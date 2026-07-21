@@ -16,12 +16,16 @@
 
 ## 2. 第一阶段范围
 
-只做 **FIV Portal 驱动的端到端最小闭环**（对应 expectation.txt 的 2.1 / 3.1 / 4.1 / 5）：
+第一阶段覆盖两条主路径：
+
+**路径 A — FIV Portal 驱动**（对应 expectation.txt 的 2.1 / 3.1 / 4.1 / 5）：
 自然语言选项目+版本 → FIV 查询链接 → 下载 IFWI + ingredient → 从 build 扫描并下载 stitch tool → 解压 → 运行 stitch。
 
+**路径 B — 本地文件 + OEMID 反查驱动**（对应 2.2 / 3.2 / 4.2 / 5）：
+用户指定本地 IFWI 文件 → 解析 OEMID 得到 Product + IFWI Version + Flavor → 按 product+version 在 FIV Portal 找到 release → 按 flavor 精确定位到一个确认的 IFWI build → 按路径 A 的方式拿 stitch tool → 运行 stitch。
+
 **暂不做**（后续阶段）：
-- 4.2 OEMID 反查 build。FIV Portal 中**无 oemid 字段**（最接近的是 ipx_id + ww_name 版本号，如 `2026.24.4.01`），需另设映射策略。
-- 纯本地文件驱动路径（2.2 / 3.2）可作为下一步低成本增量。
+- OEMID 解析失败时的追问式交互（4.2.2）先做最简：返回失败原因让 host 侧模型向用户追问，不做复杂启发式。
 
 ## 3. 关键外部依赖发现
 
@@ -46,6 +50,21 @@
     [--soft_strap "btg:Dma=1,..."]
   ```
 
+### OEMID 解析（本地文件路径下）
+- 参考 `~/Workspace/IFWI/OakStreamAPIfwi/Ifwi/oak_release/BuildScripts/stitch/diagnostics/binary_hash.py`，其 `--parse_oem_info` 模式可解析本地 IFWI 文件的 OEM 区，输出：
+  ```
+  ======== IFWI Entry Dump ========
+  Product: OKSDCRB1
+  IFWI Version: .2026.28.3.01
+  Flavor Description:
+    Value: _1P0_NonIPClean_Trace_DebugSigned
+    Type: official
+  Hash Value: 902b6636...
+  ================================
+  ```
+- **依赖极小**：`binary_hash.py` 仅依赖标准库 + `defs.structure`；`structure.py`（同目录 `defs/`）也**仅依赖标准库**（struct/json/os/re/dataclasses/typing）。
+- **策略：拷贝抽取**。把 `parse_oem_info` 相关逻辑 + `structure.py` 中必要的 dataclass（Product / IFWIVersion / FlavorDescription / IFWIEntry 等）抽成 MCP 内部的**零第三方依赖模块** `oem_parser.py`，不依赖任何已解压 stitch tool 或 venv。代价：stitch tool 更新 OEM 结构格式时需手动同步——在模块顶部注明来源文件与同步方式。
+
 ## 4. 架构与模块边界
 
 ```
@@ -53,6 +72,7 @@ ifwi-stitching-mcp/
   server.py            # FastMCP app：注册工具，薄封装层
   fiv_portal.py        # FIV Portal REST 客户端（查询 projects/builds/ingredients/stitch包）
   downloader.py        # Artifactory 下载 + 本地文件拷贝 → 本地缓存
+  oem_parser.py        # 零依赖：解析本地 IFWI 的 OEMID → Product/IFWIVersion/Flavor
   stitch_runner.py     # 解压 stitch 压缩包 + 建 venv/装依赖 + 运行 cli.py
   config.py            # 环境变量配置：FIV base URL、tokens、缓存目录
 ```
@@ -60,15 +80,23 @@ ifwi-stitching-mcp/
 每个模块单一职责、接口清晰、可独立测试：
 - `fiv_portal` 只懂 HTTP + JSON。
 - `downloader` 只懂 URL/路径 → 本地文件。
+- `oem_parser` 只懂 bytes → 结构化 OEM 字段（无网络、无 subprocess）。
 - `stitch_runner` 只懂 zip/venv/subprocess。
 - `server` 把它们组装成 MCP 工具。
 
-**数据流（FIV 驱动主路径）：**
+**数据流 A（FIV 驱动）：**
 ```
 NL 请求 → 解析 project + version → fiv_portal.get_build()
   → downloader：IFWI .bin + ingredient → 本地缓存
   → fiv_portal 扫描 build_target[] 中含 "stitch" 的包 → downloader 下载压缩包
   → stitch_runner：解压 → 建 venv 装 requirements → 运行 cli.py → stitched .bin
+```
+
+**数据流 B（本地文件 + OEMID 反查）：**
+```
+本地 IFWI 文件 → oem_parser：解析 Product + IFWI Version + Flavor
+  → fiv_portal：按 product+version 找 release → 按 flavor 定位确认的 build
+  → 之后并入数据流 A 的下载与 stitch 环节
 ```
 
 ## 5. MCP 工具
@@ -80,6 +108,10 @@ NL 请求 → 解析 project + version → fiv_portal.get_build()
 - `fiv_find_ifwi(project, phase, version)` → 解析到具体 build，返回 build 摘要 + IFWI 二进制的 Artifactory URL。
 - `fiv_find_ingredient(project, name, version)` → ingredient 下载 URL。
 - `fiv_find_stitch_tool(project, phase, version)` → 扫描 build 的 `build_target[]`，返回名字含 "stitch" 的包 URL。
+- `fiv_match_build_by_oem(product, ifwi_version, flavor)` → 路径 B 反查：按 product + ifwi_version 找 release，按 flavor 定位到确认的 build，返回同 `fiv_find_ifwi` 的 build 摘要。匹配不唯一/不到时返回候选列表交由澄清。
+
+**OEMID 解析：**
+- `parse_ifwi_oem(local_ifwi_path)` → 用 `oem_parser` 解析本地 IFWI 文件，返回 `{product, ifwi_version, flavor_value, flavor_type, hash}`；解析失败返回结构化原因（对应 4.2.2，交 host 追问）。
 
 **下载：**
 - `download(url_or_path, dest_name?)` → 下载 Artifactory URL 或拷贝本地路径到缓存，返回本地路径。IFWI / ingredient / stitch 压缩包通用。
@@ -122,21 +154,24 @@ $CACHE_DIR/
 - **stitch tool 未找到**（扫不到含 "stitch" 的包）→ 返回全部可用 package 名，交由判断。
 - **run_stitch 失败** → 返回退出码 + 截断的日志尾部；完整日志留在 `work/`。
 - **venv/pip 失败** → 返回 pip 输出，提示依赖/网络问题。
+- **OEMID 解析失败**（无有效 OEM 区/格式不符，4.2.2）→ 返回结构化原因，交由 host 向用户追问补充信息。
+- **OEM 反查不唯一/未命中** → 返回候选 build 列表（含 flavor），让模型澄清。
 
 ## 8. 测试策略
 
-- `fiv_portal.py` — 录制 JSON 响应做单元测试（mock `requests`），覆盖查询、URL 构造、stitch 包扫描、未命中分支。
+- `fiv_portal.py` — 录制 JSON 响应做单元测试（mock `requests`），覆盖查询、URL 构造、stitch 包扫描、OEM 反查匹配、未命中分支。
 - `downloader.py` — mock HTTP + 本地拷贝；验证缓存路径。
+- `oem_parser.py` — 用真实（或截取的）IFWI OEM 区字节样本做单元测试，验证 Product/IFWIVersion/Flavor 解析与非法输入分支；零依赖便于直接测。
 - `stitch_runner.py` — 用桩 `cli.py`/`requirements.txt` 验证解压、venv 创建、subprocess 调用与日志捕获，不依赖真实 stitch tool。
 - `config.py` — 环境变量读取与默认值。
-- 端到端手动验证：用真实 token 跑一次 FIV 驱动闭环，作最终确认。
+- 端到端手动验证：路径 A（FIV 驱动）与路径 B（本地文件 + OEM 反查）各跑一次真实闭环，作最终确认。
 
 ## 9. 依赖
 
-`fastmcp`、`requests`；标准库 `zipfile` / `tarfile` / `venv` / `subprocess`。
+`fastmcp`、`requests`；标准库 `zipfile` / `tarfile` / `venv` / `subprocess` / `struct`。
 
 ## 10. 后续可选增强
 
-- 本地文件驱动路径（2.2 / 3.2）。
-- OEMID 反查（4.2）——需先确定 product + ifwi version → build 的映射来源。
+- OEMID 解析失败时的启发式追问（4.2.2 的进阶交互）。
 - 在 MCP 之上加一层薄 skill，沉淀标准编排流程。
+- `oem_parser.py` 与上游 `binary_hash.py` / `structure.py` 的自动同步/校验机制。
