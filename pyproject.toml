@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifwi-stitching-mcp"
+version = "0.1.0"
+description = "MCP server for IFWI stitching via FIV Portal"
+requires-python = ">=3.9"
+dependencies = ["fastmcp", "requests"]
+
+[project.optional-dependencies]
+dev = ["pytest", "responses"]
+
+[tool.setuptools.packages.find]
+include = ["ifwi_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
