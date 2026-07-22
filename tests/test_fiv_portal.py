@@ -111,3 +111,93 @@ def test_find_ifwi_success_with_swimlane(fiv_env):
     assert r["ok"] is True
     assert r["data"]["ifwi_url"] == "https://art/root/pkg/OakStreamAP.bin"
     assert r["data"]["full_binary_name"] == "OakStreamAP.bin"
+
+
+@responses.activate
+def test_find_ingredient_success(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ingredient_detail/"),
+                  json={"ingredient_link": "https://art/ing/B-1.0.bin",
+                        "ingredient_name": "B", "ingredient_version": "1.0"}, status=200)
+    r = fiv_portal.find_ingredient("OakStreamAP", "B", "1.0")
+    assert r["ok"] is True
+    assert r["data"]["ingredient_url"] == "https://art/ing/B-1.0.bin"
+
+
+@responses.activate
+def test_find_ingredient_not_found(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ingredient_detail/"),
+                  json={"ingredient_link": None}, status=200)
+    r = fiv_portal.find_ingredient("OakStreamAP", "B", "9.9")
+    assert r["error_code"] == ErrorCode.INGREDIENT_NOT_FOUND
+
+
+@responses.activate
+def test_find_stitch_tool_success(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/",
+        "swimlane_branch": "main",
+        "build_target": [
+            {"package_name": "IFWI_Main", "package_path": "a/",
+             "binary_list": [{"full_binary_name": "ifwi.bin"}]},
+            {"package_name": "IFWI_Stitch_Tool", "package_path": "s/",
+             "binary_list": [{"full_binary_name": "stitch_tool.zip"}]},
+        ],
+    }, status=200)
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["ok"] is True
+    assert r["data"]["stitch_url"] == "https://art/root/s/stitch_tool.zip"
+    assert r["data"]["package_name"] == "IFWI_Stitch_Tool"
+
+
+@responses.activate
+def test_find_stitch_tool_none(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/",
+        "swimlane_branch": "main",
+        "build_target": [{"package_name": "IFWI_Main", "package_path": "a/",
+                          "binary_list": [{"full_binary_name": "ifwi.bin"}]}],
+    }, status=200)
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["error_code"] == ErrorCode.STITCH_TOOL_NOT_FOUND
+    assert r["detail"]["available_packages"] == ["IFWI_Main"]
+
+
+@responses.activate
+def test_match_build_by_oem_single(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    # list_swimlanes call (no swimlane) -> one lane
+    responses.add(responses.GET, _url("get_ifwi_release/"),
+                  json=[{"version": "2026.28.3.01", "swimlane_branch": "main"}], status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/", "swimlane_branch": "main",
+        "build_target": [
+            {"package_name": "OKSDCRB1_1P0_NonIPClean_Trace_DebugSigned", "package_path": "p/",
+             "binary_list": [{"full_binary_name": "ifwi.bin"}]},
+        ],
+    }, status=200)
+    r = fiv_portal.match_build_by_oem(
+        "OakStreamAP", "OKSDCRB1", ".2026.28.3.01",
+        "_1P0_NonIPClean_Trace_DebugSigned", "Orange")
+    assert r["ok"] is True
+    assert r["data"]["matched_package"] == "OKSDCRB1_1P0_NonIPClean_Trace_DebugSigned"
+    assert r["data"]["swimlane_branch"] == "main"
+
+
+@responses.activate
+def test_match_build_by_oem_none(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release/"),
+                  json=[{"version": "2026.28.3.01", "swimlane_branch": "main"}], status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/", "swimlane_branch": "main",
+        "build_target": [{"package_name": "SOMETHING_ELSE", "package_path": "p/",
+                          "binary_list": [{"full_binary_name": "x.bin"}]}],
+    }, status=200)
+    r = fiv_portal.match_build_by_oem(
+        "OakStreamAP", "OKSDCRB1", ".2026.28.3.01", "_1P0_NonIPClean", "Orange")
+    assert r["error_code"] == ErrorCode.OEM_MATCH_NONE
+    assert r["detail"]["parsed"]["product"] == "OKSDCRB1"
