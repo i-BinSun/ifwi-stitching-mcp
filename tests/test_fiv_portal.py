@@ -10,7 +10,7 @@ BASE = "https://fiv.example.com"
 @pytest.fixture
 def fiv_env(clean_env, monkeypatch):
     monkeypatch.setenv("FIV_BASE_URL", BASE)
-    monkeypatch.setenv("FIV_TOKEN", "Basic xyz")
+    monkeypatch.setenv("FIV_TOKEN", "xyz")
     return clean_env
 
 
@@ -45,7 +45,7 @@ def test_list_projects(fiv_env):
     r = fiv_portal.list_projects()
     assert r["ok"] is True
     assert r["data"]["projects"][0]["id"] == 232
-    assert responses.calls[0].request.headers["Authorization"] == "Basic xyz"
+    assert responses.calls[0].request.headers["Authorization"] == "Bearer xyz"
 
 
 @responses.activate

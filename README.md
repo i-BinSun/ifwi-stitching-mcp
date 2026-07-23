@@ -48,14 +48,14 @@ validated lazily, only when a tool that needs them is called.
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `FIV_BASE_URL` | **yes** | Base URL of the FIV Portal, e.g. `https://fiv.example.com`. REST paths are formed as `<base>/app/rest/<endpoint>`. |
-| `FIV_TOKEN` | for FIV calls | Sent **verbatim** as the `Authorization` header to FIV (e.g. `Basic <...>`). |
-| `ARTIFACTORY_TOKEN` | for downloads | Sent as `Authorization: Bearer <token>` when downloading artifacts. |
+| `FIV_TOKEN` | for FIV calls | The FIV access token. Sent as `Authorization: Bearer <token>` to FIV. |
+| `ARTIFACTORY_TOKEN` | for downloads | The Artifactory access token. Sent as `Authorization: Bearer <token>` when downloading artifacts. |
 | `IFWI_MCP_CACHE_DIR` | no | Cache root. Defaults to `~/.ifwi-stitching-mcp/cache`. Subdirs: `ifwi/`, `ingredients/`, `stitch/`, `work/`. |
 
 ```bash
 export FIV_BASE_URL="https://fiv.example.com"
-export FIV_TOKEN="Basic xxxxxxxx"
-export ARTIFACTORY_TOKEN="yyyyyyyy"
+export FIV_TOKEN="<fiv-access-token>"
+export ARTIFACTORY_TOKEN="<artifactory-access-token>"
 ```
 
 ## Running
@@ -79,8 +79,8 @@ Add an entry like this to your MCP host's server config (e.g. Claude Desktop's `
       "args": ["-m", "ifwi_mcp.server"],
       "env": {
         "FIV_BASE_URL": "https://fiv.example.com",
-        "FIV_TOKEN": "Basic xxxxxxxx",
-        "ARTIFACTORY_TOKEN": "yyyyyyyy"
+        "FIV_TOKEN": "<fiv-access-token>",
+        "ARTIFACTORY_TOKEN": "<artifactory-access-token>"
       }
     }
   }

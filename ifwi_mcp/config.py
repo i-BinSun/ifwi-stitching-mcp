@@ -34,7 +34,7 @@ def get_fiv_auth_header() -> dict:
     value = os.environ.get("FIV_TOKEN")
     if not value:
         return err(ErrorCode.MISSING_TOKEN, "FIV_TOKEN is not set", {"which": "fiv"})
-    return ok({"header_value": value})
+    return ok({"header_value": f"Bearer {value}"})
 
 
 def get_artifactory_token() -> dict:

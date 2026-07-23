@@ -10,7 +10,7 @@ BASE = "https://fiv.example.com"
 @pytest.fixture
 def fiv_env(clean_env, monkeypatch):
     monkeypatch.setenv("FIV_BASE_URL", BASE)
-    monkeypatch.setenv("FIV_TOKEN", "Basic xyz")
+    monkeypatch.setenv("FIV_TOKEN", "xyz")
     return clean_env
 
 

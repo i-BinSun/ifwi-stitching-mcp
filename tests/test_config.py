@@ -31,9 +31,9 @@ def test_fiv_auth_missing_returns_missing_token(clean_env):
 
 
 def test_fiv_auth_present(clean_env, monkeypatch):
-    monkeypatch.setenv("FIV_TOKEN", "Basic abc123")
+    monkeypatch.setenv("FIV_TOKEN", "abc123")
     result = config.get_fiv_auth_header()
-    assert result == {"ok": True, "data": {"header_value": "Basic abc123"}}
+    assert result == {"ok": True, "data": {"header_value": "Bearer abc123"}}
 
 
 def test_artifactory_token_missing(clean_env):
