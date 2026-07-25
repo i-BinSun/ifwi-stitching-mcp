@@ -29,8 +29,18 @@ def fiv_list_projects() -> dict:
 
 
 @_guard
-def fiv_list_swimlanes(project: str, phase: str, version: str) -> dict:
-    return fiv_portal.list_swimlanes(project, phase, version)
+def fiv_get_project(project: str) -> dict:
+    return fiv_portal.get_project(project)
+
+
+@_guard
+def fiv_list_swimlanes(project: str, phase: Optional[str] = None) -> dict:
+    return fiv_portal.list_swimlanes(project, phase)
+
+
+@_guard
+def fiv_list_releases(project: str, phase: str, swimlane: Optional[str] = None) -> dict:
+    return fiv_portal.list_releases(project, phase, swimlane)
 
 
 @_guard
@@ -82,7 +92,8 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
 
 
 # Register each plain function as an MCP tool (keeps the plain callable importable for tests).
-for _fn in (fiv_list_projects, fiv_list_swimlanes, fiv_find_ifwi, fiv_find_ingredient,
+for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_releases,
+            fiv_find_ifwi, fiv_find_ingredient,
             fiv_find_stitch_tool, fiv_match_build_by_oem, parse_ifwi_oem, download,
             list_local_files, extract_stitch_tool, run_stitch):
     mcp.tool(_fn)

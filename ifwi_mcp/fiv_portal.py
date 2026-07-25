@@ -1,5 +1,6 @@
 # ifwi_mcp/fiv_portal.py
 """FIV Portal REST client. Pure HTTP + JSON — no file I/O, no subprocess."""
+import json
 import re
 from typing import Optional
 
@@ -12,7 +13,7 @@ PHASES = ("Blue", "Orange", "Purple", "Daily")
 _VERSION_RE = re.compile(r"^\.?\d{4}\.\d+\.\d+\.\d+$")
 
 
-def _get(endpoint: str, params: dict) -> dict:
+def _get(endpoint: str, params: dict, prefix: str = "app/rest") -> dict:
     base = config.get_base_url()
     if not base:
         return err(ErrorCode.INVALID_ARGUMENT, "FIV_BASE_URL not set",
@@ -20,10 +21,11 @@ def _get(endpoint: str, params: dict) -> dict:
     auth = config.get_fiv_auth_header()
     if not auth["ok"]:
         return auth
-    url = f"{base}/app/rest/{endpoint}"
+    url = f"{base}/{prefix}/{endpoint}"
     try:
         resp = requests.get(url, params=params,
-                            headers={"Authorization": auth["data"]["header_value"]}, timeout=60)
+                            headers={"Authorization": auth["data"]["header_value"]}, timeout=60,
+                            verify=config.get_ca_bundle())
     except requests.RequestException as exc:
         return err(ErrorCode.INTERNAL_ERROR, "fiv network error", {"url": url, "reason": str(exc)})
     if resp.status_code in (401, 403):
@@ -60,6 +62,51 @@ def list_projects() -> dict:
     return ok({"projects": projects})
 
 
+def classify_project_type(ifwi_type: Optional[str], ifwi_sub_type: Optional[str]) -> dict:
+    """Map FIV (ifwi_type, ifwi_sub_type) to a coarse project category.
+
+    Platform  -> IFWI project (domain: server | client | graphic)
+    Graphic   -> IFWI project, graphic domain (graphic is its own ifwi_type in FIV)
+    Silicon   -> BIOS | UP (Unified Patch)
+    """
+    t = (ifwi_type or "").strip().lower()
+    s = (ifwi_sub_type or "").strip().lower()
+    if t == "platform":
+        domain = s if s in ("server", "client", "graphic") else (s or "unknown")
+        return {"category": "IFWI", "domain": domain, "is_ifwi": True}
+    if t == "graphic":
+        return {"category": "IFWI", "domain": "graphic", "is_ifwi": True}
+    if t == "silicon":
+        if s in ("unified_patch", "up"):
+            return {"category": "UP", "domain": None, "is_ifwi": False}
+        if s == "bios":
+            return {"category": "BIOS", "domain": None, "is_ifwi": False}
+        return {"category": "SILICON", "domain": s or None, "is_ifwi": False}
+    return {"category": "UNKNOWN", "domain": s or None, "is_ifwi": False}
+
+
+def get_project(project: str) -> dict:
+    """Resolve a project and return its FIV type fields plus a coarse category."""
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    project_id = pid["data"]["project_id"]
+    result = _get("get_project/", {"project_id": project_id})
+    if not result["ok"]:
+        return result
+    detail = result["data"]["json"] or {}
+    ifwi_type = detail.get("ifwi_type")
+    ifwi_sub_type = detail.get("ifwi_sub_type")
+    return ok({
+        "project_id": project_id,
+        "name": detail.get("name") or pid["data"]["name"],
+        "project_name": detail.get("project_name"),
+        "ifwi_type": ifwi_type,
+        "ifwi_sub_type": ifwi_sub_type,
+        **classify_project_type(ifwi_type, ifwi_sub_type),
+    })
+
+
 def resolve_project_id(project: str) -> dict:
     if not project:
         return err(ErrorCode.INVALID_ARGUMENT, "project is required",
@@ -83,7 +130,14 @@ def _release_rows(project_id: int, phase: str, version: str, swimlane: Optional[
     return _get("get_ifwi_release/", params)
 
 
-def list_swimlanes(project: str, phase: str, version: str) -> dict:
+def _release_swimlanes_for_version(project: str, phase: str, version: str) -> dict:
+    """Internal: swimlanes that a SPECIFIC version was released in (from get_ifwi_release).
+
+    Used to auto-resolve a swimlane for find_ifwi/find_stitch_tool/match_build_by_oem
+    when the caller does not name one. This is version-scoped and only sees lanes that
+    actually have a release for that version — NOT the project's full swimlane list
+    (for that, use list_swimlanes, which reads the build-config metadata).
+    """
     bad = _validate_common(project, phase, version)
     if bad:
         return bad
@@ -94,11 +148,97 @@ def list_swimlanes(project: str, phase: str, version: str) -> dict:
     if not rows_result["ok"]:
         return rows_result
     rows = rows_result["data"]["json"]
-    if not rows:
+    if not isinstance(rows, list) or not rows:
         return err(ErrorCode.RELEASE_NOT_FOUND, "no release rows",
                    {"project": project, "phase": phase, "version": version})
     swimlanes = sorted({r.get("swimlane_branch") for r in rows if r.get("swimlane_branch")})
     return ok({"swimlanes": swimlanes})
+
+
+def list_swimlanes(project: str, phase: Optional[str] = None) -> dict:
+    """List a project's configured build types / swimlanes from build metadata.
+
+    Reads meta_data/build (the authoritative build-config table), keeping only
+    visible builds. Optionally filter to those whose phase list includes `phase`.
+    Returns each build's name, swimlane branch, phases, stepping/SKU.
+    """
+    if not project:
+        return err(ErrorCode.INVALID_ARGUMENT, "project is required",
+                   {"param": "project", "expected": "non-empty"})
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    result = _get("build/", {"proj_id": pid["data"]["project_id"]}, prefix="meta_data")
+    if not result["ok"]:
+        return result
+    payload = result["data"]["json"]
+    builds = (payload or {}).get("data", {}).get("list", []) if isinstance(payload, dict) else []
+    swimlanes = []
+    for b in builds:
+        if b.get("visible") != 1:
+            continue
+        phases = [p.strip() for p in (b.get("phase") or "").split(",") if p.strip()]
+        if phase and phase not in phases:
+            continue
+        meta = {}
+        raw = b.get("meta_data_info")
+        if isinstance(raw, str) and raw:
+            try:
+                meta = json.loads(raw)
+            except ValueError:
+                meta = {}
+        swimlanes.append({
+            "name": b.get("name"),
+            "swimlane_branch": b.get("build_branch"),
+            "phases": phases,
+            "stepping": meta.get("stepping"),
+            "sku": meta.get("SKU"),
+        })
+    if not swimlanes:
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no visible builds for project",
+                   {"project": project, "phase": phase})
+    return ok({"project_id": pid["data"]["project_id"], "count": len(swimlanes),
+               "swimlanes": swimlanes})
+
+
+def list_releases(project: str, phase: str, swimlane: Optional[str] = None) -> dict:
+    """List releases for a project+phase, newest first. No version required."""
+    if not project:
+        return err(ErrorCode.INVALID_ARGUMENT, "project is required",
+                   {"param": "project", "expected": "non-empty"})
+    if phase not in PHASES:
+        return err(ErrorCode.INVALID_ARGUMENT, "invalid phase",
+                   {"param": "phase", "expected": f"one of {PHASES}"})
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    # Omit version to enumerate all releases in the phase. The endpoint silently caps
+    # at 20 rows unless a large `limit` is passed. The `swimlane` param IS honored by
+    # the server; when omitted the server returns only the project's default lane, so
+    # to list a non-default lane (e.g. an imh2 branch) the caller must name it.
+    params = {"project_id": pid["data"]["project_id"], "phase": phase,
+              "version": "", "limit": 1000000}
+    if swimlane:
+        params["swimlane"] = swimlane
+    result = _get("get_ifwi_release/", params)
+    if not result["ok"]:
+        return result
+    rows = result["data"]["json"]
+    # FIV returns an error dict (not a list) when no data matches.
+    if not isinstance(rows, list) or not rows:
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no releases for project/phase",
+                   {"project": project, "phase": phase, "swimlane": swimlane})
+    releases = [{
+        "version": r.get("version"),
+        "phase": r.get("phase"),
+        "swimlane_branch": r.get("swimlane_branch"),
+        "status": r.get("status"),
+        "publish_time": r.get("publish_time"),
+    } for r in rows]
+    # Newest first by publish_time (ISO strings sort correctly); None sinks to bottom.
+    releases.sort(key=lambda x: x.get("publish_time") or "", reverse=True)
+    return ok({"project_id": pid["data"]["project_id"], "phase": phase,
+               "count": len(releases), "latest": releases[0], "releases": releases})
 
 
 def find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
@@ -111,7 +251,7 @@ def find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = 
     project_id = pid["data"]["project_id"]
 
     if not swimlane:
-        lanes = list_swimlanes(project, phase, version)
+        lanes = _release_swimlanes_for_version(project, phase, version)
         if not lanes["ok"]:
             return lanes
         candidates = lanes["data"]["swimlanes"]
@@ -148,7 +288,7 @@ def _resolve_swimlane_or_multi(project, phase, version, swimlane):
     """Return ok({"swimlane": <str|None>}) or a MULTIPLE_SWIMLANES/error result."""
     if swimlane:
         return ok({"swimlane": swimlane})
-    lanes = list_swimlanes(project, phase, version)
+    lanes = _release_swimlanes_for_version(project, phase, version)
     if not lanes["ok"]:
         return lanes
     candidates = lanes["data"]["swimlanes"]
@@ -235,7 +375,7 @@ def match_build_by_oem(project: str, product: str, ifwi_version: str, flavor: st
         if not _VERSION_RE.match(version):
             return err(ErrorCode.INVALID_ARGUMENT, "OEM ifwi_version not usable as version",
                        {"param": "ifwi_version", "expected": "YYYY.WW.D.NN"})
-        lanes = list_swimlanes(project, phase, version)
+        lanes = _release_swimlanes_for_version(project, phase, version)
         if not lanes["ok"]:
             return lanes
         lanes_to_scan = lanes["data"]["swimlanes"] or [None]

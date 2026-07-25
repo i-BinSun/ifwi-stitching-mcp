@@ -33,7 +33,8 @@ def download(url_or_path: str, category: str = "ifwi", dest_name: Optional[str] 
             return token_result
         headers = {"Authorization": f"Bearer {token_result['data']['token']}"}
         try:
-            resp = requests.get(url_or_path, headers=headers, stream=True, timeout=120)
+            resp = requests.get(url_or_path, headers=headers, stream=True, timeout=120,
+                                 verify=config.get_ca_bundle())
         except requests.RequestException as exc:
             return err(ErrorCode.DOWNLOAD_FAILED, "network error during download",
                        {"url": url_or_path, "reason": str(exc)})

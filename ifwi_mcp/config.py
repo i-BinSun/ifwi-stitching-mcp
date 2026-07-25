@@ -30,6 +30,24 @@ def cache_subdir(name: str) -> Path:
     return sub
 
 
+def get_ca_bundle():
+    """CA bundle for TLS verification of FIV/Artifactory requests.
+
+    Honors FIV_CA_BUNDLE / REQUESTS_CA_BUNDLE if set; otherwise falls back to the
+    system trust store (holds the Intel intranet CAs). Returns a path str, or True
+    to use requests' default certifi bundle if no system store is found.
+    """
+    for var in ("FIV_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        val = os.environ.get(var)
+        if val:
+            return val
+    for candidate in ("/etc/ssl/certs/ca-certificates.crt",
+                      "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.exists(candidate):
+            return candidate
+    return True
+
+
 def get_fiv_auth_header() -> dict:
     value = os.environ.get("FIV_TOKEN")
     if not value:
