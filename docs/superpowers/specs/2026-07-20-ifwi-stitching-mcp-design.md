@@ -33,7 +33,7 @@
 - `get_project_info/` → 项目列表（映射"项目A" → project_id）。
 - `get_ifwi_release/`（params: project_id, phase, version）→ 把自然语言版本解析到具体 build（按 ww_name + phase）。
 - `get_ifwi_release_package_info/`（params: project_id, phase, version）→ 返回 `release_root` 与 `build_target[]`；每个 target 含 `binary_list[]`。
-  - **IFWI .bin 下载 URL = release_root + package_path + full_binary_name**。
+  - ~~**IFWI .bin 下载 URL = release_root + package_path + full_binary_name**~~ **（此假设错误，2026-07 修正）**：`package_path` 本身就是 `.7z` **打包文件**（不是目录），故**下载 URL = release_root + package_path**（一个 `.7z`）；`full_binary_name` 是包内的 `.bin` 文件名（可能是逗号分隔的多个），不应拼接到 URL 上。实测拼了 full_binary_name 的 URL 返回 404，只到 `.7z` 才 200。
 - `get_ingredient_detail/`（params: project_id, ingredient_name, ingredient_version）→ ingredient 的 Artifactory 链接（`ingredient_link`）。
 - **无专门的 stitch tool 字段**：stitch 在 portal 里是 task type，不是可下载 target。故通过扫描 `build_target[]` 中 package_name 含 "stitch" 的包来定位（4.1.1/4.1.2 合并为一次扫描）。
 
