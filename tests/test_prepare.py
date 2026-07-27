@@ -87,3 +87,49 @@ def test_prepare_stitch_no_version_none_found(fakes):
     fakes["stitch_by_version"] = {}
     r = prepare.prepare_stitch("P", "Orange")
     assert r["error_code"] == ErrorCode.STITCH_TOOL_NOT_FOUND
+
+
+@pytest.fixture
+def ing_fakes(monkeypatch, tmp_path):
+    state = {"url_by_key": {}, "extract_dir": None}
+
+    def fake_find_ingredient(project, name, version):
+        url = state["url_by_key"].get((name, version))
+        if url:
+            return ok({"ingredient_url": url, "ingredient_name": name,
+                       "ingredient_version": version})
+        return err(ErrorCode.INGREDIENT_NOT_FOUND, "no ingredient link",
+                   {"candidates": [], "ingredient_name": name,
+                    "ingredient_version": version})
+
+    def fake_download(url, category="ifwi", dest_name=None):
+        return ok({"local_path": f"/cache/{category}/pkg.7z", "source": "download",
+                   "bytes": 1})
+
+    def fake_extract_archive(local_path, dest_name=None):
+        d = tmp_path / "extracted"; (d / "binaries").mkdir(parents=True)
+        (d / "binaries" / "mmc_pkg_0.907.0.bin").write_bytes(b"m")
+        (d / "readme.txt").write_bytes(b"r")
+        state["extract_dir"] = str(d)
+        return ok({"extract_dir": str(d), "file_count": 2, "bins": []})
+
+    monkeypatch.setattr(prepare.fiv_portal, "find_ingredient", fake_find_ingredient)
+    monkeypatch.setattr(prepare.downloader, "download", fake_download)
+    monkeypatch.setattr(prepare.archive, "extract_archive", fake_extract_archive)
+    return state
+
+
+def test_prepare_ingredient_success_lists_files(ing_fakes):
+    ing_fakes["url_by_key"] = {("MMC1", "0.907.0"): "https://art/ing/z.7z"}
+    r = prepare.prepare_ingredient("P", "MMC1", "0.907.0")
+    assert r["ok"] is True
+    assert r["data"]["ingredient_dir"] == ing_fakes["extract_dir"]
+    names = [f.rsplit("/", 1)[-1] for f in r["data"]["extracted_files"]]
+    assert "mmc_pkg_0.907.0.bin" in names and "readme.txt" in names
+    assert r["data"]["ingredient_version"] == "0.907.0"
+
+
+def test_prepare_ingredient_exact_miss_no_fallback(ing_fakes):
+    ing_fakes["url_by_key"] = {}      # nothing registered
+    r = prepare.prepare_ingredient("P", "MMC1", "0.999.0")
+    assert r["error_code"] == ErrorCode.INGREDIENT_NOT_FOUND

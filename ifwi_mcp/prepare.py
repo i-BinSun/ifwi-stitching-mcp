@@ -71,3 +71,20 @@ def prepare_stitch(project: str, phase: str, version: str = None,
     return err(ErrorCode.STITCH_TOOL_NOT_FOUND,
                "no stitch tool in the latest releases scanned",
                {"project": project, "phase": phase, "scanned": len(versions[:_SCAN_CAP])})
+
+
+def prepare_ingredient(project: str, name: str, version: str) -> dict:
+    found = fiv_portal.find_ingredient(project, name, version)
+    if not found["ok"]:
+        return found  # INGREDIENT_NOT_FOUND passes through; never auto-fall-back
+    dl = downloader.download(found["data"]["ingredient_url"], category="ingredients")
+    if not dl["ok"]:
+        return dl
+    ext = archive.extract_archive(dl["data"]["local_path"])
+    if not ext["ok"]:
+        return ext
+    extract_dir = ext["data"]["extract_dir"]
+    files = sorted(str(p) for p in Path(extract_dir).rglob("*") if p.is_file())
+    return ok({"ingredient_dir": extract_dir, "extracted_files": files,
+               "ingredient_url": found["data"]["ingredient_url"],
+               "ingredient_name": name, "ingredient_version": version, "warnings": []})
