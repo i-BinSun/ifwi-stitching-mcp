@@ -271,13 +271,17 @@ def find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = 
     for target in data.get("build_target", []):
         binaries = target.get("binary_list") or []
         if binaries:
-            full = binaries[0]["full_binary_name"]
+            # package_path is the .7z package file; release_root+package_path is the
+            # downloadable URL. full_binary_name may be a comma-separated list of the
+            # .bin files inside it — expose them as a list, don't concatenate onto url.
+            files = [fn.strip() for fn in (binaries[0].get("full_binary_name") or "").split(",")
+                     if fn.strip()]
             return ok({
                 "project_id": project_id,
                 "swimlane_branch": data.get("swimlane_branch"),
                 "release_root": release_root,
-                "ifwi_url": release_root + (target.get("package_path") or "") + full,
-                "full_binary_name": full,
+                "ifwi_url": release_root + (target.get("package_path") or ""),
+                "binaries": files,
                 "build_target": target.get("package_name"),
             })
     return err(ErrorCode.RELEASE_NOT_FOUND, "no IFWI binary in build targets",
@@ -406,9 +410,12 @@ def find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[
         available.append(name)
         binaries = target.get("binary_list") or []
         if "stitch" in name.lower() and binaries:
-            full = binaries[0]["full_binary_name"]
-            return ok({"stitch_url": release_root + (target.get("package_path") or "") + full,
-                       "package_name": name, "full_binary_name": full})
+            # package_path is the downloadable .7z package; full_binary_name may list
+            # several files (comma-separated) inside it.
+            files = [fn.strip() for fn in (binaries[0].get("full_binary_name") or "").split(",")
+                     if fn.strip()]
+            return ok({"stitch_url": release_root + (target.get("package_path") or ""),
+                       "package_name": name, "binaries": files})
     return err(ErrorCode.STITCH_TOOL_NOT_FOUND, "no stitch package found",
                {"available_packages": available})
 

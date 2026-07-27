@@ -94,10 +94,13 @@ All tools return the unified result shape described above.
 | Tool | Signature | Purpose |
 |------|-----------|---------|
 | `fiv_list_projects` | `()` | List FIV projects (`id`, `name`, `project_name`). |
-| `fiv_list_swimlanes` | `(project, phase, version)` | Distinct swimlane branches for a release. |
-| `fiv_find_ifwi` | `(project, phase, version, swimlane=None)` | Resolve the IFWI binary URL. If `swimlane` is omitted and more than one exists → `MULTIPLE_SWIMLANES`. |
+| `fiv_get_project` | `(project)` | Project detail + coarse type from `ifwi_type`/`ifwi_sub_type` (IFWI server/client/graphic, or UP/BIOS). |
+| `fiv_list_swimlanes` | `(project, phase=None)` | All configured build types / swimlane branches (from build metadata, visible only); optional phase filter. |
+| `fiv_list_releases` | `(project, phase, swimlane=None)` | Releases for a phase, newest first (no version needed). Name a `swimlane` to list a non-default lane. |
+| `fiv_find_ifwi` | `(project, phase, version, swimlane=None)` | Resolve the IFWI package (`ifwi_url` = downloadable `.7z`) + its `.bin` list. If `swimlane` is omitted and more than one exists → `MULTIPLE_SWIMLANES`. |
+| `fiv_list_ifwi_binaries` | `(project, phase, version, swimlane=None)` | All build targets of a release, each with its `.7z` `package_url` and contained `.bin` files. |
 | `fiv_find_ingredient` | `(project, name, version)` | Resolve an ingredient's download URL. |
-| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | Resolve the stitch-tool archive URL. |
+| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | Resolve the stitch-tool package (`stitch_url` = downloadable `.7z`) + its file list. |
 | `fiv_match_build_by_oem` | `(project, product, ifwi_version, flavor, phase, swimlane=None)` | **Path B** — reverse-match a build from parsed OEM info. |
 | `parse_ifwi_oem` | `(local_ifwi_path)` | Decode the OEM region (offset `0xF00`, 256 bytes) of a local IFWI. Returns `product`, `ifwi_version`, `flavor_value`, `flavor_type`, `hash`. |
 | `download` | `(url_or_path, category="ifwi", dest_name=None)` | Download an Artifactory URL or copy a local file into the cache. `category` ∈ `ifwi` / `ingredients` / `stitch`. |
@@ -121,8 +124,8 @@ Every failure carries a stable `error_code`, one of:
 **Path A — known project / phase / version:**
 
 1. `fiv_list_projects` → pick a project
-2. `fiv_find_ifwi(project, phase, version)` → resolve swimlane if `MULTIPLE_SWIMLANES` is returned
-3. `download(ifwi_url)`
+2. `fiv_find_ifwi(project, phase, version)` → resolve swimlane if `MULTIPLE_SWIMLANES` is returned (returns the `.7z` `ifwi_url` + the `.bin` names it contains; use `fiv_list_ifwi_binaries` to see every build target)
+3. `download(ifwi_url)` → fetches the `.7z` build package
 4. `fiv_find_ingredient(...)` + `download(...)`
 5. `fiv_find_stitch_tool(...)` + `download(..., category="stitch")`
 6. `extract_stitch_tool(archive_path)` → pick a `config_ini` target

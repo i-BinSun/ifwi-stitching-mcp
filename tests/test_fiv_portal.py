@@ -252,15 +252,19 @@ def test_find_ifwi_success_with_swimlane(fiv_env):
         "release_root": "https://art/root/",
         "swimlane_branch": "main",
         "build_target": [
-            {"package_name": "empty", "package_path": "p0/", "binary_list": []},
-            {"package_name": "ifwi_pkg", "package_path": "pkg/",
-             "binary_list": [{"binary_name": "ifwi", "full_binary_name": "OakStreamAP.bin", "target_id": "t1"}]},
+            {"package_name": "empty", "package_path": "p0/pkg0.7z", "binary_list": []},
+            {"package_name": "ifwi_pkg", "package_path": "pkg/BuildPkg.7z",
+             "binary_list": [{"binary_name": "ifwi",
+                              "full_binary_name": "OakStreamAP_64M.bin, OakStreamAP.bin",
+                              "target_id": "t1"}]},
         ],
     }, status=200)
     r = fiv_portal.find_ifwi("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
     assert r["ok"] is True
-    assert r["data"]["ifwi_url"] == "https://art/root/pkg/OakStreamAP.bin"
-    assert r["data"]["full_binary_name"] == "OakStreamAP.bin"
+    # ifwi_url is the downloadable .7z package (release_root+package_path), NOT with a
+    # binary name appended; the .bin files are listed separately.
+    assert r["data"]["ifwi_url"] == "https://art/root/pkg/BuildPkg.7z"
+    assert r["data"]["binaries"] == ["OakStreamAP_64M.bin", "OakStreamAP.bin"]
 
 
 @responses.activate
@@ -319,16 +323,18 @@ def test_find_stitch_tool_success(fiv_env):
         "release_root": "https://art/root/",
         "swimlane_branch": "main",
         "build_target": [
-            {"package_name": "IFWI_Main", "package_path": "a/",
+            {"package_name": "IFWI_Main", "package_path": "a/main.7z",
              "binary_list": [{"full_binary_name": "ifwi.bin"}]},
-            {"package_name": "IFWI_Stitch_Tool", "package_path": "s/",
+            {"package_name": "IFWI_Stitch_Tool", "package_path": "s/stitch.7z",
              "binary_list": [{"full_binary_name": "stitch_tool.zip"}]},
         ],
     }, status=200)
     r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
     assert r["ok"] is True
-    assert r["data"]["stitch_url"] == "https://art/root/s/stitch_tool.zip"
+    # stitch_url is the downloadable .7z package, not with a filename appended
+    assert r["data"]["stitch_url"] == "https://art/root/s/stitch.7z"
     assert r["data"]["package_name"] == "IFWI_Stitch_Tool"
+    assert r["data"]["binaries"] == ["stitch_tool.zip"]
 
 
 @responses.activate
