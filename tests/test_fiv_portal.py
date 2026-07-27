@@ -264,6 +264,35 @@ def test_find_ifwi_success_with_swimlane(fiv_env):
 
 
 @responses.activate
+def test_list_ifwi_binaries_all_targets(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/",
+        "swimlane_branch": "release/ap.imh2.pre_silicon",
+        "build_target": [
+            {"package_name": "empty", "package_path": "p0/pkg0.7z", "binary_list": []},
+            {"package_name": "debug", "package_path": "d/pkg1.7z", "binary_list": [
+                # comma-separated: a _64M variant + standard, in one entry
+                {"binary_name": "crb", "full_binary_name": "A_64M.bin, A.bin", "target_id": 1},
+            ]},
+            {"package_name": "release", "package_path": "r/pkg2.7z", "binary_list": [
+                {"binary_name": "rel", "full_binary_name": "B.bin", "target_id": 2},
+            ]},
+        ],
+    }, status=200)
+    r = fiv_portal.list_ifwi_binaries("OakStreamAP", "Orange", "2026.20.3.03",
+                                      swimlane="release/ap.imh2.pre_silicon")
+    assert r["ok"] is True
+    assert r["data"]["target_count"] == 3
+    assert r["data"]["binary_count"] == 3          # 2 (comma-split) + 1
+    debug = next(t for t in r["data"]["targets"] if t["build_target"] == "debug")
+    assert debug["binaries"] == ["A_64M.bin", "A.bin"]   # comma string split
+    assert debug["package_url"] == "https://art/root/d/pkg1.7z"
+    empty = next(t for t in r["data"]["targets"] if t["build_target"] == "empty")
+    assert empty["binaries"] == []
+
+
+@responses.activate
 def test_find_ingredient_success(fiv_env):
     responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
     responses.add(responses.GET, _url("get_ingredient_detail/"),

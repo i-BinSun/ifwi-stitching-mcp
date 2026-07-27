@@ -284,6 +284,67 @@ def find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = 
                {"project": project, "phase": phase, "version": version})
 
 
+def list_ifwi_binaries(project: str, phase: str, version: str,
+                       swimlane: Optional[str] = None) -> dict:
+    """List every IFWI binary across all build targets of a release.
+
+    Unlike find_ifwi (which returns just the first binary of the first target),
+    this enumerates all build targets, and for each the downloadable .7z package
+    URL and the individual .bin files it contains.
+    """
+    bad = _validate_common(project, phase, version)
+    if bad:
+        return bad
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    project_id = pid["data"]["project_id"]
+
+    if not swimlane:
+        lanes = _release_swimlanes_for_version(project, phase, version)
+        if not lanes["ok"]:
+            return lanes
+        candidates = lanes["data"]["swimlanes"]
+        if len(candidates) > 1:
+            return err(ErrorCode.MULTIPLE_SWIMLANES, "multiple swimlanes; pick one",
+                       {"candidates": candidates})
+        swimlane = candidates[0] if candidates else None
+
+    params = {"project_id": project_id, "phase": phase, "version": version}
+    if swimlane:
+        params["swimlane"] = swimlane
+    pkg = _get("get_ifwi_release_package_info/", params)
+    if not pkg["ok"]:
+        return pkg
+    data = pkg["data"]["json"]
+    release_root = data.get("release_root") or ""
+    targets = []
+    total = 0
+    for target in data.get("build_target", []):
+        package_path = target.get("package_path") or ""
+        # full_binary_name may be a comma-separated list of .bin files inside the pkg.
+        files = []
+        for entry in (target.get("binary_list") or []):
+            for fn in (entry.get("full_binary_name") or "").split(","):
+                fn = fn.strip()
+                if fn:
+                    files.append(fn)
+        total += len(files)
+        targets.append({
+            "build_target": target.get("package_name"),
+            "package_url": release_root + package_path,
+            "binaries": files,
+        })
+    if not targets:
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no build targets in release",
+                   {"project": project, "phase": phase, "version": version})
+    return ok({"project_id": project_id, "phase": phase, "version": version,
+               "swimlane_branch": data.get("swimlane_branch"),
+               "release_root": release_root,
+               "target_count": len(targets), "binary_count": total,
+               "targets": targets})
+
+
 def _resolve_swimlane_or_multi(project, phase, version, swimlane):
     """Return ok({"swimlane": <str|None>}) or a MULTIPLE_SWIMLANES/error result."""
     if swimlane:

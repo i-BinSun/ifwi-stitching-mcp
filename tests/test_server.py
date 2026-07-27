@@ -15,7 +15,8 @@ def fiv_env(clean_env, monkeypatch):
 
 
 def test_all_tools_exist():
-    for name in ["fiv_list_projects", "fiv_list_swimlanes", "fiv_find_ifwi",
+    for name in ["fiv_list_projects", "fiv_get_project", "fiv_list_swimlanes",
+                 "fiv_list_releases", "fiv_find_ifwi", "fiv_list_ifwi_binaries",
                  "fiv_find_ingredient", "fiv_find_stitch_tool", "fiv_match_build_by_oem",
                  "parse_ifwi_oem", "download", "list_local_files",
                  "extract_stitch_tool", "run_stitch", "main"]:
