@@ -2,6 +2,8 @@
 
 The only module that shells out (subprocess) or creates venvs.
 """
+import ast
+import configparser
 import re
 import subprocess
 import sys
@@ -43,6 +45,94 @@ def _find_venv_python(stitch_dir: Path) -> Path:
         if candidate.is_dir():
             return _venv_python(candidate)
     return Path(sys.executable)
+
+
+def _read_regex_mandatory(config_ini: Path, ingredient_name: str) -> Optional[dict]:
+    """Return the ingredient's {file_key: regex} dict from the config, or None."""
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(config_ini)
+    except configparser.Error:
+        return None
+    if ingredient_name not in cp:
+        return None
+    raw = cp[ingredient_name].get("regex_mandatory_dict")
+    if not raw:
+        return None
+    try:
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _pick_file(regex: str, files: list, warnings: list, key: str) -> Optional[Path]:
+    """Advisory match of one regex against candidate files. Never raises."""
+    strict = []
+    for f in files:
+        for cand in (str(f), str(f).replace("/", "\\")):
+            try:
+                if re.search(regex, cand):
+                    strict.append(f)
+                    break
+            except re.error:
+                break  # unparseable regex -> treat as no strict match
+    if len(strict) == 1:
+        return strict[0]
+    if len(strict) > 1:
+        pick = sorted(strict)[0]
+        warnings.append(f"{key}: {len(strict)} files matched regex; picked {pick.name}")
+        return pick
+    # best-effort: score by literal token overlap with the regex
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", regex) if len(t) >= 3]
+    if not files:
+        warnings.append(f"{key}: no files available to match")
+        return None
+    best = max(files, key=lambda f: sum(1 for t in tokens if t.lower() in f.name.lower()))
+    best_score = sum(1 for t in tokens if t.lower() in best.name.lower())
+    if best_score == 0:
+        warnings.append(f"{key}: no regex match and no token overlap; "
+                        f"candidates={[f.name for f in files]}")
+        return None
+    warnings.append(f"{key}: no exact regex match; best-effort picked {best.name}")
+    return best
+
+
+def _resolve_ingredient_arg(config_ini: Path, ingredient_name: str,
+                            ingredient_path: str) -> tuple:
+    """Turn a directory (or dict-string) into the {key: path} dict-string cli.py wants.
+
+    Regex matching is advisory: it never fails, only warns. If the ingredient has no
+    config section, or an explicit dict-string is given, the input is passed through.
+    """
+    warnings: list = []
+    stripped = ingredient_path.strip()
+    if stripped.startswith("{"):
+        try:
+            if isinstance(ast.literal_eval(stripped), dict):
+                return ingredient_path, warnings  # explicit override, verbatim
+        except (ValueError, SyntaxError):
+            pass
+    regex_dict = _read_regex_mandatory(config_ini, ingredient_name)
+    if not regex_dict:
+        return ingredient_path, warnings  # back-compat passthrough
+    p = Path(ingredient_path)
+    if p.is_dir():
+        files = [q for q in p.rglob("*") if q.is_file()]
+    elif p.is_file():
+        files = [p]
+    else:
+        files = []
+    chosen = {}
+    for key, regex in regex_dict.items():
+        picked = _pick_file(regex, files, warnings, key)
+        if picked is not None:
+            chosen[key] = str(picked)
+    if len(chosen) == len(regex_dict) and chosen:
+        return str(chosen), warnings
+    warnings.append(f"{ingredient_name}: could not resolve all mandatory files "
+                    f"({len(chosen)}/{len(regex_dict)}); passing path through")
+    return ingredient_path, warnings
 
 
 def extract_stitch_tool(archive_path: str) -> dict:
@@ -91,9 +181,9 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
     if not Path(binary_file).is_file():
         return err(ErrorCode.INVALID_ARGUMENT, "binary_file not found",
                    {"param": "binary_file", "expected": "existing file"})
-    if not Path(ingredient_path).exists():
+    if not ingredient_path.strip().startswith("{") and not Path(ingredient_path).exists():
         return err(ErrorCode.INVALID_ARGUMENT, "ingredient_path not found",
-                   {"param": "ingredient_path", "expected": "existing path"})
+                   {"param": "ingredient_path", "expected": "existing path or dict-string"})
 
     config_dir = (sdir / "config").resolve()
     if "/" not in config_ini and "\\" not in config_ini:
@@ -114,11 +204,14 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
         return err(ErrorCode.INVALID_ARGUMENT, "soft_strap has invalid syntax",
                    {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
 
+    ingredient_arg, ingredient_warnings = _resolve_ingredient_arg(
+        resolved_ini, ingredient_name, ingredient_path)
+
     vpython = _find_venv_python(sdir)
     cmd = [str(vpython), "cli.py",
            "--binary_file", binary_file,
            "--ingredient_name", ingredient_name,
-           "--ingredient_path", ingredient_path,
+           "--ingredient_path", ingredient_arg,
            "--config_ini", str(resolved_ini)]
     if soft_strap:
         cmd += ["--soft_strap", soft_strap]
@@ -140,4 +233,5 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
     if not bins:
         return err(ErrorCode.STITCH_RUN_FAILED, "stitch succeeded but produced no .bin",
                    {"exit_code": 0, "log_tail": combined[-2000:], "full_log_path": str(log_path)})
-    return ok({"stitched_bin": str(bins[-1]), "log_path": str(log_path), "exit_code": 0})
+    return ok({"stitched_bin": str(bins[-1]), "log_path": str(log_path),
+               "exit_code": 0, "warnings": ingredient_warnings})
