@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import archive, config, downloader, fiv_portal, oem_parser, stitch_runner
+from . import archive, config, downloader, fiv_portal, oem_parser, prepare, stitch_runner
 from .result import err, ErrorCode
 
 mcp = FastMCP("ifwi-stitching-mcp")
@@ -71,6 +71,17 @@ def fiv_match_build_by_oem(project: str, product: str, ifwi_version: str, flavor
 
 
 @_guard
+def fiv_prepare_stitch(project: str, phase: str, version: Optional[str] = None,
+                       swimlane: Optional[str] = None) -> dict:
+    return prepare.prepare_stitch(project, phase, version, swimlane)
+
+
+@_guard
+def fiv_prepare_ingredient(project: str, name: str, version: str) -> dict:
+    return prepare.prepare_ingredient(project, name, version)
+
+
+@_guard
 def parse_ifwi_oem(local_ifwi_path: str) -> dict:
     return oem_parser.parse_ifwi_oem(local_ifwi_path)
 
@@ -105,7 +116,9 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
 # Register each plain function as an MCP tool (keeps the plain callable importable for tests).
 for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_releases,
             fiv_find_ifwi, fiv_list_ifwi_binaries, fiv_find_ingredient,
-            fiv_find_stitch_tool, fiv_match_build_by_oem, parse_ifwi_oem, download,
+            fiv_find_stitch_tool, fiv_match_build_by_oem,
+            fiv_prepare_stitch, fiv_prepare_ingredient,
+            parse_ifwi_oem, download,
             list_local_files, extract_archive, extract_stitch_tool, run_stitch):
     mcp.tool(_fn)
 

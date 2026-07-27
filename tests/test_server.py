@@ -18,6 +18,7 @@ def test_all_tools_exist():
     for name in ["fiv_list_projects", "fiv_get_project", "fiv_list_swimlanes",
                  "fiv_list_releases", "fiv_find_ifwi", "fiv_list_ifwi_binaries",
                  "fiv_find_ingredient", "fiv_find_stitch_tool", "fiv_match_build_by_oem",
+                 "fiv_prepare_stitch", "fiv_prepare_ingredient",
                  "parse_ifwi_oem", "download", "list_local_files",
                  "extract_archive", "extract_stitch_tool", "run_stitch", "main"]:
         assert hasattr(server, name), name
@@ -48,3 +49,12 @@ def test_wrapper_maps_unexpected_exception(fiv_env, monkeypatch):
     result = server.parse_ifwi_oem("/whatever")
     assert result["error_code"] == ErrorCode.INTERNAL_ERROR
     assert "kaboom" in result["detail"]["exception"]
+
+
+def test_fiv_prepare_stitch_wrapper_passes_through(fiv_env, monkeypatch):
+    from ifwi_mcp.result import ok
+    monkeypatch.setattr(server.prepare, "prepare_stitch",
+                        lambda *a, **k: ok({"prepared": False, "candidates": []}))
+    r = server.fiv_prepare_stitch("P", "Orange")
+    assert r["ok"] is True
+    assert r["data"]["prepared"] is False
