@@ -105,7 +105,7 @@ All tools return the unified result shape described above.
 | `parse_ifwi_oem` | `(local_ifwi_path)` | Decode the OEM region (offset `0xF00`, 256 bytes) of a local IFWI. Returns `product`, `ifwi_version`, `flavor_value`, `flavor_type`, `hash`. |
 | `download` | `(url_or_path, category="ifwi", dest_name=None)` | Download an Artifactory URL or copy a local file into the cache. `category` ∈ `ifwi` / `ingredients` / `stitch`. |
 | `list_local_files` | `()` | List files already cached across the categories. |
-| `extract_stitch_tool` | `(archive_path)` | Extract a `.zip`/`.tar*` stitch tool, build its venv, list `Config_Stitch_*.ini` targets. |
+| `extract_stitch_tool` | `(archive_path)` | Extract a `.zip`/`.tar*`/`.7z` stitch tool, build its venv, list `Config_Stitch_*.ini` targets. |
 | `run_stitch` | `(stitch_dir, binary_file, ingredient_name, ingredient_path, config_ini, soft_strap=None)` | Run the stitch tool's `cli.py` in its venv; returns the newest stitched `.bin`. |
 
 `phase` ∈ `Blue` / `Orange` / `Purple` / `Daily`. `version` matches `YYYY.WW.D.NN` (a leading dot is tolerated).

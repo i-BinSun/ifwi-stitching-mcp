@@ -52,6 +52,22 @@ def test_extract_success_lists_config_targets(clean_env, tmp_path):
         "Config_Stitch_TARGET_A", "Config_Stitch_TARGET_B"]
 
 
+def test_extract_success_7z(clean_env, tmp_path):
+    import py7zr
+    # build a .7z with the same layout by first laying files on disk
+    staging = tmp_path / "staging"
+    (staging / "Output" / "config").mkdir(parents=True)
+    (staging / "Output" / "cli.py").write_text("print('hi')\n")
+    (staging / "Output" / "config" / "Config_Stitch_TARGET_A.ini").write_text("[Configuration]\n")
+    sevenz = tmp_path / "stitch_tool.7z"
+    with py7zr.SevenZipFile(sevenz, "w") as z:
+        z.writeall(staging / "Output", "Output")
+    r = stitch_runner.extract_stitch_tool(str(sevenz))
+    assert r["ok"] is True
+    assert Path(r["data"]["stitch_dir"], "cli.py").is_file()
+    assert r["data"]["config_targets"] == ["Config_Stitch_TARGET_A"]
+
+
 def test_run_stitch_success(clean_env, tmp_path):
     zpath = tmp_path / "stitch_tool.zip"
     _make_stitch_zip(zpath)

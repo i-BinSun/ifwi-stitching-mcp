@@ -7,7 +7,7 @@ name = "ifwi-stitching-mcp"
 version = "0.1.0"
 description = "MCP server for IFWI stitching via FIV Portal"
 requires-python = ">=3.9"
-dependencies = ["fastmcp", "requests"]
+dependencies = ["fastmcp", "requests", "py7zr"]
 
 [project.optional-dependencies]
 dev = ["pytest", "responses"]
