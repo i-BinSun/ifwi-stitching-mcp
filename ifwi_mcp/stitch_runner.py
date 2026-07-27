@@ -5,15 +5,11 @@ The only module that shells out (subprocess) or creates venvs.
 import re
 import subprocess
 import sys
-import tarfile
 import venv
-import zipfile
 from pathlib import Path
 from typing import Optional
 
-import py7zr
-
-from . import config
+from . import archive, config
 from .result import ok, err, ErrorCode
 
 _SOFT_STRAP_RE = re.compile(r"^(\w+:\w+=[^,\s]+)([ ,]\w+:\w+=[^,\s]+)*$")
@@ -49,29 +45,6 @@ def _find_venv_python(stitch_dir: Path) -> Path:
     return Path(sys.executable)
 
 
-def _extract_archive(src: Path, dest: Path) -> Optional[dict]:
-    """Extract a .zip / .tar* / .7z archive into dest. Return an err dict on failure,
-    or None on success. 7z detection is by content (magic) with a suffix fallback,
-    since py7zr.is_7zfile only accepts a path."""
-    try:
-        if zipfile.is_zipfile(src):
-            with zipfile.ZipFile(src) as z:
-                z.extractall(dest)
-        elif tarfile.is_tarfile(src):
-            with tarfile.open(src) as t:
-                t.extractall(dest)
-        elif py7zr.is_7zfile(src):
-            with py7zr.SevenZipFile(src, mode="r") as z:
-                z.extractall(dest)
-        else:
-            return err(ErrorCode.EXTRACT_FAILED, "unsupported archive format",
-                       {"archive": str(src), "reason": "not zip, tar, or 7z"})
-    except (zipfile.BadZipFile, tarfile.TarError, py7zr.exceptions.ArchiveError, OSError) as exc:
-        return err(ErrorCode.EXTRACT_FAILED, "extraction failed",
-                   {"archive": str(src), "reason": str(exc)})
-    return None
-
-
 def extract_stitch_tool(archive_path: str) -> dict:
     src = Path(archive_path)
     if not src.is_file():
@@ -79,7 +52,7 @@ def extract_stitch_tool(archive_path: str) -> dict:
                    {"archive": archive_path, "reason": "not a file"})
     tool_root = config.cache_subdir("stitch") / src.name.split(".")[0]
     tool_root.mkdir(parents=True, exist_ok=True)
-    extract_err = _extract_archive(src, tool_root)
+    extract_err = archive.extract_into(src, tool_root)
     if extract_err:
         return extract_err
 

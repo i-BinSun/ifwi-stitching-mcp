@@ -19,7 +19,7 @@ def test_all_tools_exist():
                  "fiv_list_releases", "fiv_find_ifwi", "fiv_list_ifwi_binaries",
                  "fiv_find_ingredient", "fiv_find_stitch_tool", "fiv_match_build_by_oem",
                  "parse_ifwi_oem", "download", "list_local_files",
-                 "extract_stitch_tool", "run_stitch", "main"]:
+                 "extract_archive", "extract_stitch_tool", "run_stitch", "main"]:
         assert hasattr(server, name), name
 
 

@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import config, downloader, fiv_portal, oem_parser, stitch_runner
+from . import archive, config, downloader, fiv_portal, oem_parser, stitch_runner
 from .result import err, ErrorCode
 
 mcp = FastMCP("ifwi-stitching-mcp")
@@ -86,6 +86,11 @@ def list_local_files() -> dict:
 
 
 @_guard
+def extract_archive(archive_path: str, dest_name: Optional[str] = None) -> dict:
+    return archive.extract_archive(archive_path, dest_name)
+
+
+@_guard
 def extract_stitch_tool(archive_path: str) -> dict:
     return stitch_runner.extract_stitch_tool(archive_path)
 
@@ -101,7 +106,7 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredient_name: str,
 for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_releases,
             fiv_find_ifwi, fiv_list_ifwi_binaries, fiv_find_ingredient,
             fiv_find_stitch_tool, fiv_match_build_by_oem, parse_ifwi_oem, download,
-            list_local_files, extract_stitch_tool, run_stitch):
+            list_local_files, extract_archive, extract_stitch_tool, run_stitch):
     mcp.tool(_fn)
 
 
