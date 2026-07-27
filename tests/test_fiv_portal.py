@@ -352,6 +352,28 @@ def test_find_stitch_tool_none(fiv_env):
 
 
 @responses.activate
+def test_find_stitch_tool_collateral_empty_binaries(fiv_env):
+    # The stitch-tool package is collateral: it carries NO .bin (empty binary_list).
+    # It must still be found.
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": "https://art/root/",
+        "swimlane_branch": "main",
+        "build_target": [
+            {"package_name": "OakStreamRp_DMR_FSP_Glue_Debug", "package_path": "g/glue.7z",
+             "binary_list": [{"full_binary_name": "a.bin"}]},
+            {"package_name": "IFWI_Stitch_Tool_Release", "package_path": "s/stitch.7z",
+             "binary_list": []},
+        ],
+    }, status=200)
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["ok"] is True
+    assert r["data"]["stitch_url"] == "https://art/root/s/stitch.7z"
+    assert r["data"]["package_name"] == "IFWI_Stitch_Tool_Release"
+    assert r["data"]["binaries"] == []
+
+
+@responses.activate
 def test_match_build_by_oem_single(fiv_env):
     responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
     # list_swimlanes call (no swimlane) -> one lane

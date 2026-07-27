@@ -408,12 +408,15 @@ def find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[
     for target in data.get("build_target", []):
         name = target.get("package_name") or ""
         available.append(name)
-        binaries = target.get("binary_list") or []
-        if "stitch" in name.lower() and binaries:
-            # package_path is the downloadable .7z package; full_binary_name may list
-            # several files (comma-separated) inside it.
-            files = [fn.strip() for fn in (binaries[0].get("full_binary_name") or "").split(",")
-                     if fn.strip()]
+        # Stitch-tool packages are collateral and carry no .bin, so do NOT require a
+        # non-empty binary_list. Match by package name; list any binaries if present.
+        if "stitch" in name.lower():
+            files = []
+            for entry in (target.get("binary_list") or []):
+                for fn in (entry.get("full_binary_name") or "").split(","):
+                    fn = fn.strip()
+                    if fn:
+                        files.append(fn)
             return ok({"stitch_url": release_root + (target.get("package_path") or ""),
                        "package_name": name, "binaries": files})
     return err(ErrorCode.STITCH_TOOL_NOT_FOUND, "no stitch package found",
