@@ -62,13 +62,30 @@ def test_prepare_stitch_version_absent_offers_adjacent(fakes):
                          "2026.29.6.02", "2026.28.3.05"]
     fakes["stitch_by_version"] = {"2026.30.4.01": "https://art/a.7z",
                                   "2026.29.6.02": "https://art/b.7z"}
-    r = prepare.prepare_stitch("P", "Orange", "2026.30.2.01")
+    r = prepare.prepare_stitch("P", "Orange", "2026.30.2.01", search_neighbors=True)
     assert r["ok"] is True
     assert r["data"]["prepared"] is False
     vers = [c["version"] for c in r["data"]["candidates"]]
     assert vers == ["2026.30.4.01", "2026.29.6.02"]  # nearest-first
     assert fakes["downloaded"] == []                  # nothing downloaded on selection
     assert r["data"]["warnings"]
+
+
+def test_prepare_stitch_version_absent_default_fails_fast(fakes, monkeypatch):
+    # Same setup as the adjacent-candidates test, but without search_neighbors=True.
+    fakes["releases"] = ["2026.31.1.01", "2026.30.4.01", "2026.30.2.01",
+                         "2026.29.6.02", "2026.28.3.05"]
+    fakes["stitch_by_version"] = {"2026.30.4.01": "https://art/a.7z",
+                                  "2026.29.6.02": "https://art/b.7z"}
+
+    def boom(*a, **k):
+        raise AssertionError("list_releases should not be called without search_neighbors")
+    monkeypatch.setattr(prepare.fiv_portal, "list_releases", boom)
+
+    r = prepare.prepare_stitch("P", "Orange", "2026.30.2.01")
+    assert r["ok"] is False
+    assert r["error_code"] == ErrorCode.STITCH_TOOL_NOT_FOUND
+    assert r["detail"]["version"] == "2026.30.2.01"
 
 
 def test_prepare_stitch_no_version_scans_backward(fakes):

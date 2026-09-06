@@ -69,3 +69,26 @@ def test_list_local_files(clean_env, tmp_path):
     assert listing["ok"] is True
     names = [f["path"].split("/")[-1] for f in listing["data"]["files"]]
     assert "a.bin" in names
+
+
+def test_local_copy_is_skipped_on_second_call(clean_env, tmp_path):
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"hello")
+    first = downloader.download(str(src), category="ifwi")
+    assert first["data"]["source"] == "copy"
+    src.unlink()  # prove the second call doesn't re-read the source at all
+    second = downloader.download(str(src), category="ifwi")
+    assert second["ok"] is True
+    assert second["data"]["source"] == "cache"
+    assert second["data"]["local_path"] == first["data"]["local_path"]
+
+
+@responses.activate
+def test_url_download_is_skipped_on_second_call(clean_env, monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "tok")
+    responses.add(responses.GET, "https://artifactory/y.bin", body=b"binary", status=200)
+    first = downloader.download("https://artifactory/y.bin", category="ingredients")
+    assert first["data"]["source"] == "download"
+    second = downloader.download("https://artifactory/y.bin", category="ingredients")
+    assert second["data"]["source"] == "cache"
+    assert len(responses.calls) == 1  # no second HTTP request

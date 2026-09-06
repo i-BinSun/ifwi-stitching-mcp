@@ -6,7 +6,7 @@ from typing import Optional
 
 import py7zr
 
-from . import config
+from . import config, lock
 from .result import ok, err, ErrorCode
 
 
@@ -47,18 +47,34 @@ def extract_archive(archive_path: str, dest_name: Optional[str] = None) -> dict:
     Returns extract_dir, the file count, and the extracted .bin files (the common
     payload of interest for IFWI packages).
     """
-    src = Path(archive_path)
-    if not src.is_file():
-        return err(ErrorCode.EXTRACT_FAILED, "archive not found",
-                   {"archive": archive_path, "reason": "not a file"})
     if dest_name and (("/" in dest_name) or ("\\" in dest_name) or (".." in dest_name)):
         return err(ErrorCode.INVALID_ARGUMENT, "dest_name must be a bare filename",
                    {"param": "dest_name", "expected": "no path separators or .."})
+    src = Path(archive_path)
     dest = config.cache_subdir("extracted") / (dest_name or src.name.split(".")[0])
-    dest.mkdir(parents=True, exist_ok=True)
-    failure = extract_into(src, dest)
-    if failure:
-        return failure
-    files = [p for p in dest.rglob("*") if p.is_file()]
-    bins = sorted(str(p) for p in files if p.suffix.lower() == ".bin")
-    return ok({"extract_dir": str(dest), "file_count": len(files), "bins": bins})
+
+    def _describe(source: str) -> dict:
+        files = [p for p in dest.rglob("*") if p.is_file()]
+        bins = sorted(str(p) for p in files if p.suffix.lower() == ".bin")
+        return ok({"extract_dir": dest.as_posix(), "file_count": len(files), "bins": bins,
+                   "source": source})
+
+    if dest.is_dir() and any(dest.rglob("*")):
+        return _describe("cache")
+
+    if not src.is_file():
+        return err(ErrorCode.EXTRACT_FAILED, "archive not found",
+                   {"archive": archive_path, "reason": "not a file"})
+
+    try:
+        with lock.acquire(str(dest)):
+            if dest.is_dir() and any(dest.rglob("*")):
+                return _describe("cache")
+            dest.mkdir(parents=True, exist_ok=True)
+            failure = extract_into(src, dest)
+            if failure:
+                return failure
+            return _describe("extract")
+    except TimeoutError as exc:
+        return err(ErrorCode.LOCK_TIMEOUT, "timed out waiting for another extraction of the same archive",
+                   {"dest": str(dest), "reason": str(exc)})

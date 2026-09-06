@@ -23,6 +23,10 @@ htmlcov/
 .mcp.json
 .superpowers/
 
+# Local secrets / runtime config
+.env
+config.json
+
 # Editor / OS
 .idea/
 .vscode/

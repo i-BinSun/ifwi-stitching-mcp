@@ -292,9 +292,10 @@ def list_ifwi_binaries(project: str, phase: str, version: str,
                        swimlane: Optional[str] = None) -> dict:
     """List every IFWI binary across all build targets of a release.
 
-    Unlike find_ifwi (which returns just the first binary of the first target),
-    this enumerates all build targets, and for each the downloadable .7z package
-    URL and the individual .bin files it contains.
+    This is the *fallback* listing: it enumerates every build target and the .7z
+    package each one ships. Prefer list_release_binaries, which returns the curated
+    IFWI binaries of the release report; only fall back here when the user says none
+    of those are the one they want (or no report exists).
     """
     bad = _validate_common(project, phase, version)
     if bad:
@@ -363,6 +364,109 @@ def _resolve_swimlane_or_multi(project, phase, version, swimlane):
     return ok({"swimlane": candidates[0] if candidates else None})
 
 
+def list_release_binaries(project: str, phase: str, version: str,
+                          swimlane: Optional[str] = None) -> dict:
+    """List the IFWI binaries published in a release's report (get_release_binary).
+
+    This is the preferred way to pick an IFWI: the report holds the curated, validated
+    binaries for the release, and each entry links straight to a .bin - no .7z package
+    to download and extract. When no report exists the caller should fall back to
+    list_ifwi_binaries, which enumerates every build target instead.
+    """
+    bad = _validate_common(project, phase, version)
+    if bad:
+        return bad
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    lane = _resolve_swimlane_or_multi(project, phase, version, swimlane)
+    if not lane["ok"]:
+        return lane
+    swimlane = lane["data"]["swimlane"]
+
+    params = {"project_id": pid["data"]["project_id"], "phase": phase, "version": version}
+    if swimlane:
+        params["swimlane"] = swimlane
+    result = _get("get_release_binary/", params)
+    if not result["ok"]:
+        return result
+    data = result["data"]["json"]
+    # A missing report is reported as HTTP 200 with an error envelope, not a 404.
+    if not isinstance(data, dict) or data.get("code") == 1 or "binaries" not in data:
+        reason = (data or {}).get("error") if isinstance(data, dict) else "unexpected payload"
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no release report for this version",
+                   {"project": project, "phase": phase, "version": version,
+                    "swimlane": swimlane, "reason": reason})
+
+    binaries = []
+    for entry in data.get("binaries") or []:
+        urls = [u for u in (entry.get("binary_list") or []) if u]
+        binaries.append({
+            "binary_id": entry.get("binary_id"),
+            "binary_name": entry.get("binary_name"),
+            "short_name": entry.get("short_name"),
+            "validated": entry.get("validated"),
+            "url": urls[0] if urls else None,
+            "urls": urls,
+        })
+    if not binaries:
+        return err(ErrorCode.RELEASE_NOT_FOUND, "release report lists no IFWI binaries",
+                   {"project": project, "phase": phase, "version": version})
+    return ok({"project_id": pid["data"]["project_id"], "phase": phase, "version": version,
+               "swimlane_branch": data.get("swimlane_branch"),
+               "daily_hash": data.get("daily_hash"),
+               "count": len(binaries), "binaries": binaries, "source": "release_report"})
+
+
+def get_binary_ingredients(project: str, phase: str, version: str, binary_name: str,
+                           swimlane: Optional[str] = None, package_name: Optional[str] = None) -> dict:
+    """Look up the ingredients baked into one specific release binary (get_release_binary_info).
+
+    binary_name must match a build's ifwi_target_name exactly (the `binary_name` field from
+    list_release_binaries / list_ifwi_binaries). Returns each ingredient's name, version and
+    other properties - e.g. to read off which MMC version shipped in a given .bin.
+    """
+    bad = _validate_common(project, phase, version)
+    if bad:
+        return bad
+    if not binary_name:
+        return err(ErrorCode.INVALID_ARGUMENT, "binary_name is required",
+                   {"param": "binary_name", "expected": "non-empty"})
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    lane = _resolve_swimlane_or_multi(project, phase, version, swimlane)
+    if not lane["ok"]:
+        return lane
+    swimlane = lane["data"]["swimlane"]
+
+    params = {"project_id": pid["data"]["project_id"], "phase": phase, "version": version,
+              "binary_name": binary_name}
+    if swimlane:
+        params["swimlane"] = swimlane
+    if package_name:
+        params["package_name"] = package_name
+    result = _get("get_release_binary_info/", params)
+    if not result["ok"]:
+        return result
+    data = result["data"]["json"]
+    # Same error envelope shape as get_release_binary/: HTTP 200 with {"code": 1, ...}.
+    if not isinstance(data, dict) or data.get("code") == 1:
+        reason = (data or {}).get("error") if isinstance(data, dict) else "unexpected payload"
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no release report for this version",
+                   {"project": project, "phase": phase, "version": version,
+                    "swimlane": swimlane, "reason": reason})
+    ingredients = data.get("ingredient_list")
+    # binary_name matched nothing: the endpoint returns {} (no ingredient_list at all).
+    if not ingredients:
+        return err(ErrorCode.IFWI_BINARY_NOT_FOUND, "binary_name matched no build in this release",
+                   {"project": project, "phase": phase, "version": version,
+                    "binary_name": binary_name, "swimlane": swimlane})
+    return ok({"project_id": pid["data"]["project_id"], "phase": phase, "version": version,
+               "binary_name": binary_name, "swimlane_branch": data.get("swimlane_branch"),
+               "count": len(ingredients), "ingredients": ingredients})
+
+
 def find_ingredient(project: str, name: str, version: str) -> dict:
     if not project or not name or not version:
         return err(ErrorCode.INVALID_ARGUMENT, "project, name, version are required",
@@ -382,6 +486,120 @@ def find_ingredient(project: str, name: str, version: str) -> dict:
         return err(ErrorCode.INGREDIENT_NOT_FOUND, "no ingredient link",
                    {"candidates": [], "ingredient_name": name, "ingredient_version": version})
     return ok({"ingredient_url": link, "ingredient_name": name, "ingredient_version": version})
+
+
+def _version_sort_key(v: str):
+    parts = re.split(r"[.\-]", v)
+    return [(0, int(p)) if p.isdigit() else (1, p) for p in parts]
+
+
+def list_ingredient_versions(project: str, name: str, status: str = "ALL",
+                             include_stitch_ingredient: int = 0) -> dict:
+    """List every version FIV has ever recorded for a named ingredient.
+
+    Hits get_ingredient_version/ directly - the authoritative source - instead of
+    inferring versions by scanning historical release ingredient lists (which misses
+    any version never baked into a release binary, and can't be trusted to be complete).
+    status defaults to ALL (every VCS check-in status); the endpoint's own default is
+    'accept' only, which silently hides Pending/Reject/Revert/Close/Obsoleted/Skipped
+    entries. Note: 'ALL' must be this exact uppercase string - the server compares it
+    case-sensitively and anything else (including lowercase 'all') is treated as a
+    literal single status to filter by, matching nothing.
+    """
+    if not project or not name:
+        return err(ErrorCode.INVALID_ARGUMENT, "project, name are required",
+                   {"param": "project|name", "expected": "non-empty"})
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    result = _get("get_ingredient_version/", {
+        "project_id": pid["data"]["project_id"],
+        "ingredient_name": name,
+        "status": status,
+        "include_stitch_ingredient": include_stitch_ingredient,
+    })
+    if not result["ok"]:
+        if result.get("error_code") == ErrorCode.INTERNAL_ERROR and \
+                (result.get("detail") or {}).get("http_status") == 404:
+            return err(ErrorCode.INGREDIENT_NOT_FOUND, "no data for ingredient",
+                       {"ingredient_name": name, "project": project})
+        return result
+    payload = result["data"]["json"]
+    if not isinstance(payload, list):
+        return err(ErrorCode.INGREDIENT_NOT_FOUND, "unexpected response shape",
+                   {"ingredient_name": name, "project": project, "response": payload})
+    versions = sorted({v for v in payload if v}, key=_version_sort_key)
+    return ok({"ingredient_name": name, "status": status, "count": len(versions),
+               "versions": versions})
+
+
+def _artifactory_storage_url(url: str) -> Optional[str]:
+    """Convert an Artifactory repo-browse URL into its `api/storage` JSON-listing URL."""
+    marker = "/artifactory/"
+    idx = url.find(marker)
+    if idx == -1:
+        return None
+    prefix = url[:idx + len(marker)]
+    rest = url[idx + len(marker):]
+    if rest.startswith("api/storage/"):
+        return url
+    return f"{prefix}api/storage/{rest}"
+
+
+def _artifactory_list(url: str) -> dict:
+    """List the immediate children of an Artifactory folder via its Storage API."""
+    storage_url = _artifactory_storage_url(url)
+    if not storage_url:
+        return err(ErrorCode.INTERNAL_ERROR, "not an artifactory URL", {"url": url})
+    token = config.get_artifactory_token()
+    if not token["ok"]:
+        return token
+    try:
+        resp = requests.get(storage_url,
+                            headers={"Authorization": f"Bearer {token['data']['token']}"},
+                            timeout=60, verify=config.get_ca_bundle())
+    except requests.RequestException as exc:
+        return err(ErrorCode.INTERNAL_ERROR, "artifactory network error",
+                   {"url": storage_url, "reason": str(exc)})
+    if resp.status_code in (401, 403):
+        return err(ErrorCode.AUTH_FAILED, "artifactory rejected credentials",
+                   {"service": "artifactory", "http_status": resp.status_code})
+    if not (200 <= resp.status_code < 300):
+        return err(ErrorCode.INTERNAL_ERROR, "artifactory http error",
+                   {"url": storage_url, "http_status": resp.status_code})
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        return err(ErrorCode.INTERNAL_ERROR, "artifactory returned non-JSON", {"reason": str(exc)})
+    children = payload.get("children") or []
+    folders = [c["uri"].lstrip("/") for c in children if c.get("folder")]
+    files = [c["uri"].lstrip("/") for c in children if not c.get("folder")]
+    return ok({"folders": folders, "files": files})
+
+
+def _browse_release_root_for_stitch(release_root: str) -> Optional[dict]:
+    """Fallback for stitch tools that don't self-report in build_target metadata.
+
+    Some stitch-tool packages exist on Artifactory but are never listed by
+    get_ifwi_release_package_info. Browse release_root directly: one level down is a
+    folder per target name, one level below that is the package file itself. Returns a
+    find_stitch_tool-shaped ok() result, or None if the fallback found nothing (never
+    raises — this is best-effort and must not mask the original not-found error).
+    """
+    if not release_root:
+        return None
+    top = _artifactory_list(release_root)
+    if not top["ok"]:
+        return None
+    for folder in top["data"]["folders"]:
+        if "stitch" not in folder.lower():
+            continue
+        sub = _artifactory_list(f"{release_root}{folder}/")
+        if not sub["ok"] or not sub["data"]["files"]:
+            continue
+        return ok({"stitch_url": f"{release_root}{folder}/{sub['data']['files'][0]}",
+                   "package_name": folder, "binaries": [], "source": "artifactory_browse"})
+    return None
 
 
 def find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
@@ -418,9 +636,12 @@ def find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[
                     if fn:
                         files.append(fn)
             return ok({"stitch_url": release_root + (target.get("package_path") or ""),
-                       "package_name": name, "binaries": files})
+                       "package_name": name, "binaries": files, "source": "metadata"})
+    fallback = _browse_release_root_for_stitch(release_root)
+    if fallback:
+        return fallback
     return err(ErrorCode.STITCH_TOOL_NOT_FOUND, "no stitch package found",
-               {"available_packages": available})
+               {"available_packages": available, "release_root": release_root})
 
 
 def match_build_by_oem(project: str, product: str, ifwi_version: str, flavor: str,

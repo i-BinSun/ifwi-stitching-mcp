@@ -317,6 +317,35 @@ def test_find_ingredient_not_found(fiv_env):
 
 
 @responses.activate
+def test_list_ingredient_versions_success_dedupes_and_sorts(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ingredient_version/"),
+                  json=["0.950.0", "0.936.0", "0.943.0", "0.943.0"], status=200)
+    r = fiv_portal.list_ingredient_versions("OakStreamAP", "PowerOn_DMRAP_MMC1")
+    assert r["ok"] is True
+    assert r["data"]["versions"] == ["0.936.0", "0.943.0", "0.950.0"]
+    assert r["data"]["count"] == 3
+
+
+@responses.activate
+def test_list_ingredient_versions_defaults_status_to_all(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ingredient_version/"), json=[], status=200)
+    fiv_portal.list_ingredient_versions("OakStreamAP", "PowerOn_DMRAP_MMC1")
+    sent = responses.calls[-1].request
+    assert "status=ALL" in sent.url
+
+
+@responses.activate
+def test_list_ingredient_versions_not_found(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ingredient_version/"),
+                  body="No data has found, please check parameters.", status=404)
+    r = fiv_portal.list_ingredient_versions("OakStreamAP", "NoSuchIngredient")
+    assert r["error_code"] == ErrorCode.INGREDIENT_NOT_FOUND
+
+
+@responses.activate
 def test_find_stitch_tool_success(fiv_env):
     responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
     responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
@@ -371,6 +400,82 @@ def test_find_stitch_tool_collateral_empty_binaries(fiv_env):
     assert r["data"]["stitch_url"] == "https://art/root/s/stitch.7z"
     assert r["data"]["package_name"] == "IFWI_Stitch_Tool_Release"
     assert r["data"]["binaries"] == []
+
+
+@responses.activate
+def test_find_stitch_tool_falls_back_to_artifactory_browse(fiv_env, monkeypatch):
+    # No build_target reports a stitch package, but one exists on disk one level under
+    # release_root: <release_root>/<target-name>/<package-file>.
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "arttok")
+    root = "https://art.example.com/artifactory/repo/2026.28.3.01/"
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": root,
+        "swimlane_branch": "main",
+        "build_target": [{"package_name": "IFWI_Main", "package_path": "a/",
+                          "binary_list": [{"full_binary_name": "ifwi.bin"}]}],
+    }, status=200)
+    responses.add(responses.GET,
+                  "https://art.example.com/artifactory/api/storage/repo/2026.28.3.01/",
+                  json={"children": [
+                      {"uri": "/IFWI_Main", "folder": True},
+                      {"uri": "/IFWI_Stitch_Tool_Release_Linux", "folder": True},
+                  ]}, status=200)
+    responses.add(responses.GET,
+                  "https://art.example.com/artifactory/api/storage/repo/2026.28.3.01/"
+                  "IFWI_Stitch_Tool_Release_Linux/",
+                  json={"children": [
+                      {"uri": "/pkg_Stitch_Tool_79_BuildPkg.7z", "folder": False},
+                  ]}, status=200)
+
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["ok"] is True
+    assert r["data"]["stitch_url"] == root + "IFWI_Stitch_Tool_Release_Linux/pkg_Stitch_Tool_79_BuildPkg.7z"
+    assert r["data"]["package_name"] == "IFWI_Stitch_Tool_Release_Linux"
+    assert r["data"]["source"] == "artifactory_browse"
+    assert responses.calls[-1].request.headers["Authorization"] == "Bearer arttok"
+
+
+@responses.activate
+def test_find_stitch_tool_fallback_no_stitch_folder(fiv_env, monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "arttok")
+    root = "https://art.example.com/artifactory/repo/2026.28.3.01/"
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": root,
+        "swimlane_branch": "main",
+        "build_target": [{"package_name": "IFWI_Main", "package_path": "a/",
+                          "binary_list": [{"full_binary_name": "ifwi.bin"}]}],
+    }, status=200)
+    responses.add(responses.GET,
+                  "https://art.example.com/artifactory/api/storage/repo/2026.28.3.01/",
+                  json={"children": [{"uri": "/IFWI_Main", "folder": True}]}, status=200)
+
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["error_code"] == ErrorCode.STITCH_TOOL_NOT_FOUND
+    assert r["detail"]["release_root"] == root
+
+
+@responses.activate
+def test_find_stitch_tool_fallback_artifactory_error_falls_through(fiv_env, monkeypatch):
+    # Artifactory browse itself fails (e.g. bad/missing token) -> best-effort, must not
+    # crash find_stitch_tool; it should just fall through to the original not-found.
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "arttok")
+    root = "https://art.example.com/artifactory/repo/2026.28.3.01/"
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "release_root": root,
+        "swimlane_branch": "main",
+        "build_target": [{"package_name": "IFWI_Main", "package_path": "a/",
+                          "binary_list": [{"full_binary_name": "ifwi.bin"}]}],
+    }, status=200)
+    responses.add(responses.GET,
+                  "https://art.example.com/artifactory/api/storage/repo/2026.28.3.01/",
+                  status=403)
+
+    r = fiv_portal.find_stitch_tool("OakStreamAP", "Orange", "2026.28.3.01", swimlane="main")
+    assert r["error_code"] == ErrorCode.STITCH_TOOL_NOT_FOUND
+    assert r["detail"]["release_root"] == root
 
 
 @responses.activate

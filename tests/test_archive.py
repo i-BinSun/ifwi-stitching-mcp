@@ -71,3 +71,19 @@ def test_extract_7z_reports_bins(clean_env, tmp_path):
     assert r["ok"] is True
     assert r["data"]["extract_dir"].endswith("/out")
     assert [Path(b).name for b in r["data"]["bins"]] == ["fw.bin"]
+
+
+def test_extract_is_skipped_on_second_call(clean_env, tmp_path):
+    staging = _seed(tmp_path)
+    z = tmp_path / "pkg.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        for p in staging.rglob("*"):
+            if p.is_file():
+                zf.write(p, p.relative_to(staging))
+    first = archive.extract_archive(str(z))
+    assert first["data"]["source"] == "extract"
+    z.unlink()  # prove the second call doesn't need the archive at all
+    second = archive.extract_archive(str(tmp_path / "pkg.zip"))
+    assert second["ok"] is True
+    assert second["data"]["source"] == "cache"
+    assert second["data"]["extract_dir"] == first["data"]["extract_dir"]

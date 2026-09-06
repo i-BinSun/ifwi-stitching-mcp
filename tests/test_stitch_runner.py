@@ -77,7 +77,7 @@ def test_run_stitch_success(clean_env, tmp_path):
     binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00" * 16)
     ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
     r = stitch_runner.run_stitch(
-        stitch_dir, str(binary), "BIOS", str(ing), "Config_Stitch_TARGET_A")
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "Config_Stitch_TARGET_A")
     assert r["ok"] is True, r
     assert Path(r["data"]["stitched_bin"]).read_bytes() == b"STITCHED"
     assert r["data"]["exit_code"] == 0
@@ -91,7 +91,7 @@ def test_run_stitch_rejects_config_traversal(clean_env, tmp_path):
     binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00")
     ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
     r = stitch_runner.run_stitch(
-        stitch_dir, str(binary), "BIOS", str(ing), "../cli.py")
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "../cli.py")
     assert r["error_code"] == ErrorCode.INVALID_ARGUMENT
 
 
@@ -103,7 +103,7 @@ def test_run_stitch_bad_soft_strap(clean_env, tmp_path):
     binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00")
     ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
     r = stitch_runner.run_stitch(
-        stitch_dir, str(binary), "BIOS", str(ing), "Config_Stitch_TARGET_A",
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "Config_Stitch_TARGET_A",
         soft_strap="this is not valid")
     assert r["error_code"] == ErrorCode.INVALID_ARGUMENT
 
@@ -126,10 +126,123 @@ def test_run_stitch_nonzero_exit(clean_env, tmp_path):
     binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00")
     ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
     r = stitch_runner.run_stitch(
-        stitch_dir, str(binary), "BIOS", str(ing), "Config_Stitch_T")
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "Config_Stitch_T")
     assert r["error_code"] == ErrorCode.STITCH_RUN_FAILED
     assert r["detail"]["exit_code"] == 1
     assert "boom" in r["detail"]["log_tail"]
+
+
+def _make_legacy_stitch_zip(zip_path: Path):
+    """A minimal legacy stitch tool: no cli.py, Source/stitch2.py instead."""
+    stitch2_src = (
+        "import argparse, os, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--binary_file', required=True)\n"
+        "p.add_argument('--ingredient_name', required=True)\n"
+        "p.add_argument('--ingredient_path', required=True)\n"
+        "p.add_argument('--config_ini', required=True)\n"
+        "p.add_argument('--soft_strap', default='')\n"
+        "a = p.parse_args()\n"
+        "os.makedirs('output', exist_ok=True)\n"
+        "open(os.path.join('output', 'out_stitched.bin'), 'wb').write(b'STITCHED')\n"
+        "print('done')\n"
+        "sys.exit(0)\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as z:
+        z.writestr("Output/Source/stitch2.py", stitch2_src)
+        z.writestr("Output/Source/config/Config_Stitch_TARGET_A.ini", "[Configuration]\n")
+
+
+def test_extract_legacy_tool_finds_stitch2(clean_env, tmp_path):
+    zpath = tmp_path / "legacy_tool.zip"
+    _make_legacy_stitch_zip(zpath)
+    r = stitch_runner.extract_stitch_tool(str(zpath))
+    assert r["ok"] is True, r
+    assert Path(r["data"]["stitch_dir"]).name == "Source"
+    assert Path(r["data"]["stitch_dir"], "stitch2.py").is_file()
+    assert r["data"]["config_targets"] == ["Config_Stitch_TARGET_A"]
+
+
+def test_run_stitch_legacy_tool_uses_stitch2(clean_env, tmp_path):
+    zpath = tmp_path / "legacy_tool.zip"
+    _make_legacy_stitch_zip(zpath)
+    stitch_dir = stitch_runner.extract_stitch_tool(str(zpath))["data"]["stitch_dir"]
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00" * 16)
+    ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
+    r = stitch_runner.run_stitch(
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "Config_Stitch_TARGET_A")
+    assert r["ok"] is True, r
+    assert Path(r["data"]["stitched_bin"]).read_bytes() == b"STITCHED"
+    assert "stitch2.py" in r["data"]["command_line"]
+
+
+def _make_legacy_stitch_zip_sibling_config(zip_path: Path):
+    """Legacy layout seen in real DMR-AP packages: Config/ is a *sibling* of
+    Source/, not nested under it (Source/config does not exist)."""
+    stitch2_src = (
+        "import argparse, os, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--binary_file', required=True)\n"
+        "p.add_argument('--ingredient_name', required=True)\n"
+        "p.add_argument('--ingredient_path', required=True)\n"
+        "p.add_argument('--config_ini', required=True)\n"
+        "p.add_argument('--soft_strap', default='')\n"
+        "a = p.parse_args()\n"
+        "os.makedirs('output', exist_ok=True)\n"
+        "open(os.path.join('output', 'out_stitched.bin'), 'wb').write(b'STITCHED')\n"
+        "print('done')\n"
+        "sys.exit(0)\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as z:
+        z.writestr("Output/Source/stitch2.py", stitch2_src)
+        z.writestr("Output/Config/Config_Stitch_TARGET_A.ini", "[Configuration]\n")
+
+
+def test_extract_legacy_tool_finds_sibling_config(clean_env, tmp_path):
+    zpath = tmp_path / "legacy_sibling.zip"
+    _make_legacy_stitch_zip_sibling_config(zpath)
+    r = stitch_runner.extract_stitch_tool(str(zpath))
+    assert r["ok"] is True, r
+    assert Path(r["data"]["stitch_dir"]).name == "Source"
+    assert r["data"]["config_targets"] == ["Config_Stitch_TARGET_A"]
+
+
+def test_run_stitch_legacy_tool_sibling_config(clean_env, tmp_path):
+    zpath = tmp_path / "legacy_sibling.zip"
+    _make_legacy_stitch_zip_sibling_config(zpath)
+    stitch_dir = stitch_runner.extract_stitch_tool(str(zpath))["data"]["stitch_dir"]
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00" * 16)
+    ing = tmp_path / "ing.bin"; ing.write_bytes(b"\x01")
+    r = stitch_runner.run_stitch(
+        stitch_dir, str(binary), [{"name": "BIOS", "path": str(ing)}], "Config_Stitch_TARGET_A")
+    assert r["ok"] is True, r
+    assert Path(r["data"]["stitched_bin"]).read_bytes() == b"STITCHED"
+
+
+def test_find_config_dir_sibling(clean_env, tmp_path):
+    root = tmp_path / "root"
+    (root / "Source").mkdir(parents=True)
+    (root / "Config").mkdir()
+    (root / "Config" / "Config_Stitch_TARGET_A.ini").write_text("[Configuration]\n")
+    found = stitch_runner.find_config_dir(root / "Source")
+    assert found == root / "Config"
+
+
+def test_find_config_dir_none(clean_env, tmp_path):
+    d = tmp_path / "lonely"; d.mkdir()
+    assert stitch_runner.find_config_dir(d) is None
+
+
+def test_find_entry_script_prefers_cli_py(clean_env, tmp_path):
+    d = tmp_path / "both"; d.mkdir()
+    (d / "cli.py").write_text("")
+    (d / "stitch2.py").write_text("")
+    assert stitch_runner.find_entry_script(d) == "cli.py"
+
+
+def test_find_entry_script_none(clean_env, tmp_path):
+    d = tmp_path / "neither"; d.mkdir()
+    assert stitch_runner.find_entry_script(d) is None
 
 
 def test_read_regex_mandatory_reads_section(clean_env, tmp_path):
@@ -219,8 +332,88 @@ def test_run_stitch_auto_assembles_ingredient_dict(clean_env, tmp_path):
     ing = tmp_path / "ing"; ing.mkdir()
     mmc = ing / "mmc_pkg_0.915.0_00_10_sign-prod-debug_encrypt-prod_imh1-a0.bin"
     mmc.write_bytes(b"m")
-    r = stitch_runner.run_stitch(stitch_dir, str(binary), "MMC1", str(ing), "Config_Stitch_MMC")
+    r = stitch_runner.run_stitch(stitch_dir, str(binary), [{"name": "MMC1", "path": str(ing)}],
+                                 "Config_Stitch_MMC")
     assert r["ok"] is True, r
     echoed = Path(stitch_dir, "output", "ingredient_arg.txt").read_text()
     assert ast.literal_eval(echoed) == {"MMC1_file": str(mmc)}
     assert r["data"]["warnings"] == []
+
+
+def test_build_stitch_command_joins_multiple_ingredients_with_pipe(clean_env, tmp_path):
+    zpath = tmp_path / "tool.zip"
+    _make_stitch_zip(zpath)
+    stitch_dir = stitch_runner.extract_stitch_tool(str(zpath))["data"]["stitch_dir"]
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00")
+    ing1 = tmp_path / "ing1.bin"; ing1.write_bytes(b"\x01")
+    ing2 = tmp_path / "ing2.bin"; ing2.write_bytes(b"\x02")
+    r = stitch_runner.build_stitch_command(
+        stitch_dir, str(binary),
+        [{"name": "MMC1", "path": str(ing1)}, {"name": "MMC2", "path": str(ing2)}],
+        "Config_Stitch_TARGET_A")
+    assert r["ok"] is True, r
+    argv = r["data"]["argv"]
+    assert argv[argv.index("--ingredient_name") + 1] == "MMC1|MMC2"
+    assert argv[argv.index("--ingredient_path") + 1] == f"{ing1}|{ing2}"
+    assert r["data"]["ingredient_args"] == [str(ing1), str(ing2)]
+
+
+def test_build_stitch_command_rejects_empty_ingredients(clean_env, tmp_path):
+    zpath = tmp_path / "tool.zip"
+    _make_stitch_zip(zpath)
+    stitch_dir = stitch_runner.extract_stitch_tool(str(zpath))["data"]["stitch_dir"]
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"\x00")
+    r = stitch_runner.build_stitch_command(stitch_dir, str(binary), [], "Config_Stitch_TARGET_A")
+    assert r["error_code"] == ErrorCode.INVALID_ARGUMENT
+    assert r["detail"]["param"] == "ingredients"
+
+
+def _make_tool_root(tmp_path: Path, name: str) -> Path:
+    """A minimal, already-materialized-looking tool install: cli.py + config/ next
+    to a venv/ dir, with no Stitching/Output/output runtime dirs yet."""
+    root = tmp_path / name
+    (root / "config").mkdir(parents=True)
+    (root / "cli.py").write_text("print('hi')\n")
+    (root / "config" / "Config_Stitch_A.ini").write_text("[Configuration]\n")
+    (root / "venv").mkdir()
+    (root / "venv" / "marker.txt").write_text("venv")
+    return root
+
+
+def test_materialize_workspace_is_idempotent_for_same_key(clean_env, tmp_path):
+    tool_root = _make_tool_root(tmp_path, "tool")
+    first = stitch_runner.materialize_workspace(tool_root, "same-key")
+    second = stitch_runner.materialize_workspace(tool_root, "same-key")
+    assert first["ok"] is True and second["ok"] is True
+    assert first["data"]["workspace_root"] == second["data"]["workspace_root"]
+
+
+def test_materialize_workspace_links_code_without_copying(clean_env, tmp_path):
+    tool_root = _make_tool_root(tmp_path, "tool")
+    workspace = stitch_runner.materialize_workspace(tool_root, "key-1")
+    assert workspace["ok"] is True
+    ws_root = Path(workspace["data"]["workspace_root"])
+    assert (ws_root / "cli.py").read_text() == "print('hi')\n"
+    assert (ws_root / "config" / "Config_Stitch_A.ini").is_file()
+    # a hardlinked file is the *same* inode: editing through tool_root must be
+    # visible through the workspace, proving it isn't a full copy.
+    (tool_root / "cli.py").write_text("print('changed')\n")
+    assert (ws_root / "cli.py").read_text() == "print('changed')\n"
+
+
+def test_materialize_workspace_isolates_runtime_dirs_between_keys(clean_env, tmp_path):
+    tool_root = _make_tool_root(tmp_path, "tool")
+    ws1 = Path(stitch_runner.materialize_workspace(tool_root, "run-1")["data"]["workspace_root"])
+    ws2 = Path(stitch_runner.materialize_workspace(tool_root, "run-2")["data"]["workspace_root"])
+    assert ws1 != ws2
+
+    (ws1 / "output").mkdir()
+    (ws1 / "output" / "stitched.bin").write_bytes(b"one")
+    (ws1 / "Stitching").mkdir()
+
+    # run-2's workspace must not see run-1's runtime output/Stitching dirs, and
+    # tool_root itself (the shared source) must never have gained them either.
+    assert not (ws2 / "output").exists()
+    assert not (ws2 / "Stitching").exists()
+    assert not (tool_root / "output").exists()
+    assert not (tool_root / "Stitching").exists()
