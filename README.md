@@ -82,6 +82,9 @@ A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`
   },
   "deliverables": {
     "archive": true
+  },
+  "stitch": {
+    "fallback_deps": ["colorama", "crcmod", "cryptography", "lxml", "packaging", "cbor2"]
   }
 }
 ```
@@ -94,9 +97,24 @@ A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`
 | `execution.timeout_seconds` | `3600` | Kills a local run / gives up polling a remote job after this long. |
 | `execution.poll_interval_seconds` | `5` | How often a remote job's status is polled. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
+| `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
 
-`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT` and `IFWI_MCP_EXEC_TOKEN` override the file. An invalid
-execution section fails startup, so a misconfigured remote endpoint is caught before any work is done.
+`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS`
+(comma-separated) override the file. An invalid execution section fails startup, so a misconfigured remote
+endpoint is caught before any work is done.
+
+#### Dependency install when the tool ships no `requirements.txt`
+
+`extract_stitch_tool` builds a venv per tool and installs its dependencies, in order:
+
+1. `requirements.txt` next to `cli.py`/`stitch2.py`, or at the tool root.
+2. A nested `requirements_windows.txt` / `requirements_linux.txt` (picked by host platform) anywhere under
+   the tool root — legacy packages ship the FIT tool's own deps this way, several directories away from the
+   entry script (e.g. under `FITm_Py/<version>/`). This is real, not a fallback: the FIT tool is invoked with
+   `sys.executable` from that same venv, so its deps have to land there too.
+3. Only if neither is found: `stitch.fallback_deps` / `IFWI_MCP_STITCH_FALLBACK_DEPS`, if configured.
+   Nothing installs by default — set this only as a stopgap for a tool package that is missing its
+   requirements file outright, until its owner ships one.
 
 #### Configuring from the MCP host instead of a file
 
@@ -111,6 +129,7 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive` (`0`/`false`/`no`/`off` → off) |
+| `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps` (comma-separated) |
 | `IFWI_MCP_CONFIG` | path of the config file itself |
 
 Env vars always win over the file, so a shared config file can hold the defaults while one host overrides

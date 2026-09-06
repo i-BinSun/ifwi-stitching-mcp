@@ -7,7 +7,8 @@ def clean_env(monkeypatch, tmp_path):
     for var in ("FIV_BASE_URL", "FIV_TOKEN", "ARTIFACTORY_TOKEN", "IFWI_MCP_CACHE_DIR",
                 "IFWI_MCP_CONFIG", "IFWI_MCP_EXEC_MODE", "IFWI_MCP_EXEC_ENDPOINT",
                 "IFWI_MCP_EXEC_TOKEN", "IFWI_MCP_EXEC_TIMEOUT",
-                "IFWI_MCP_EXEC_POLL_INTERVAL", "IFWI_MCP_DELIVERABLES_ARCHIVE"):
+                "IFWI_MCP_EXEC_POLL_INTERVAL", "IFWI_MCP_DELIVERABLES_ARCHIVE",
+                "IFWI_MCP_STITCH_FALLBACK_DEPS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("IFWI_MCP_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("IFWI_MCP_CONFIG", str(tmp_path / "config.json"))

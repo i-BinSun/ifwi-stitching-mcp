@@ -145,6 +145,28 @@ def test_validate_startup_rejects_bad_execution_config(clean_env, write_config, 
     assert config.validate_startup()["error_code"] == ErrorCode.CONFIG_INVALID
 
 
+def test_stitch_fallback_deps_defaults_empty(clean_env):
+    assert config.get_stitch_config()["data"]["fallback_deps"] == []
+
+
+def test_stitch_fallback_deps_from_config_file(clean_env, write_config):
+    write_config({"stitch": {"fallback_deps": ["colorama", "cbor2"]}})
+    assert config.get_stitch_config()["data"]["fallback_deps"] == ["colorama", "cbor2"]
+
+
+def test_stitch_fallback_deps_env_override(clean_env, write_config, monkeypatch):
+    write_config({"stitch": {"fallback_deps": ["colorama"]}})
+    monkeypatch.setenv("IFWI_MCP_STITCH_FALLBACK_DEPS", "cryptography, lxml ,cbor2")
+    assert config.get_stitch_config()["data"]["fallback_deps"] == ["cryptography", "lxml", "cbor2"]
+
+
+def test_stitch_fallback_deps_rejects_non_list(clean_env, write_config):
+    write_config({"stitch": {"fallback_deps": "colorama"}})
+    r = config.get_stitch_config()
+    assert r["error_code"] == ErrorCode.CONFIG_INVALID
+    assert r["detail"]["param"] == "stitch.fallback_deps"
+
+
 def test_deliverables_archive_defaults_true(clean_env):
     assert config.get_deliverables_config()["data"]["archive"] is True
 

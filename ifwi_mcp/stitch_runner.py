@@ -91,6 +91,22 @@ def find_cli_dir(extract_root: Path) -> Optional[Path]:
     return None
 
 
+def _find_requirements(tool_root: Path, cli_dir: Path) -> Optional[Path]:
+    """Locate the tool's own requirements file, if it ships one.
+
+    Modern layout: requirements.txt next to cli.py. Legacy tools ship a nested
+    FIT-tool subdirectory (e.g. FITm_Py/<version>/) with platform-specific
+    requirements_windows.txt / requirements_linux.txt instead — that FIT tool is
+    invoked via sys.executable from the *same* venv, so its deps have to land here.
+    """
+    for candidate in (cli_dir / "requirements.txt", tool_root / "requirements.txt"):
+        if candidate.is_file():
+            return candidate
+    variant = "requirements_windows.txt" if sys.platform.startswith("win") else "requirements_linux.txt"
+    matches = sorted(tool_root.rglob(variant))
+    return matches[0] if matches else None
+
+
 def _venv_python(venv_dir: Path) -> Path:
     if sys.platform.startswith("win"):
         return venv_dir / "Scripts" / "python.exe"
@@ -214,20 +230,32 @@ def _extract_stitch_tool_locked(archive_path: str, tool_root: Path) -> dict:
             return err(ErrorCode.VENV_SETUP_FAILED, "venv creation failed",
                        {"pip_output": str(exc)})
     vpython = _venv_python(venv_dir)
-    reqs = cli_dir / "requirements.txt"
     deps_marker = venv_dir / ".deps_installed"
-    if reqs.is_file() and not deps_marker.is_file():
-        proc = subprocess.run([str(vpython), "-m", "pip", "install", "-r", str(reqs)],
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            return err(ErrorCode.VENV_SETUP_FAILED, "pip install failed",
-                       {"pip_output": (proc.stdout + proc.stderr)[-2000:]})
-        deps_marker.write_text("")
+    deps_source = "none"
+    if not deps_marker.is_file():
+        reqs = _find_requirements(tool_root, cli_dir)
+        pip_argv = ["-r", str(reqs)] if reqs is not None else None
+        deps_source = "requirements_file" if reqs is not None else "none"
+        if pip_argv is None:
+            fallback = config.get_stitch_config()
+            if not fallback["ok"]:
+                return fallback
+            fallback_deps = fallback["data"]["fallback_deps"]
+            if fallback_deps:
+                pip_argv = list(fallback_deps)
+                deps_source = "fallback"
+        if pip_argv is not None:
+            proc = subprocess.run([str(vpython), "-m", "pip", "install", *pip_argv],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                return err(ErrorCode.VENV_SETUP_FAILED, "pip install failed",
+                           {"pip_output": (proc.stdout + proc.stderr)[-2000:]})
+            deps_marker.write_text("")
 
     config_dir = find_config_dir(cli_dir)
     targets = sorted(p.stem for p in config_dir.glob("Config_Stitch_*.ini")) if config_dir else []
     return ok({"stitch_dir": str(cli_dir), "venv_python": str(vpython), "config_targets": targets,
-               "tool_root": str(tool_root)})
+               "tool_root": str(tool_root), "deps_source": deps_source})
 
 
 def extract_stitch_tool(archive_path: str) -> dict:

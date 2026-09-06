@@ -176,6 +176,31 @@ def get_execution_token() -> str:
     return str(loaded["data"]["section"].get("token") or "")
 
 
+def get_stitch_config() -> dict:
+    """Extra pip packages for the stitch tool's venv when it ships no requirements file.
+
+    Off by default: if neither a requirements.txt nor a platform-specific
+    requirements_windows.txt/requirements_linux.txt is found anywhere in the extracted
+    tool, nothing installs unless this is configured — so an unconfigured setup behaves
+    exactly as before. IFWI_MCP_STITCH_FALLBACK_DEPS (comma-separated) overrides the
+    stitch.fallback_deps config list.
+    """
+    loaded = _section("stitch")
+    if not loaded["ok"]:
+        return loaded
+    section, path = loaded["data"]["section"], loaded["data"]["path"]
+    env = os.environ.get("IFWI_MCP_STITCH_FALLBACK_DEPS")
+    if env is not None:
+        deps = [item.strip() for item in env.split(",") if item.strip()]
+    else:
+        raw = section.get("fallback_deps") or []
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            return err(ErrorCode.CONFIG_INVALID, "stitch.fallback_deps must be a list of strings",
+                       {"path": path, "param": "stitch.fallback_deps", "expected": "list[str]"})
+        deps = raw
+    return ok({"fallback_deps": deps, "config_path": path})
+
+
 def get_deliverables_config() -> dict:
     """How finished-job artifacts are packaged."""
     loaded = _section("deliverables")

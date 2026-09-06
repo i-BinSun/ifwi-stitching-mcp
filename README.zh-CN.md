@@ -80,6 +80,9 @@ export ARTIFACTORY_TOKEN="<artifactory-access-token>"
   },
   "deliverables": {
     "archive": true
+  },
+  "stitch": {
+    "fallback_deps": ["colorama", "crcmod", "cryptography", "lxml", "packaging", "cbor2"]
   }
 }
 ```
@@ -92,8 +95,21 @@ export ARTIFACTORY_TOKEN="<artifactory-access-token>"
 | `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程轮询超时即放弃。 |
 | `execution.poll_interval_seconds` | `5` | 远程任务状态的轮询间隔。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
+| `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
 无效的 execution 段会导致**启动失败**，因此配错的远程端点会在任何实际工作开始前就被拦下。
+
+#### 工具没有 `requirements.txt` 时的依赖安装
+
+`extract_stitch_tool` 会为每个工具建一个 venv 并安装依赖，顺序如下：
+
+1. `cli.py`/`stitch2.py` 同级目录，或工具根目录下的 `requirements.txt`。
+2. 工具根目录下任意位置（按当前系统选择）嵌套的 `requirements_windows.txt` / `requirements_linux.txt`——
+   老版本的工具包会以这种方式携带 FIT 工具自身的依赖，通常在离入口脚本好几层的地方（例如
+   `FITm_Py/<version>/` 下）。这是真实存在的文件，不是兜底：FIT 工具正是用同一个 venv 里的
+   `sys.executable` 调起的，所以它的依赖也必须装进这个 venv。
+3. 只有当以上两者都找不到时，才会用 `stitch.fallback_deps` / `IFWI_MCP_STITCH_FALLBACK_DEPS`（如果配置了的话）。
+   默认不装任何东西；只在某个工具包彻底没有 requirements 文件、且其 owner 还没补上之前，把这个当作临时手段来配置。
 
 #### 用 MCP 宿主配置，而不是配置文件
 
@@ -108,6 +124,7 @@ export ARTIFACTORY_TOKEN="<artifactory-access-token>"
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive`（`0`/`false`/`no`/`off` 表示关闭） |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
+| `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps`（逗号分隔） |
 | `IFWI_MCP_CONFIG` | 配置文件本身的路径 |
 
 环境变量优先级始终高于文件，因此可以用一份共享配置文件放默认值，再由某个宿主单独覆盖 mode。

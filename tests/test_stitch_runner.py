@@ -2,6 +2,7 @@
 import ast
 import os
 import stat
+import sys
 import zipfile
 from pathlib import Path
 import pytest
@@ -205,6 +206,50 @@ def test_extract_legacy_tool_finds_sibling_config(clean_env, tmp_path):
     assert r["ok"] is True, r
     assert Path(r["data"]["stitch_dir"]).name == "Source"
     assert r["data"]["config_targets"] == ["Config_Stitch_TARGET_A"]
+
+
+def test_extract_with_no_requirements_anywhere_installs_nothing(clean_env, tmp_path):
+    zpath = tmp_path / "no_reqs.zip"
+    _make_legacy_stitch_zip(zpath)
+    r = stitch_runner.extract_stitch_tool(str(zpath))
+    assert r["ok"] is True, r
+    assert r["data"]["deps_source"] == "none"
+    assert not (Path(r["data"]["tool_root"]) / "venv" / ".deps_installed").exists()
+
+
+def test_extract_finds_nested_platform_requirements_file(clean_env, tmp_path):
+    """Legacy packages ship the FIT tool's own deps as requirements_<platform>.txt,
+    nested under a FITm_Py subdir rather than next to stitch2.py."""
+    zpath = tmp_path / "nested_reqs.zip"
+    variant = "requirements_windows.txt" if sys.platform.startswith("win") else "requirements_linux.txt"
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr("Output/Source/stitch2.py", "import sys\nsys.exit(0)\n")
+        z.writestr("Output/Source/config/Config_Stitch_TARGET_A.ini", "[Configuration]\n")
+        z.writestr(f"Output/FITm_Py/ModularFIT_cmd_1.0.0/{variant}", "")
+    r = stitch_runner.extract_stitch_tool(str(zpath))
+    assert r["ok"] is True, r
+    assert r["data"]["deps_source"] == "requirements_file"
+    assert (Path(r["data"]["tool_root"]) / "venv" / ".deps_installed").is_file()
+
+
+def test_extract_uses_configured_fallback_deps_when_none_found(clean_env, tmp_path, monkeypatch):
+    zpath = tmp_path / "no_reqs_fallback.zip"
+    _make_legacy_stitch_zip(zpath)
+    monkeypatch.setenv("IFWI_MCP_STITCH_FALLBACK_DEPS", "colorama,cbor2")
+    calls = []
+    real_run = stitch_runner.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return real_run([argv[0], "-c", "pass"], **kwargs)
+
+    monkeypatch.setattr(stitch_runner.subprocess, "run", fake_run)
+    r = stitch_runner.extract_stitch_tool(str(zpath))
+    assert r["ok"] is True, r
+    assert r["data"]["deps_source"] == "fallback"
+    install_calls = [c for c in calls if "install" in c]
+    assert install_calls and install_calls[0][-2:] == ["colorama", "cbor2"]
+    assert (Path(r["data"]["tool_root"]) / "venv" / ".deps_installed").is_file()
 
 
 def test_run_stitch_legacy_tool_sibling_config(clean_env, tmp_path):
