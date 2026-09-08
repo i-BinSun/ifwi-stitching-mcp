@@ -116,9 +116,18 @@ def resolve_project_id(project: str) -> dict:
         return listing
     projects = listing["data"]["projects"]
     needle = project.strip().lower()
-    for p in projects:
-        if needle in (str(p.get("name", "")).lower(), str(p.get("project_name", "")).lower()):
-            return ok({"project_id": p["id"], "name": p["name"]})
+    matches = [p for p in projects
+               if needle in (str(p.get("name", "")).lower(), str(p.get("project_name", "")).lower())]
+    # dedupe by project id (the same project can appear twice if name == project_name)
+    by_id = {p["id"]: p for p in matches}
+    matches = list(by_id.values())
+    if len(matches) > 1:
+        return err(ErrorCode.PROJECT_AMBIGUOUS, "multiple projects match this name; ask the user which one",
+                   {"candidates": [{"id": p["id"], "name": p["name"], "project_name": p.get("project_name")}
+                                    for p in matches]})
+    if matches:
+        p = matches[0]
+        return ok({"project_id": p["id"], "name": p["name"]})
     return err(ErrorCode.PROJECT_NOT_FOUND, "no project matched",
                {"candidates": [p["name"] for p in projects]})
 
