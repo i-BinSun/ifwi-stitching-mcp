@@ -147,6 +147,9 @@ Windows 上。
 一个 JSON 配置文件持有**执行开关**。路径取 `IFWI_MCP_CONFIG`，默认位于缓存目录旁边
 （`~/.ifwi-stitching-mcp/config.json`）。文件不存在即表示"全部用默认值"，也就是本地执行。
 
+> **`execution.mode = "remote"` 目前还在开发中，尚不可用** —— 现在没有配套的 runner 能接收 plan。请继续使用
+> 默认的 `local` 模式；下面这些字段是为将来远程执行落地时准备的文档。
+
 ```json
 {
   "execution": {
@@ -210,6 +213,8 @@ Windows 上。
 环境变量优先级始终高于文件，因此可以用一份共享配置文件放默认值，再由某个宿主单独覆盖 mode。
 
 #### 远程 runner 协议
+
+> **尚不可用** —— 这里描述的是未来远程 runner 应该遵循的协议；目前并不存在这样的 runner。
 
 当 `mode` 为 `remote` 时，服务器会：
 

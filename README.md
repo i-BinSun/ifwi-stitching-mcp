@@ -155,6 +155,10 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`, or next to the cache dir
 (`~/.ifwi-stitching-mcp/config.json`) by default. A missing file means "all defaults", i.e. local execution.
 
+> **`execution.mode = "remote"` is still under development and not usable yet** — there is no working
+> runner to hand a plan to. Stick with the default `local` mode for now; the fields below are documented for
+> when remote execution lands.
+
 ```json
 {
   "execution": {
@@ -220,6 +224,9 @@ Env vars always win over the file, so a shared config file can hold the defaults
 just the mode.
 
 #### Remote runner contract
+
+> **Not usable yet** — describes the intended contract for a future remote runner; no such runner exists
+> today.
 
 When `mode` is `remote`, the server:
 
