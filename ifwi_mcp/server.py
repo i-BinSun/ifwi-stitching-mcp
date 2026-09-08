@@ -153,6 +153,11 @@ def fiv_prepare_stitch(project: str, phase: str, version: Optional[str] = None,
     Omit version to auto-pick the newest release that ships one. If a specific version has
     no stitch tool, this fails fast (no candidates) so the caller can tell the user first;
     re-call with search_neighbors=True to check adjacent versions and get candidates back.
+
+    Returns `config_targets`: the Config_Stitch_*.ini names (without extension) found under
+    the tool's config/ dir. Pick the one matching the chosen IFWI binary's flavor and pass
+    its bare name as `config_ini` to stitch_build_plan/run_stitch — never ask the user for a
+    local config path, it already lives inside this stitch tool.
     """
     return prepare.prepare_stitch(project, phase, version, swimlane, search_neighbors)
 
@@ -268,6 +273,12 @@ def stitch_build_plan(project: str, phase: str, ingredients: str, config_ini: st
     single run: [{"name": "PowerOn_DMRAP_MMC1", "version": "0.958.0"},
     {"name": "PowerOn_DMRAP_MMC2", "path": "/abs/dir"}]. Each entry needs a name and
     either version (fetched from FIV) or path (an existing local dir/file).
+
+    config_ini is the bare name (with or without .ini) of one of the stitch tool's own
+    Config_Stitch_*.ini files, e.g. "Config_Stitch_OKSDCRB1_IPCleanDFXEnable_Trace_DebugSigned"
+    — get the list from fiv_prepare_stitch/extract_stitch_tool's `config_targets` and match it
+    to the chosen IFWI binary's flavor. It is resolved against the prepared stitch tool's
+    config/ dir at run time, so never ask the user for a local filesystem path here.
     """
     parsed, error = _parse_ingredients(ingredients)
     if error:
