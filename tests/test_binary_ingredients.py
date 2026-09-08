@@ -46,9 +46,31 @@ def test_get_binary_ingredients_returns_list(portal):
     assert names["MMC"] == "1.2.3"
 
 
-def test_binary_name_is_required(portal):
-    r = fiv_portal.get_binary_ingredients("DMR", "Orange", "2026.35.3.01", "")
-    assert r["error_code"] == ErrorCode.INVALID_ARGUMENT
+def test_omitted_binary_name_auto_resolves_single_candidate(monkeypatch):
+    monkeypatch.setattr(fiv_portal, "list_release_binaries", lambda p, ph, v, sw: ok({
+        "binaries": [{"binary_name": "only_one", "url": "https://af/only_one.bin"}],
+        "swimlane_branch": "release/ap.b0.poweron",
+    }))
+    monkeypatch.setattr(fiv_portal, "resolve_project_id",
+                        lambda project: ok({"project_id": 232, "name": project}))
+    monkeypatch.setattr(fiv_portal, "_resolve_swimlane_or_multi",
+                        lambda p, ph, v, sw: ok({"swimlane": sw or "release/ap.b0.poweron"}))
+    monkeypatch.setattr(fiv_portal, "_get", lambda endpoint, params, prefix="app/rest": ok({"json": INFO}))
+    r = fiv_portal.get_binary_ingredients("DMR", "Orange", "2026.35.3.01")
+    assert r["ok"] is True
+    assert r["data"]["binary_name"] == "only_one"
+
+
+def test_omitted_binary_name_is_ambiguous_with_several_candidates(monkeypatch):
+    monkeypatch.setattr(fiv_portal, "list_release_binaries", lambda p, ph, v, sw: ok({
+        "binaries": [{"binary_name": "a"}, {"binary_name": "b"}],
+        "swimlane_branch": "release/ap.b0.poweron",
+    }))
+    monkeypatch.setattr(fiv_portal, "resolve_project_id",
+                        lambda project: ok({"project_id": 232, "name": project}))
+    r = fiv_portal.get_binary_ingredients("DMR", "Orange", "2026.35.3.01")
+    assert r["error_code"] == ErrorCode.IFWI_BINARY_AMBIGUOUS
+    assert r["detail"]["candidates"] == ["a", "b"]
 
 
 def test_unmatched_binary_name_is_not_found(portal):

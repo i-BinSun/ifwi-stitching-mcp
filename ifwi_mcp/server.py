@@ -55,6 +55,8 @@ def fiv_list_releases(project: str, phase: str, swimlane: Optional[str] = None) 
 def fiv_find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
     """Resolve one release's IFWI package: the downloadable .7z URL and the .bin names inside it.
 
+    Don't just report the version and go: always show the returned `binaries` names to
+    the user and let them pick which one they want before downloading anything.
     Returns MULTIPLE_SWIMLANES with candidates when swimlane is omitted and several exist.
     """
     return fiv_portal.find_ifwi(project, phase, version, swimlane)
@@ -68,6 +70,11 @@ def fiv_list_release_binaries(project: str, phase: str, version: str,
     These are the curated, validated binaries of the release, each linking straight to a
     .bin. Show them to the user; only if they say none is the right one, fall back to
     fiv_list_ifwi_binaries, which enumerates every build target of the release.
+
+    IMPORTANT: when `count` > 1, do not pick one yourself for ANY purpose - not just
+    downloading. That includes answering data questions ("what MMC version does the latest
+    release use?", "what's the download URL?"). Always list every `binary_name` and ask the
+    user which one they mean before calling fiv_get_binary_ingredients or fiv_prepare_ifwi.
     """
     return fiv_portal.list_release_binaries(project, phase, version, swimlane)
 
@@ -84,13 +91,20 @@ def fiv_list_ifwi_binaries(project: str, phase: str, version: str,
 
 
 @_guard
-def fiv_get_binary_ingredients(project: str, phase: str, version: str, binary_name: str,
+def fiv_get_binary_ingredients(project: str, phase: str, version: str,
+                               binary_name: Optional[str] = None,
                                swimlane: Optional[str] = None,
                                package_name: Optional[str] = None) -> dict:
     """List the ingredients (name, version, ...) baked into one specific release binary.
 
     binary_name must match exactly (the `binary_name` field from fiv_list_release_binaries /
     fiv_list_ifwi_binaries), e.g. to read off which MMC version shipped in a given .bin.
+
+    Omit binary_name only when you haven't checked the release yet: if the release has more
+    than one binary, this refuses to guess and returns IFWI_BINARY_AMBIGUOUS with every
+    candidate - show that list to the user and ask which one they mean before answering any
+    question about ingredient/MMC versions. Never call this with an arbitrarily-picked
+    binary_name when fiv_list_release_binaries showed several candidates.
     """
     return fiv_portal.get_binary_ingredients(project, phase, version, binary_name,
                                              swimlane, package_name)

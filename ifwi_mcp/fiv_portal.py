@@ -418,23 +418,39 @@ def list_release_binaries(project: str, phase: str, version: str,
                "count": len(binaries), "binaries": binaries, "source": "release_report"})
 
 
-def get_binary_ingredients(project: str, phase: str, version: str, binary_name: str,
+def get_binary_ingredients(project: str, phase: str, version: str, binary_name: Optional[str] = None,
                            swimlane: Optional[str] = None, package_name: Optional[str] = None) -> dict:
     """Look up the ingredients baked into one specific release binary (get_release_binary_info).
 
     binary_name must match a build's ifwi_target_name exactly (the `binary_name` field from
     list_release_binaries / list_ifwi_binaries). Returns each ingredient's name, version and
     other properties - e.g. to read off which MMC version shipped in a given .bin.
+
+    binary_name may be omitted only when the release report lists exactly one binary; when
+    it lists several, this refuses to guess and returns IFWI_BINARY_AMBIGUOUS with every
+    candidate name instead - the caller must show them to the user and let them pick before
+    asking anything about ingredients (never silently pick one, e.g. the first result).
     """
     bad = _validate_common(project, phase, version)
     if bad:
         return bad
-    if not binary_name:
-        return err(ErrorCode.INVALID_ARGUMENT, "binary_name is required",
-                   {"param": "binary_name", "expected": "non-empty"})
     pid = resolve_project_id(project)
     if not pid["ok"]:
         return pid
+
+    if not binary_name:
+        report = list_release_binaries(project, phase, version, swimlane)
+        if not report["ok"]:
+            return report
+        binaries = report["data"]["binaries"]
+        if len(binaries) > 1:
+            return err(ErrorCode.IFWI_BINARY_AMBIGUOUS,
+                       "release report lists several IFWI binaries; show them to the user "
+                       "and pick one with binary_name before asking about ingredients",
+                       {"candidates": [b.get("binary_name") for b in binaries]})
+        binary_name = binaries[0]["binary_name"]
+        swimlane = swimlane or report["data"]["swimlane_branch"]
+
     lane = _resolve_swimlane_or_multi(project, phase, version, swimlane)
     if not lane["ok"]:
         return lane
