@@ -25,7 +25,7 @@ def _get(endpoint: str, params: dict, prefix: str = "app/rest") -> dict:
     try:
         resp = requests.get(url, params=params,
                             headers={"Authorization": auth["data"]["header_value"]}, timeout=60,
-                            verify=config.get_ca_bundle())
+                            verify=False)
     except requests.RequestException as exc:
         return err(ErrorCode.INTERNAL_ERROR, "fiv network error", {"url": url, "reason": str(exc)})
     if resp.status_code in (401, 403):
@@ -573,7 +573,7 @@ def _artifactory_list(url: str) -> dict:
     try:
         resp = requests.get(storage_url,
                             headers={"Authorization": f"Bearer {token['data']['token']}"},
-                            timeout=60, verify=config.get_ca_bundle())
+                            timeout=60, verify=False)
     except requests.RequestException as exc:
         return err(ErrorCode.INTERNAL_ERROR, "artifactory network error",
                    {"url": storage_url, "reason": str(exc)})

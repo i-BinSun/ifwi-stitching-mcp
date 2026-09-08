@@ -48,8 +48,8 @@ pip install -e ".[dev]"
 
 ### 配置
 
-服务器需要三个值：`FIV_BASE_URL`（启动时必需）、`FIV_TOKEN` 和 `ARTIFACTORY_TOKEN`（懒校验，只有调用到
-需要它们的工具时才检查）。
+服务器需要 `FIV_TOKEN` 和 `ARTIFACTORY_TOKEN`（懒校验，只有调用到需要它们的工具时才检查）。`FIV_BASE_URL`
+默认值为 `https://fiv-ifwi.intel.com`，只有在使用不同的 FIV Portal 时才需要设置。
 
 把 [`.env.example`](.env.example) 复制成项目根目录下的 `.env` 并填入自己的值：
 
@@ -62,7 +62,7 @@ cp .env.example .env
 
 | 变量 | 是否必需 | 用途 |
 |------|----------|------|
-| `FIV_BASE_URL` | **是** | FIV Portal 的基础 URL，例如 `https://fiv.example.com`。 |
+| `FIV_BASE_URL` | 否 | FIV Portal 的基础 URL，默认 `https://fiv-ifwi.intel.com`。 |
 | `FIV_TOKEN` | 调用 FIV 时 | FIV 访问 token，以 `Authorization: Bearer <token>` 发送。 |
 | `ARTIFACTORY_TOKEN` | 下载时 | Artifactory 访问 token，下载产物时以同样方式发送。 |
 | `IFWI_MCP_CACHE_DIR` | 否 | 缓存根目录，默认 `~/.ifwi-stitching-mcp/cache`。 |

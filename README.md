@@ -50,8 +50,9 @@ pip install -e ".[dev]"
 
 ### Configuration
 
-The server needs three values: `FIV_BASE_URL` (required at startup), `FIV_TOKEN` and `ARTIFACTORY_TOKEN`
-(validated lazily, only when a tool that needs them is called).
+The server needs `FIV_TOKEN` and `ARTIFACTORY_TOKEN` (validated lazily, only when a tool that needs them is
+called). `FIV_BASE_URL` defaults to `https://fiv-ifwi.intel.com` and only needs to be set if you use a
+different FIV Portal.
 
 Copy [`.env.example`](.env.example) to `.env` in the project root and fill in your values:
 
@@ -65,7 +66,7 @@ startup — no host-specific `envFile` setting required. Values already present 
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `FIV_BASE_URL` | **yes** | Base URL of the FIV Portal, e.g. `https://fiv.example.com`. |
+| `FIV_BASE_URL` | no | Base URL of the FIV Portal. Defaults to `https://fiv-ifwi.intel.com`. |
 | `FIV_TOKEN` | for FIV calls | The FIV access token, sent as `Authorization: Bearer <token>`. |
 | `ARTIFACTORY_TOKEN` | for downloads | The Artifactory access token, sent the same way when downloading artifacts. |
 | `IFWI_MCP_CACHE_DIR` | no | Cache root. Defaults to `~/.ifwi-stitching-mcp/cache`. |

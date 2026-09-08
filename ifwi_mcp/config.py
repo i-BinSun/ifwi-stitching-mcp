@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+import urllib3
 from dotenv import load_dotenv
 
 from .result import ok, err, ErrorCode
@@ -14,6 +15,10 @@ from .result import ok, err, ErrorCode
 # Loads .env from the cwd or one of its parents; never overrides a var already set
 # (e.g. inline in an MCP host's `env` block), so hosts always take priority.
 load_dotenv()
+
+# All outbound requests use verify=False (see fiv_portal/downloader/executor/deliverables);
+# suppress the resulting per-request InsecureRequestWarning noise.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _DEFAULT_CACHE = Path.home() / ".ifwi-stitching-mcp" / "cache"
 _EXEC_MODES = ("local", "remote")
@@ -26,7 +31,7 @@ class ConfigError(Exception):
 
 
 def get_base_url() -> str:
-    return os.environ.get("FIV_BASE_URL", "").rstrip("/")
+    return os.environ.get("FIV_BASE_URL", "https://fiv-ifwi.intel.com").rstrip("/")
 
 
 def get_cache_dir() -> Path:
@@ -38,24 +43,6 @@ def cache_subdir(name: str) -> Path:
     sub = get_cache_dir() / name
     sub.mkdir(parents=True, exist_ok=True)
     return sub
-
-
-def get_ca_bundle():
-    """CA bundle for TLS verification of FIV/Artifactory requests.
-
-    Honors FIV_CA_BUNDLE / REQUESTS_CA_BUNDLE if set; otherwise falls back to the
-    system trust store (holds the Intel intranet CAs). Returns a path str, or True
-    to use requests' default certifi bundle if no system store is found.
-    """
-    for var in ("FIV_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
-        val = os.environ.get(var)
-        if val:
-            return val
-    for candidate in ("/etc/ssl/certs/ca-certificates.crt",
-                      "/etc/pki/tls/certs/ca-bundle.crt"):
-        if os.path.exists(candidate):
-            return candidate
-    return True
 
 
 def get_fiv_auth_header() -> dict:

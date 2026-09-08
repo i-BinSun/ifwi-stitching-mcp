@@ -122,7 +122,7 @@ def fetch(plan_id: str, entries: list, token: str = "") -> dict:
         target = _target(dest, name)
         try:
             resp = requests.get(url, headers=headers, stream=True,
-                                timeout=_DOWNLOAD_TIMEOUT, verify=config.get_ca_bundle())
+                                timeout=_DOWNLOAD_TIMEOUT, verify=False)
             resp.raise_for_status()
             with target.open("wb") as handle:
                 for chunk in resp.iter_content(chunk_size=65536):

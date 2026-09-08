@@ -218,7 +218,7 @@ def _submit(endpoint: str, token: str, plan: dict) -> dict:
     try:
         resp = requests.post(f"{endpoint}/jobs", json={"plan": plan},
                              headers=_headers(token), timeout=_SUBMIT_TIMEOUT,
-                             verify=config.get_ca_bundle())
+                             verify=False)
     except requests.RequestException as exc:
         return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach the stitch runner",
                    {"endpoint": endpoint, "reason": str(exc)})
@@ -248,7 +248,7 @@ def _poll(endpoint: str, token: str, job_id: str, timeout_seconds: int,
     while True:
         try:
             resp = requests.get(f"{endpoint}/jobs/{job_id}", headers=_headers(token),
-                                timeout=_POLL_TIMEOUT, verify=config.get_ca_bundle())
+                                timeout=_POLL_TIMEOUT, verify=False)
         except requests.RequestException as exc:
             return err(ErrorCode.REMOTE_EXEC_FAILED, "lost contact with the stitch runner",
                        {"endpoint": endpoint, "job_id": job_id, "reason": str(exc)})
