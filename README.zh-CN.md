@@ -64,6 +64,9 @@ export FIV_TOKEN="<fiv-access-token>"
 export ARTIFACTORY_TOKEN="<artifactory-access-token>"
 ```
 
+也可以把 [`.env.example`](.env.example) 复制成 `.env` 再填入自己的值——这个文件已被 gitignore，也正是下面
+VS Code `envFile` 配置所期望的文件。
+
 ### 配置文件 —— 决定 stitch 任务在哪里跑
 
 一个 JSON 配置文件持有**执行开关**。路径取 `IFWI_MCP_CONFIG`，默认位于缓存目录旁边

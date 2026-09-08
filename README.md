@@ -66,6 +66,9 @@ export FIV_TOKEN="<fiv-access-token>"
 export ARTIFACTORY_TOKEN="<artifactory-access-token>"
 ```
 
+Or copy [`.env.example`](.env.example) to `.env` and fill in your values — it's gitignored, and is what the
+VS Code `envFile` config below expects.
+
 ### Config file — where stitch jobs run
 
 A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`, or next to the cache dir
