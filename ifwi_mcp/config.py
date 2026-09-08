@@ -7,7 +7,13 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 from .result import ok, err, ErrorCode
+
+# Loads .env from the cwd or one of its parents; never overrides a var already set
+# (e.g. inline in an MCP host's `env` block), so hosts always take priority.
+load_dotenv()
 
 _DEFAULT_CACHE = Path.home() / ".ifwi-stitching-mcp" / "cache"
 _EXEC_MODES = ("local", "remote")
