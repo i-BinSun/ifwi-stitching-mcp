@@ -172,6 +172,68 @@ def _pick_file(regex: str, files: list, warnings: list, key: str) -> Optional[Pa
     return best
 
 
+def resolve_config_ini(stitch_dir: str, config_ini: str) -> dict:
+    """Resolve a bare config_ini name (or path) to the actual file under stitch_dir/config."""
+    sdir = Path(stitch_dir)
+    found_config_dir = find_config_dir(sdir)
+    if found_config_dir is None:
+        return err(ErrorCode.INVALID_ARGUMENT, "no config directory found near stitch_dir",
+                   {"param": "stitch_dir",
+                    "expected": "config/ or Config/ under stitch_dir or its parent"})
+    config_dir = found_config_dir.resolve()
+    if "/" not in config_ini and "\\" not in config_ini:
+        # Bare name: append .ini if needed
+        name = config_ini if config_ini.endswith(".ini") else f"{config_ini}.ini"
+        resolved_ini = config_dir / name
+    else:
+        resolved_ini = Path(config_ini).resolve()
+    try:
+        resolved_ini.relative_to(config_dir)
+    except ValueError:
+        return err(ErrorCode.INVALID_ARGUMENT, "config_ini must live under stitch_dir/config",
+                   {"param": "config_ini", "expected": "name of a file under config/"})
+    if not resolved_ini.is_file():
+        return err(ErrorCode.INVALID_ARGUMENT, "config_ini not found",
+                   {"param": "config_ini", "expected": f"file under {config_dir}"})
+    return ok({"config_ini_path": str(resolved_ini)})
+
+
+def preview_ingredient_match(stitch_dir: str, config_ini: str, ingredient_name: str,
+                             ingredient_path: str) -> dict:
+    """Advisory-match a local ingredient path against its config regex, without building
+    or running anything.
+
+    Always attempts the match and reports the outcome (single file, several candidates,
+    or nothing found) instead of erroring out -- so a caller can show the user what was
+    actually found on disk before they confirm a plan, rather than asking them to pick a
+    file blindly.
+    """
+    resolved = resolve_config_ini(stitch_dir, config_ini)
+    if not resolved["ok"]:
+        return resolved
+    resolved_ini = Path(resolved["data"]["config_ini_path"])
+    regex_dict = _read_regex_mandatory(resolved_ini, ingredient_name)
+    if not regex_dict:
+        return ok({"name": ingredient_name, "config_ini": str(resolved_ini),
+                   "regex_dict": None, "matches": None,
+                   "warnings": [f"no regex_mandatory_dict found for '{ingredient_name}' "
+                                f"in {resolved_ini.name}; path will be passed through as-is"]})
+    p = Path(ingredient_path)
+    if p.is_dir():
+        files = [q for q in p.rglob("*") if q.is_file()]
+    elif p.is_file():
+        files = [p]
+    else:
+        files = []
+    warnings: list = []
+    matches = {}
+    for key, regex in regex_dict.items():
+        picked = _pick_file(regex, files, warnings, key)
+        matches[key] = str(picked) if picked else None
+    return ok({"name": ingredient_name, "config_ini": str(resolved_ini),
+               "regex_dict": regex_dict, "matches": matches, "warnings": warnings})
+
+
 def _resolve_ingredient_arg(config_ini: Path, ingredient_name: str,
                             ingredient_path: str) -> tuple:
     """Turn a directory (or dict-string) into the {key: path} dict-string cli.py wants.
@@ -369,26 +431,10 @@ def build_stitch_command(stitch_dir: str, binary_file: str, ingredients: list,
                        {"param": f"ingredients[{i}].path",
                         "expected": "existing path or dict-string"})
 
-    found_config_dir = find_config_dir(sdir)
-    if found_config_dir is None:
-        return err(ErrorCode.INVALID_ARGUMENT, "no config directory found near stitch_dir",
-                   {"param": "stitch_dir",
-                    "expected": "config/ or Config/ under stitch_dir or its parent"})
-    config_dir = found_config_dir.resolve()
-    if "/" not in config_ini and "\\" not in config_ini:
-        # Bare name: append .ini if needed
-        name = config_ini if config_ini.endswith(".ini") else f"{config_ini}.ini"
-        resolved_ini = config_dir / name
-    else:
-        resolved_ini = Path(config_ini).resolve()
-    try:
-        resolved_ini.relative_to(config_dir)
-    except ValueError:
-        return err(ErrorCode.INVALID_ARGUMENT, "config_ini must live under stitch_dir/config",
-                   {"param": "config_ini", "expected": "name of a file under config/"})
-    if not resolved_ini.is_file():
-        return err(ErrorCode.INVALID_ARGUMENT, "config_ini not found",
-                   {"param": "config_ini", "expected": f"file under {config_dir}"})
+    resolved = resolve_config_ini(str(sdir), config_ini)
+    if not resolved["ok"]:
+        return resolved
+    resolved_ini = Path(resolved["data"]["config_ini_path"])
     if soft_strap and not _SOFT_STRAP_RE.match(soft_strap):
         return err(ErrorCode.INVALID_ARGUMENT, "soft_strap has invalid syntax",
                    {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})

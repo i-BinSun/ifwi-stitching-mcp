@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import config, fiv_portal
+from . import config, fiv_portal, prepare, stitch_runner
 from .result import ok, err, ErrorCode
 
 PLAN_VERSION = 1
@@ -37,6 +37,56 @@ def _invalid(message: str, detail: dict) -> dict:
     return err(ErrorCode.PLAN_INVALID, message, detail)
 
 
+def _resolve_stitch_dir(stitch_source: dict) -> dict:
+    """Locate the stitch tool's cli.py directory, preparing it (from cache, if already
+    fetched) if it's FIV-sourced. Used only for the advisory ingredient-match preview
+    below -- execution re-resolves this itself."""
+    if stitch_source["kind"] == "local":
+        local = Path(stitch_source["local_path"])
+        if local.is_file():
+            return stitch_runner.extract_stitch_tool(str(local))
+        cli_dir = stitch_runner.find_cli_dir(local)
+        if cli_dir is None:
+            return err(ErrorCode.ENV_PREPARE_FAILED, "no cli.py or stitch2.py under stitch_path",
+                       {"path": str(local)})
+        return ok({"stitch_dir": str(cli_dir)})
+    res = prepare.prepare_stitch(stitch_source["project"], stitch_source["phase"],
+                                 stitch_source["version"], stitch_source.get("swimlane"),
+                                 search_neighbors=True)
+    if not res["ok"]:
+        return res
+    if not res["data"].get("prepared"):
+        return err(ErrorCode.ENV_PREPARE_FAILED, "no stitch tool for the planned version",
+                   {"version": stitch_source["version"],
+                    "candidates": res["data"].get("candidates", [])})
+    return ok({"stitch_dir": res["data"]["stitch_dir"]})
+
+
+def _preview_local_ingredients(stitch_source: dict, config_ini: str,
+                               local_ingredients: list) -> tuple:
+    """Advisory regex-match preview for every local-path ingredient, so the caller can
+    show the user what file was actually found before confirming the plan -- instead of
+    asking them to pick a candidate blindly. Never blocks plan building: failures become
+    warnings."""
+    if not local_ingredients:
+        return [], []
+    stitch_dir_res = _resolve_stitch_dir(stitch_source)
+    if not stitch_dir_res["ok"]:
+        return [], [f"could not prepare the stitch tool to preview ingredient regex match: "
+                    f"{stitch_dir_res['message']}"]
+    stitch_dir = stitch_dir_res["data"]["stitch_dir"]
+    previews, warnings = [], []
+    for item in local_ingredients:
+        preview = stitch_runner.preview_ingredient_match(
+            stitch_dir, config_ini, item["name"], item["path"])
+        if preview["ok"]:
+            previews.append(preview["data"])
+        else:
+            warnings.append(f"{item['name']}: could not preview ingredient match: "
+                            f"{preview['message']}")
+    return previews, warnings
+
+
 def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                version: Optional[str] = None, swimlane: Optional[str] = None,
                ifwi_binary: Optional[str] = None, ifwi_path: Optional[str] = None,
@@ -47,7 +97,14 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     """Validate the confirmed answers and render the command line for them.
 
     Every source is either "fiv" (fetched during environment preparation) or
-    "local" (an existing path the user supplied). Nothing is downloaded here.
+    "local" (an existing path the user supplied).
+
+    If any ingredient is a local path, the stitch tool is prepared right away (a no-op
+    if it was already fetched, e.g. via fiv_prepare_stitch) so its config_ini's
+    regex_mandatory_dict can be advisory-matched against that path. The result is
+    returned as ingredient_match_preview — show it to the user before they confirm the
+    plan, instead of asking them to pick a candidate file blindly. It never blocks plan
+    building: an unresolved or non-matching regex only adds to the response's warnings.
 
     ingredients is a non-empty list of {"name": str, "version": str} (fetched from FIV)
     or {"name": str, "path": str} (existing local dir/file) — one entry per ingredient.
@@ -92,6 +149,7 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     # --- Ingredient sources ------------------------------------------------
     ingredient_sources = []
     ingredient_names = []
+    local_ingredients = []
     for i, item in enumerate(ingredients):
         name = item["name"].strip()
         ing_path = item.get("path")
@@ -100,8 +158,10 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                 return _invalid("ingredient path does not exist",
                                 {"param": f"ingredients[{i}].path",
                                  "expected": "existing dir or file"})
+            resolved_path = str(Path(ing_path).resolve())
             ingredient_sources.append({"kind": "local", "name": name,
-                                       "local_path": str(Path(ing_path).resolve())})
+                                       "local_path": resolved_path})
+            local_ingredients.append({"name": name, "path": resolved_path})
         else:
             ing_version = item.get("version")
             if not ing_version:
@@ -125,6 +185,9 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                             {"param": "stitch_version"})
         stitch_source = {"kind": "fiv", "project": project, "phase": phase,
                          "version": tool_version, "swimlane": swimlane}
+
+    ingredient_match_preview, preview_warnings = _preview_local_ingredients(
+        stitch_source, config_ini, local_ingredients)
 
     argv = [P_PYTHON, "cli.py",
             "--binary_file", P_BINARY,
@@ -154,7 +217,9 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     return ok({"plan_id": plan["plan_id"], "plan": plan,
                "plan_path": saved["data"]["plan_path"],
                "command_line": render_command_line(plan),
-               "placeholders": [P_PYTHON, P_BINARY, P_INGREDIENT, P_CONFIG_INI]})
+               "placeholders": [P_PYTHON, P_BINARY, P_INGREDIENT, P_CONFIG_INI],
+               "ingredient_match_preview": ingredient_match_preview,
+               "warnings": preview_warnings})
 
 
 def render_command_line(plan: dict) -> str:

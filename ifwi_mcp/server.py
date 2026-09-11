@@ -263,11 +263,17 @@ def stitch_build_plan(project: str, phase: str, ingredients: str, config_ini: st
                       soft_strap: Optional[str] = None) -> dict:
     """Turn the answers confirmed with the user into a saved plan plus its command line.
 
-    Call this once every parameter is settled. Nothing is downloaded and nothing runs, so
-    the returned command_line can be shown to the user for a final confirmation before
+    Call this once every parameter is settled. Nothing runs, so the returned
+    command_line can be shown to the user for a final confirmation before
     stitch_execute_plan. Each input is taken either from FIV (version fields) or from a
     local path (the *_path arguments). Set ifwi_from_build_targets=True if the chosen
     ifwi_binary came from fiv_list_ifwi_binaries rather than the release report.
+
+    If any ingredient is given as a local path, the stitch tool is prepared here (cheap
+    if already fetched via fiv_prepare_stitch) and that ingredient's regex from the
+    resolved config_ini is advisory-matched against the path. Check the response's
+    ingredient_match_preview/warnings and show them to the user — never ask the user to
+    pick which local file to use before this match has been attempted.
 
     ingredients is a JSON array string, one entry per ingredient to stitch together in a
     single run: [{"name": "PowerOn_DMRAP_MMC1", "version": "0.958.0"},
