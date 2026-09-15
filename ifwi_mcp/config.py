@@ -16,7 +16,7 @@ from .result import ok, err, ErrorCode
 # (e.g. inline in an MCP host's `env` block), so hosts always take priority.
 load_dotenv()
 
-# All outbound requests use verify=False (see fiv_portal/downloader/executor/deliverables);
+# All outbound requests use verify=False (see fiv_portal/artifactory/executor/deliverables);
 # suppress the resulting per-request InsecureRequestWarning noise.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 

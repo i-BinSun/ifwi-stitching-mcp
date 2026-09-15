@@ -1,11 +1,11 @@
 """High-level orchestration: prepare a stitch tool or an ingredient end-to-end.
 
-Composes the pure-HTTP fiv_portal with the I/O modules (downloader, archive,
+Composes the pure-HTTP fiv_portal with the I/O modules (artifactory, archive,
 stitch_runner). This is the only place those layers are chained together.
 """
 from pathlib import Path
 
-from . import archive, downloader, fiv_portal, stitch_runner
+from . import archive, artifactory, fiv_portal, stitch_runner
 from .result import ok, err, ErrorCode
 
 _SCAN_CAP = 30
@@ -13,7 +13,7 @@ _NEIGHBORS = 3
 
 
 def _download_and_extract_stitch(stitch_url: str, version: str) -> dict:
-    dl = downloader.download(stitch_url, category="stitch")
+    dl = artifactory.download(stitch_url, category="stitch")
     if not dl["ok"]:
         return dl
     ext = stitch_runner.extract_stitch_tool(dl["data"]["local_path"])
@@ -84,7 +84,7 @@ def prepare_ingredient(project: str, name: str, version: str) -> dict:
     found = fiv_portal.find_ingredient(project, name, version)
     if not found["ok"]:
         return found  # INGREDIENT_NOT_FOUND passes through; never auto-fall-back
-    dl = downloader.download(found["data"]["ingredient_url"], category="ingredients")
+    dl = artifactory.download(found["data"]["ingredient_url"], category="ingredients")
     if not dl["ok"]:
         return dl
     ext = archive.extract_archive(dl["data"]["local_path"])
@@ -138,7 +138,7 @@ def prepare_ifwi(project: str, phase: str, version: str, swimlane: str = None,
                 return err(ErrorCode.IFWI_BINARY_NOT_FOUND,
                            "release report entry has no download URL",
                            {"binary_name": entry.get("binary_name")})
-            dl = downloader.download(entry["url"], category="ifwi")
+            dl = artifactory.download(entry["url"], category="ifwi")
             if not dl["ok"]:
                 return dl
             return ok({"binary_file": dl["data"]["local_path"],
@@ -155,7 +155,7 @@ def prepare_ifwi(project: str, phase: str, version: str, swimlane: str = None,
     found = fiv_portal.find_ifwi(project, phase, version, swimlane)
     if not found["ok"]:
         return found
-    dl = downloader.download(found["data"]["ifwi_url"], category="ifwi")
+    dl = artifactory.download(found["data"]["ifwi_url"], category="ifwi")
     if not dl["ok"]:
         return dl
     ext = archive.extract_archive(dl["data"]["local_path"])

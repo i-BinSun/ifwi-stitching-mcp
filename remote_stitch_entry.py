@@ -15,7 +15,7 @@ import argparse
 import json
 import sys
 
-from ifwi_mcp import artifactory_upload, config, executor
+from ifwi_mcp import artifactory, config, executor
 from ifwi_mcp.result import ok, err, ErrorCode
 
 
@@ -29,7 +29,7 @@ def run(plan: dict) -> dict:
 
     uploaded = []
     for item in local_result["data"]["deliverables"]["items"]:
-        res = artifactory_upload.upload_file(item["path"], item["name"])
+        res = artifactory.upload_file(item["path"], item["name"])
         if not res["ok"]:
             return res
         uploaded.append({"url": res["data"]["url"], "name": item["name"], "kind": item["kind"]})

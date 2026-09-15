@@ -1,4 +1,4 @@
-"""Turn Artifactory URLs or local paths into files in the local cache."""
+"""Artifactory transfer operations: download/cache artifacts and upload deliverables."""
 import os
 import shutil
 from pathlib import Path
@@ -11,6 +11,7 @@ from . import config, lock
 from .result import ok, err, ErrorCode
 
 _CATEGORIES = ("ifwi", "ingredients", "stitch")
+_UPLOAD_TIMEOUT = 300
 
 
 def _is_url(value: str) -> bool:
@@ -30,7 +31,7 @@ def _fetch_url(url_or_path: str, target: Path) -> dict:
     headers = {"Authorization": f"Bearer {token_result['data']['token']}"}
     try:
         resp = requests.get(url_or_path, headers=headers, stream=True, timeout=120,
-                             verify=False)
+                            verify=False)
     except requests.RequestException as exc:
         return err(ErrorCode.DOWNLOAD_FAILED, "network error during download",
                    {"url": url_or_path, "reason": str(exc)})
@@ -65,6 +66,7 @@ def _copy_local(src: Path, target: Path) -> dict:
 
 
 def download(url_or_path: str, category: str = "ifwi", dest_name: Optional[str] = None) -> dict:
+    """Download an Artifactory URL or copy a local file into the local cache."""
     if not url_or_path:
         return err(ErrorCode.INVALID_ARGUMENT, "url_or_path is required",
                    {"param": "url_or_path", "expected": "non-empty URL or path"})
@@ -98,6 +100,7 @@ def download(url_or_path: str, category: str = "ifwi", dest_name: Optional[str] 
 
 
 def list_local_files() -> dict:
+    """List all cached artifact files across categories."""
     files = []
     for category in _CATEGORIES:
         base = config.cache_subdir(category)
@@ -105,3 +108,35 @@ def list_local_files() -> dict:
             if path.is_file():
                 files.append({"path": path.as_posix(), "category": category, "bytes": path.stat().st_size})
     return ok({"files": files})
+
+
+def upload_file(local_path: str, dest_name: str) -> dict:
+    """Upload remote-stitch deliverables to Artifactory."""
+    src = Path(local_path)
+    if not src.is_file():
+        return err(ErrorCode.INVALID_ARGUMENT, "local_path does not exist",
+                   {"param": "local_path", "expected": "existing file"})
+
+    base_result = config.get_artifactory_upload_base()
+    if not base_result["ok"]:
+        return base_result
+    token_result = config.get_artifactory_token()
+    if not token_result["ok"]:
+        return token_result
+
+    url = f"{base_result['data']['base_url']}/{dest_name}"
+    headers = {"Authorization": f"Bearer {token_result['data']['token']}"}
+    try:
+        with src.open("rb") as fh:
+            resp = requests.put(url, data=fh, headers=headers,
+                                timeout=_UPLOAD_TIMEOUT, verify=False)
+    except requests.RequestException as exc:
+        return err(ErrorCode.UPLOAD_FAILED, "network error during upload",
+                   {"url": url, "reason": str(exc)})
+    if resp.status_code in (401, 403):
+        return err(ErrorCode.AUTH_FAILED, "artifactory rejected credentials",
+                   {"service": "artifactory", "http_status": resp.status_code})
+    if not (200 <= resp.status_code < 300):
+        return err(ErrorCode.UPLOAD_FAILED, "upload returned error status",
+                   {"url": url, "http_status": resp.status_code, "body": resp.text[:2000]})
+    return ok({"url": url, "name": dest_name})

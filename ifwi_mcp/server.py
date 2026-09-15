@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import (archive, config, deliverables, downloader, executor, fiv_portal,
+from . import (archive, artifactory, config, deliverables, executor, fiv_portal,
                oem_parser, plan as plan_mod, prepare, stitch_runner, up_config)
 from .result import err, ErrorCode
 
@@ -201,13 +201,13 @@ def download(url_or_path: str, category: str = "ifwi", dest_name: Optional[str] 
 
     category is one of ifwi, ingredients or stitch.
     """
-    return downloader.download(url_or_path, category, dest_name)
+    return artifactory.download(url_or_path, category, dest_name)
 
 
 @_guard
 def list_local_files() -> dict:
     """List the files already cached, across all categories."""
-    return downloader.list_local_files()
+    return artifactory.list_local_files()
 
 
 @_guard
