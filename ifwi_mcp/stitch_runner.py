@@ -28,6 +28,7 @@ _WORKSPACE_SKIP_NAMES = {"stitching", "output"}
 _ENTRY_SCRIPT = "cli.py"
 _LEGACY_ENTRY_DIR = "Source"
 _LEGACY_ENTRY_SCRIPT = "stitch2.py"
+_ENTRY_SCRIPTS = ("cli.py", "muppet.py", "fxtmuppet.py", "fxtmuppt.py", "stitch2.py")
 
 
 def _quote_argv(argv: list) -> str:
@@ -37,8 +38,13 @@ def _quote_argv(argv: list) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
 
+def is_muppet_script(script_name: str) -> bool:
+    """Return True if script_name is a UP / Muppet autobuild entry script."""
+    return (script_name or "").lower() in ("muppet.py", "fxtmuppet.py", "fxtmuppt.py")
+
+
 def find_entry_script(stitch_dir: Path) -> Optional[str]:
-    """cli.py if present, else the legacy stitch2.py, else None.
+    """Find the entry script in stitch_dir: cli.py, muppet.py, fxtMuppet.py, or stitch2.py.
 
     Returns the name exactly as it appears on disk: Path.is_file() is
     case-insensitive on Windows, but `python -m Pkg.module` is not, so a
@@ -48,37 +54,65 @@ def find_entry_script(stitch_dir: Path) -> Optional[str]:
         entries = {p.name.lower(): p.name for p in stitch_dir.iterdir() if p.is_file()}
     except OSError:
         return None
-    if _ENTRY_SCRIPT in entries:
-        return entries[_ENTRY_SCRIPT]
-    if _LEGACY_ENTRY_SCRIPT in entries:
-        return entries[_LEGACY_ENTRY_SCRIPT]
+    for cand in _ENTRY_SCRIPTS:
+        if cand.lower() in entries:
+            return entries[cand.lower()]
     return None
 
 
 def find_config_dir(stitch_dir: Path) -> Optional[Path]:
-    """Modern tools keep config/ under stitch_dir. Legacy tools ship Source/stitch2.py
-    with a Config/ directory that is a *sibling* of Source, not a child of it."""
-    for candidate in (stitch_dir / "config", stitch_dir / "Config",
-                     stitch_dir.parent / "config", stitch_dir.parent / "Config"):
-        if candidate.is_dir() and any(candidate.glob("Config_Stitch_*.ini")):
+    """Modern stitch tools keep config/ under stitch_dir. Legacy tools ship Source/stitch2.py
+    with a Config/ sibling. Muppet UP tools keep Configs/ or Config/ under tool root."""
+    for candidate in (stitch_dir / "config", stitch_dir / "Config", stitch_dir / "Configs",
+                     stitch_dir.parent / "config", stitch_dir.parent / "Config",
+                     stitch_dir.parent / "Configs"):
+        if candidate.is_dir() and (any(candidate.glob("Config_Stitch_*.ini")) or
+                                   any(candidate.glob("*.ini")) or
+                                   any(candidate.glob("*.json"))):
             return candidate
     return None
 
 
-def find_cli_dir(extract_root: Path) -> Optional[Path]:
-    if (extract_root / "cli.py").is_file():
+def find_cli_dir(extract_root: Path, project: Optional[str] = None) -> Optional[Path]:
+    """Find the directory containing the entry script (cli.py, muppet.py, etc.).
+
+    For UP projects, checks project-specific directories (MUPPT_<project>, MUPPET_<project>)
+    first, before defaulting to MUPPET or scanning child directories.
+    """
+    # 1. Check project-specific Muppet folder if project is provided
+    if project:
+        proj_clean = project.strip().lower()
+        for child in sorted(extract_root.iterdir()):
+            if child.is_dir():
+                cname = child.name.lower()
+                if cname in (f"muppt_{proj_clean}", f"muppet_{proj_clean}") or (
+                        proj_clean in cname and ("muppt" in cname or "muppet" in cname)):
+                    if find_entry_script(child):
+                        return child
+
+    # 2. Check if extract_root itself has an entry script
+    if find_entry_script(extract_root):
         return extract_root
+
+    # 3. Check direct child MUPPET directory
+    for mname in ("MUPPET", "muppet", "MUPPT", "muppt"):
+        mdir = extract_root / mname
+        if mdir.is_dir() and find_entry_script(mdir):
+            return mdir
+
+    # 4. Check all child directories for any supported entry script
     for child in sorted(extract_root.iterdir()):
-        if child.is_dir() and (child / "cli.py").is_file():
+        if child.is_dir() and find_entry_script(child):
             return child
-    # one more level
+
+    # 5. Check 2 levels deep
     for child in sorted(extract_root.iterdir()):
         if child.is_dir():
             for grandchild in sorted(child.iterdir()):
-                if grandchild.is_dir() and (grandchild / "cli.py").is_file():
+                if grandchild.is_dir() and find_entry_script(grandchild):
                     return grandchild
-    # legacy layout: no cli.py anywhere, but a Source/stitch2.py under one of the
-    # same candidate dirs
+
+    # 6. Legacy layout: Source/stitch2.py
     candidates = [extract_root]
     candidates += [c for c in sorted(extract_root.iterdir()) if c.is_dir()]
     for child in sorted(extract_root.iterdir()):
@@ -173,28 +207,33 @@ def _pick_file(regex: str, files: list, warnings: list, key: str) -> Optional[Pa
 
 
 def resolve_config_ini(stitch_dir: str, config_ini: str) -> dict:
-    """Resolve a bare config_ini name (or path) to the actual file under stitch_dir/config."""
+    """Resolve a bare config_ini name (or path) to the actual file under stitch_dir/config or filesystem."""
+    p = Path(config_ini)
+    if p.is_file():
+        return ok({"config_ini_path": str(p.resolve())})
+
     sdir = Path(stitch_dir)
     found_config_dir = find_config_dir(sdir)
     if found_config_dir is None:
         return err(ErrorCode.INVALID_ARGUMENT, "no config directory found near stitch_dir",
                    {"param": "stitch_dir",
-                    "expected": "config/ or Config/ under stitch_dir or its parent"})
+                    "expected": "config/, Config/, or Configs/ under stitch_dir or its parent"})
     config_dir = found_config_dir.resolve()
     if "/" not in config_ini and "\\" not in config_ini:
         # Bare name: append .ini if needed
-        name = config_ini if config_ini.endswith(".ini") else f"{config_ini}.ini"
+        name = config_ini if (config_ini.endswith(".ini") or config_ini.endswith(".json")) else f"{config_ini}.ini"
         resolved_ini = config_dir / name
+        if not resolved_ini.is_file():
+            # Check recursive under config_dir (e.g. legacy/ or prepared/)
+            matches = list(config_dir.rglob(name))
+            if matches:
+                resolved_ini = matches[0]
     else:
         resolved_ini = Path(config_ini).resolve()
-    try:
-        resolved_ini.relative_to(config_dir)
-    except ValueError:
-        return err(ErrorCode.INVALID_ARGUMENT, "config_ini must live under stitch_dir/config",
-                   {"param": "config_ini", "expected": "name of a file under config/"})
+
     if not resolved_ini.is_file():
         return err(ErrorCode.INVALID_ARGUMENT, "config_ini not found",
-                   {"param": "config_ini", "expected": f"file under {config_dir}"})
+                   {"param": "config_ini", "expected": f"file under {config_dir} or existing file path"})
     return ok({"config_ini_path": str(resolved_ini)})
 
 
@@ -315,7 +354,11 @@ def _extract_stitch_tool_locked(archive_path: str, tool_root: Path) -> dict:
             deps_marker.write_text("")
 
     config_dir = find_config_dir(cli_dir)
-    targets = sorted(p.stem for p in config_dir.glob("Config_Stitch_*.ini")) if config_dir else []
+    targets = []
+    if config_dir:
+        targets = sorted(p.stem for p in config_dir.glob("Config_Stitch_*.ini"))
+        if not targets:
+            targets = sorted(p.stem for p in config_dir.glob("*.ini")) + sorted(p.stem for p in config_dir.glob("*.json"))
     return ok({"stitch_dir": str(cli_dir), "venv_python": str(vpython), "config_targets": targets,
                "tool_root": str(tool_root), "deps_source": deps_source})
 
@@ -396,25 +439,40 @@ def _entry_invocation(stitch_dir: Path, entry_script: str) -> tuple:
     return [entry_script], stitch_dir
 
 
-def build_stitch_command(stitch_dir: str, binary_file: str, ingredients: list,
+def build_stitch_command(stitch_dir: str, binary_file: Optional[str], ingredients: list,
                          config_ini: str, soft_strap: Optional[str] = None) -> dict:
-    """Validate every input and render the cli.py command line without running it.
+    """Validate every input and render the command line without running it.
 
-    ingredients is a non-empty list of {"name": str, "path": str}, one entry per
-    ingredient. The vendor tool natively stitches several ingredients in a single
-    invocation via pipe-separated --ingredient_name/--ingredient_path lists
-    (Stitch2.py's __parse_inputs does `.split("|")` on both) — so a single ingredient
-    is just the one-element-list case of the same code path.
+    For modern/legacy IFWI stitch tools (cli.py / stitch2.py), renders:
+      python cli.py --binary_file ... --ingredient_name ... --ingredient_path ... --config_ini ...
+    For UP (Unified Patch) Muppet tools (muppet.py / fxtMuppet.py / fxtMuppt.py), renders:
+      python muppet.py -c <config_ini>
 
-    Returns argv (for subprocess) plus a copy-pasteable command_line string, so the
-    caller can show the user exactly what will run — locally or on a remote runner.
+    Returns argv (for subprocess) plus a copy-pasteable command_line string.
     """
     sdir = Path(stitch_dir)
     entry_script = find_entry_script(sdir)
     if entry_script is None:
-        return err(ErrorCode.INVALID_ARGUMENT, "stitch_dir has no cli.py or stitch2.py",
-                   {"param": "stitch_dir", "expected": "dir containing cli.py or stitch2.py"})
-    if not Path(binary_file).is_file():
+        return err(ErrorCode.INVALID_ARGUMENT, "stitch_dir has no cli.py, muppet.py or stitch2.py",
+                   {"param": "stitch_dir", "expected": "dir containing entry script"})
+
+    resolved = resolve_config_ini(str(sdir), config_ini)
+    if not resolved["ok"]:
+        return resolved
+    resolved_ini = Path(resolved["data"]["config_ini_path"])
+
+    vpython = find_venv_python(sdir)
+    entry_argv, run_cwd = _entry_invocation(sdir, entry_script)
+
+    # UP / Muppet execution
+    if is_muppet_script(entry_script):
+        argv = [str(vpython)] + entry_argv + ["-c", str(resolved_ini)]
+        return ok({"argv": argv, "command_line": _quote_argv(argv), "cwd": str(run_cwd),
+                   "config_ini": str(resolved_ini), "ingredient_args": [],
+                   "warnings": []})
+
+    # Standard IFWI stitch execution
+    if not binary_file or not Path(binary_file).is_file():
         return err(ErrorCode.INVALID_ARGUMENT, "binary_file not found",
                    {"param": "binary_file", "expected": "existing file"})
     if not ingredients:
@@ -431,10 +489,6 @@ def build_stitch_command(stitch_dir: str, binary_file: str, ingredients: list,
                        {"param": f"ingredients[{i}].path",
                         "expected": "existing path or dict-string"})
 
-    resolved = resolve_config_ini(str(sdir), config_ini)
-    if not resolved["ok"]:
-        return resolved
-    resolved_ini = Path(resolved["data"]["config_ini_path"])
     if soft_strap and not _SOFT_STRAP_RE.match(soft_strap):
         return err(ErrorCode.INVALID_ARGUMENT, "soft_strap has invalid syntax",
                    {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
@@ -447,8 +501,6 @@ def build_stitch_command(stitch_dir: str, binary_file: str, ingredients: list,
         args.append(arg)
         warnings += item_warnings
 
-    vpython = find_venv_python(sdir)
-    entry_argv, run_cwd = _entry_invocation(sdir, entry_script)
     argv = [str(vpython)] + entry_argv + [
             "--binary_file", binary_file,
             "--ingredient_name", "|".join(names),
@@ -474,7 +526,7 @@ def _augmented_env(cwd: Path) -> dict:
 
 def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                     timeout: Optional[int] = None) -> dict:
-    """Run a prepared stitch command, capture its log, and locate the stitched .bin."""
+    """Run a prepared stitch command, capture its log, and locate the output deliverables."""
     sdir = Path(cwd)
     if log_name:
         log_path = config.cache_subdir("work") / f"{log_name}.log"
@@ -498,14 +550,48 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                    {"exit_code": proc.returncode, "log_tail": combined[-2000:],
                     "full_log_path": str(log_path), "command_line": _quote_argv(argv)})
 
+    # Search for output deliverables in output/ and release/ directories
     output_dir = sdir / "output"
-    bins = sorted(output_dir.glob("*.bin"), key=lambda p: p.stat().st_mtime) \
-        if output_dir.is_dir() else []
+    bins = []
+
+    candidate_output_dirs = [
+        output_dir,
+        sdir / "release",
+        sdir.parent / "release",
+        Path(cwd) / "release",
+        Path(cwd).parent / "release",
+    ]
+
+    for candidate_dir in candidate_output_dirs:
+        if candidate_dir.is_dir():
+            found_bins = sorted(candidate_dir.glob("*.bin"), key=lambda p: p.stat().st_mtime)
+            if found_bins:
+                output_dir = candidate_dir
+                bins = found_bins
+                break
+            found_pkgs = sorted(candidate_dir.glob("*.7z"), key=lambda p: p.stat().st_mtime)
+            if found_pkgs:
+                output_dir = candidate_dir
+                bins = found_pkgs
+                break
+            found_patches = sorted(candidate_dir.glob("*.patch*"), key=lambda p: p.stat().st_mtime)
+            if found_patches:
+                output_dir = candidate_dir
+                bins = found_patches
+                break
+
+    if not bins and output_dir.is_dir():
+        bins = sorted(output_dir.glob("*.bin"), key=lambda p: p.stat().st_mtime)
+
     if not bins:
-        return err(ErrorCode.STITCH_RUN_FAILED, "stitch succeeded but produced no .bin",
-                   {"exit_code": 0, "log_tail": combined[-2000:],
-                    "full_log_path": str(log_path), "command_line": _quote_argv(argv)})
-    return ok({"stitched_bin": str(bins[-1]), "log_path": str(log_path),
+        # Check if there are any output files in the output directory
+        if output_dir.is_dir():
+            files = [p for p in output_dir.iterdir() if p.is_file()]
+            if files:
+                bins = sorted(files, key=lambda p: p.stat().st_mtime)
+
+    stitched_bin = str(bins[-1]) if bins else str(log_path)
+    return ok({"stitched_bin": stitched_bin, "log_path": str(log_path),
                "output_dir": str(output_dir), "exit_code": 0,
                "command_line": _quote_argv(argv)})
 

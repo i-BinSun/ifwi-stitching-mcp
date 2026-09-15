@@ -7,7 +7,7 @@ from typing import Optional
 from fastmcp import FastMCP
 
 from . import (archive, config, deliverables, downloader, executor, fiv_portal,
-               oem_parser, plan as plan_mod, prepare, stitch_runner)
+               oem_parser, plan as plan_mod, prepare, stitch_runner, up_config)
 from .result import err, ErrorCode
 
 mcp = FastMCP("ifwi-stitching-mcp")
@@ -132,6 +132,12 @@ def fiv_list_ingredient_versions(project: str, name: str, status: str = "ALL",
 def fiv_find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
     """Resolve a release's stitch-tool package URL and its file list."""
     return fiv_portal.find_stitch_tool(project, phase, version, swimlane)
+
+
+@_guard
+def fiv_find_env_package(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
+    """Resolve a UP (Unified Patch) release's env-package URL."""
+    return fiv_portal.find_env_package(project, phase, version, swimlane)
 
 
 @_guard
@@ -326,6 +332,37 @@ def stitch_execute_plan(plan_id: str) -> dict:
 
 
 @_guard
+def create_up_config(output_path: str,
+                     default_params: Optional[str] = None,
+                     ingredients: Optional[str] = None,
+                     template_path: Optional[str] = None,
+                     fit1_params: Optional[str] = None,
+                     soc_params: Optional[str] = None) -> dict:
+    """Generate or update a UP (Unified Patch) Muppet config ini file.
+
+    default_params, ingredients, fit1_params, soc_params can be JSON strings (e.g. '{"mcheck": "/path/..."}').
+    """
+    def _parse_dict(d):
+        if not d:
+            return {}
+        if isinstance(d, dict):
+            return d
+        try:
+            return json.loads(d)
+        except (ValueError, TypeError):
+            return {}
+
+    return up_config.generate_up_config_ini(
+        output_path,
+        default_params=_parse_dict(default_params),
+        ingredients=_parse_dict(ingredients),
+        template_path=template_path,
+        fit1_params=_parse_dict(fit1_params),
+        soc_params=_parse_dict(soc_params),
+    )
+
+
+@_guard
 def stitch_get_deliverables(plan_id: str) -> dict:
     """Re-read the deliverables manifest of a finished plan: artifacts, sizes and sha256."""
     return deliverables.load_manifest(plan_id)
@@ -335,12 +372,13 @@ def stitch_get_deliverables(plan_id: str) -> dict:
 for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_releases,
             fiv_find_ifwi, fiv_list_release_binaries, fiv_list_ifwi_binaries,
             fiv_get_binary_ingredients, fiv_find_ingredient, fiv_list_ingredient_versions,
-            fiv_find_stitch_tool, fiv_match_build_by_oem,
+            fiv_find_stitch_tool, fiv_find_env_package, fiv_match_build_by_oem,
             fiv_prepare_stitch, fiv_prepare_ingredient, fiv_prepare_ifwi,
             parse_ifwi_oem, download,
             list_local_files, extract_archive, extract_stitch_tool, run_stitch,
             get_execution_config, stitch_build_plan, stitch_get_plan, stitch_list_plans,
-            stitch_prepare_environment, stitch_execute_plan, stitch_get_deliverables):
+            stitch_prepare_environment, stitch_execute_plan, stitch_get_deliverables,
+            create_up_config):
     mcp.tool(_fn)
 
 

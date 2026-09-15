@@ -120,6 +120,34 @@ The `command` path is platform-dependent: `.venv/Scripts/python.exe` on Windows,
 Linux/macOS. Both host configs are per-machine, so pick the one that matches where the server runs — note
 that a config written inside WSL needs the Linux path even when VS Code itself is on Windows.
 
+### Command-line usage
+
+Everything is also available as a standalone `ifwi-cli` command — no MCP host needed, useful from scripts,
+CI, or an ad-hoc terminal. `pip install -e .` registers it on `PATH`; if the entry point isn't picked up
+(e.g. a stale editable install), run it as a module instead: `python -m ifwi_mcp.cli`.
+
+Commands are grouped the same way the tools are: `fiv ...` for FIV Portal lookups, `stitch ...` for the
+plan/build/run workflow, `oem parse` for OEM decoding, plus a few top-level utilities (`download`,
+`list-local-files`, `extract-archive`). Run `ifwi-cli --help`, `ifwi-cli fiv --help`, or
+`ifwi-cli stitch --help` to see every subcommand.
+
+```bash
+ifwi-cli fiv list-releases --project DMR --phase PowerOn
+
+ifwi-cli stitch build-plan --project DMR --phase PowerOn \
+  --ingredients '[{"name": "PowerOn_DMRAP_MMC1", "version": "0.967.0"}]' \
+  --config-ini Config_Stitch_OKSDCRB1_IPCleanDFXEnable_Trace_DebugSigned
+# -> prints the saved plan, including its plan_id
+
+ifwi-cli stitch execute-plan --plan-id <plan_id>
+
+ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
+```
+
+Every command prints the same unified result envelope the MCP tools return (`{"ok": true, "data": ...}` or
+`{"ok": false, "error_code": ..., "message": ..., "detail": ...}`) as JSON on stdout, and exits `0` when
+`ok` is `true`, `1` otherwise — pipe it through `jq` for scripting.
+
 ### Troubleshooting
 
 - **Code changes have no effect** — the MCP server is a long-lived process and must be restarted. With
@@ -156,16 +184,20 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`, or next to the cache dir
 (`~/.ifwi-stitching-mcp/config.json`) by default. A missing file means "all defaults", i.e. local execution.
 
-> **`execution.mode = "remote"` is still under development and not usable yet** — there is no working
-> runner to hand a plan to. Stick with the default `local` mode for now; the fields below are documented for
-> when remote execution lands.
+`execution.mode = "remote"` dispatches the plan to Intel's `AUTO_INTEGRATION_SERVICE` — the same
+`start_auto_task`/`get_custom_task_by_id` mechanism fiv-portal itself uses for `submit_vdc`/`web_stitch` —
+which clones this repo on a worker (per `task_dispatcher.json`'s `script_name` entry) and runs
+`remote_stitch_entry.py`, reusing the exact local-execution codepath. See
+[Remote runner contract](#remote-runner-contract) below.
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "https://stitch-runner.example.com/api/v1",
-    "token": "<runner-access-token>",
+    "endpoint": "https://auto-integration-service.example.intel.com",
+    "script_name": "mcp_stitch",
+    "fiv_project_id": "123",
+    "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
   },
@@ -180,17 +212,20 @@ A JSON config file holds the **execution switch**. It lives at `IFWI_MCP_CONFIG`
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here; `remote` hands the plan to a runner. |
-| `execution.endpoint` | — | **Required when `mode` is `remote`.** Base URL of the runner's job API. |
-| `execution.token` | — | Bearer token for the runner. Never echoed back by any tool. |
-| `execution.timeout_seconds` | `3600` | Kills a local run / gives up polling a remote job after this long. |
-| `execution.poll_interval_seconds` | `5` | How often a remote job's status is polled. |
+| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here; `remote` dispatches the plan to `AUTO_INTEGRATION_SERVICE`. |
+| `execution.endpoint` | — | **Required when `mode` is `remote`.** Base URL of `AUTO_INTEGRATION_SERVICE`. |
+| `execution.script_name` | `mcp_stitch` | `task_dispatcher.json` entry to invoke. |
+| `execution.fiv_project_id` | — | **Required when `mode` is `remote`.** `fiv_project_id` sent to `start_auto_task`. |
+| `execution.artifactory_repo` | — | Base Artifactory URL the remote worker uploads deliverables under (used by the worker, not this process — set it via the worker's own env/config). |
+| `execution.token` | — | Reserved for future authenticated use; not sent to `AUTO_INTEGRATION_SERVICE` today (it takes none). |
+| `execution.timeout_seconds` | `3600` | Kills a local run / gives up polling a remote task after this long. |
+| `execution.poll_interval_seconds` | `5` | How often a remote task's status is polled. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
 | `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
 
-`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS`
-(comma-separated) override the file. An invalid execution section fails startup, so a misconfigured remote
-endpoint is caught before any work is done.
+`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_SCRIPT_NAME`, `IFWI_MCP_EXEC_FIV_PROJECT_ID`,
+`IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS` (comma-separated) override the file. An invalid
+execution section fails startup, so a misconfigured remote endpoint is caught before any work is done.
 
 #### Dependency install when the tool ships no `requirements.txt`
 
@@ -214,6 +249,9 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 |---------|------------|
 | `IFWI_MCP_EXEC_MODE` | `execution.mode` |
 | `IFWI_MCP_EXEC_ENDPOINT` | `execution.endpoint` |
+| `IFWI_MCP_EXEC_SCRIPT_NAME` | `execution.script_name` |
+| `IFWI_MCP_EXEC_FIV_PROJECT_ID` | `execution.fiv_project_id` |
+| `IFWI_MCP_ARTIFACTORY_REPO` | `execution.artifactory_repo` |
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
@@ -226,18 +264,25 @@ just the mode.
 
 #### Remote runner contract
 
-> **Not usable yet** — describes the intended contract for a future remote runner; no such runner exists
-> today.
+When `mode` is `remote`, the server dispatches through Intel's `AUTO_INTEGRATION_SERVICE` — the same
+mechanism fiv-portal itself uses to submit `submit_vdc`/`web_stitch` tasks:
 
-When `mode` is `remote`, the server:
+1. `POST <endpoint>/start_auto_task/` (form-encoded): `{"fiv_project_id": ..., "script_name":
+   "mcp_stitch", "args": "{\"plan\": {...}}"}` → `{"result": "SUCCESS", "auto_server_task_id": "..."}`
+2. polls `GET <endpoint>/get_custom_task_by_id/?task_id=<auto_server_task_id>` until
+   `task_data.task_status` is `finished`/`failed`/`skip`, reading `task_data.task_result` as the
+   worker's own `{"ok": ..., "data": {...}}` result envelope
+3. fetches every URL in `task_result.data.deliverables` (`[{"name", "url", "kind"}]`) into the local
+   deliverables dir, the same way local mode's artifacts are collected
 
-1. `POST <endpoint>/jobs` with `{"plan": {...}}` → expects `{"job_id": "..."}`
-2. polls `GET <endpoint>/jobs/<job_id>` → expects `{"status": "running|succeeded|failed", "exit_code": 0,
-   "command_line": "...", "log_tail": "...", "deliverables": [{"name", "url", "kind"}]}`
-3. downloads every deliverable URL into the local deliverables dir
-
-The runner is expected to perform the same environment preparation the local mode does — the plan carries
-everything needed for that. `Authorization: Bearer <execution.token>` is sent on all three steps.
+`AUTO_INTEGRATION_SERVICE`'s `task_dispatcher.json` (in the `fiv-portal-common-handler` repo) routes
+`script_name: mcp_stitch` to `remote_stitch_entry.py` at this repo's root: it clones this repo onto the
+worker, installs `requirements.txt`, and runs `remote_stitch_entry.py --plan-json '<plan>'`. That entry
+script reuses `executor._execute_local` unmodified to run the stitch tool on the worker, then uploads the
+resulting deliverables to Artifactory (`execution.artifactory_repo` / `IFWI_MCP_ARTIFACTORY_REPO` on the
+worker's own config, using the same `ARTIFACTORY_TOKEN` Bearer-auth pattern as downloads) before printing
+its result envelope to stdout. No `Authorization` header is sent to `AUTO_INTEGRATION_SERVICE` itself —
+it takes none.
 
 ### Tools
 
@@ -255,7 +300,8 @@ All tools return the unified result shape described above.
 | `fiv_get_binary_ingredients` | `(project, phase, version, binary_name=None, swimlane=None, package_name=None)` | List the ingredients (name, version, ...) baked into one release binary — e.g. to read off which MMC version shipped in a given `.bin`. `binary_name` must match a `fiv_list_release_binaries`/`fiv_list_ifwi_binaries` entry; if omitted and the release has more than one binary, returns `IFWI_BINARY_AMBIGUOUS` with every candidate instead of guessing. |
 | `fiv_find_ingredient` | `(project, name, version)` | Resolve an ingredient's download URL by exact name and version. |
 | `fiv_list_ingredient_versions` | `(project, name, status="ALL", include_stitch_ingredient=0)` | List every version FIV has ever recorded for a named ingredient — authoritative, hits FIV's dedicated endpoint rather than scanning historical release binaries. |
-| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | Resolve the stitch-tool package (`stitch_url` = downloadable `.7z`) + its file list. If no `build_target` reports a stitch package, falls back to browsing `release_root` on Artifactory directly (`<release_root>/<target-name>/<package>`) before giving up. |
+| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | Resolve the stitch-tool package (`stitch_url` = downloadable `.7z`) + its file list. For UP projects, automatically delegates to `fiv_find_env_package`. If no `build_target` reports a stitch package, falls back to browsing `release_root` on Artifactory directly (`<release_root>/<target-name>/<package>`) before giving up. |
+| `fiv_find_env_package` | `(project, phase, version, swimlane=None)` | Resolve a UP (Unified Patch) release's env package URL from `get_ifwi_release_detail` (`env_atf_link` or download links). |
 | `fiv_match_build_by_oem` | `(project, product, ifwi_version, flavor, phase, swimlane=None)` | **Path B** — reverse-match a build from parsed OEM info. |
 | `parse_ifwi_oem` | `(local_ifwi_path)` | Decode the OEM region (offset `0xF00`, 256 bytes) of a local IFWI. Returns `product`, `ifwi_version`, `flavor_value`, `flavor_type`, `hash`. |
 | `download` | `(url_or_path, category="ifwi", dest_name=None)` | Download an Artifactory URL or copy a local file into the cache. `category` ∈ `ifwi` / `ingredients` / `stitch`. |
@@ -272,6 +318,7 @@ All tools return the unified result shape described above.
 | `stitch_prepare_environment` | `(plan_id)` | Fetch and unpack everything the plan needs, without running it. |
 | `stitch_execute_plan` | `(plan_id)` | Prepare, run (local or remote), and collect the deliverables. |
 | `stitch_get_deliverables` | `(plan_id)` | Re-read the deliverables manifest of a finished plan. |
+| `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | Generate or update a UP (Unified Patch) Muppet config ini file. |
 
 `phase` ∈ `Blue` / `Orange` / `Purple` / `Daily`. `version` matches `YYYY.WW.D.NN` (a leading dot is tolerated).
 
@@ -343,6 +390,16 @@ Use `stitch_prepare_environment(plan_id)` first if you want to fetch everything 
 1. `parse_ifwi_oem(local.bin)` → `product`, `ifwi_version`, `flavor_value`
 2. `fiv_match_build_by_oem(project, product, ifwi_version, flavor, phase)` → pinned swimlane / package
 3. continue with `stitch_build_plan` / `stitch_execute_plan` (pass the local image as `ifwi_path`)
+
+#### Path C — Unified Patch (UP) build flow
+
+For UP projects (e.g. `category: "UP"` in `fiv_get_project`), the build tool is Muppet inside the release's env package:
+
+1. `fiv_get_project(project)` → verifies project is a UP project (`category: "UP"`).
+2. `fiv_find_env_package(project, phase, version, swimlane)` (or `fiv_find_stitch_tool`, which auto-delegates) → downloads the release's `env_atf_link` env package.
+3. `create_up_config(output_path, default_params=..., ingredients=...)` → generates the UP config ini file (with `[default]`, `[FIT1]`, `[SOC]`, `[ucode_section]`).
+4. `stitch_build_plan(project, phase, ingredients, config_ini)` → creates a UP plan running `python muppet.py -c <config_ini>` inside `MUPPET/` or `MUPPT_<project>/`.
+5. `stitch_execute_plan(plan_id)` → executes locally or on remote worker, collecting output deliverables from `<build_path>/<version>/release/`.
 
 ### Development
 

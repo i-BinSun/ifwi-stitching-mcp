@@ -59,6 +59,21 @@ def get_artifactory_token() -> dict:
     return ok({"token": value})
 
 
+def get_artifactory_upload_base() -> dict:
+    """Base Artifactory URL that remote-stitch deliverables get PUT under."""
+    raw = os.environ.get("IFWI_MCP_ARTIFACTORY_REPO")
+    if raw is None:
+        loaded = _section("execution")
+        if not loaded["ok"]:
+            return loaded
+        raw = loaded["data"]["section"].get("artifactory_repo")
+    if not raw:
+        return err(ErrorCode.CONFIG_INVALID, "execution.artifactory_repo is not set",
+                   {"param": "execution.artifactory_repo",
+                    "expected": "e.g. https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch"})
+    return ok({"base_url": str(raw).rstrip("/")})
+
+
 def get_config_path() -> Path:
     """Path of the JSON config file (IFWI_MCP_CONFIG, else next to the cache dir)."""
     raw = os.environ.get("IFWI_MCP_CONFIG")
@@ -153,9 +168,19 @@ def get_execution_config() -> dict:
     if isinstance(poll, dict):
         return poll
 
+    script_name = str(os.environ.get("IFWI_MCP_EXEC_SCRIPT_NAME") or
+                      section.get("script_name") or "mcp_stitch").strip()
+    fiv_project_id = str(os.environ.get("IFWI_MCP_EXEC_FIV_PROJECT_ID") or
+                         section.get("fiv_project_id") or "").strip()
+    if mode == "remote" and not fiv_project_id:
+        return err(ErrorCode.CONFIG_INVALID, "remote execution requires execution.fiv_project_id",
+                   {"path": path, "param": "execution.fiv_project_id",
+                    "expected": "the AUTO_INTEGRATION_SERVICE fiv_project_id to submit under"})
+
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
                "has_token": bool(get_execution_token()),
-               "timeout_seconds": timeout, "poll_interval_seconds": poll})
+               "timeout_seconds": timeout, "poll_interval_seconds": poll,
+               "script_name": script_name, "fiv_project_id": fiv_project_id})
 
 
 def get_execution_token() -> str:

@@ -3,12 +3,17 @@
 The execution.mode switch in the config file decides where the work happens:
 
 * local  - download/extract everything into the cache, run cli.py in its venv.
-* remote - POST the plan to execution.endpoint, poll for completion, then pull the
-           deliverables back. The runner is expected to perform the same steps.
+* remote - dispatch the plan to Intel's AUTO_INTEGRATION_SERVICE (the same
+           start_auto_task/get_custom_task_by_id mechanism fiv-portal itself uses for
+           submit_vdc/web_stitch), which clones ifwi-stitching-mcp on a worker per
+           task_dispatcher.json and runs remote_stitch_entry.py -- reusing this exact
+           local-execution codepath there. The worker uploads its deliverables to
+           Artifactory and we fetch them back.
 
 Either way the caller gets the same result shape: the exact command line that ran,
 the exit code, and a deliverables manifest.
 """
+import json
 import time
 import uuid
 from pathlib import Path
@@ -20,16 +25,8 @@ from .result import ok, err, ErrorCode
 
 _SUBMIT_TIMEOUT = 60
 _POLL_TIMEOUT = 60
-_DONE = {"succeeded": True, "success": True, "completed": True, "done": True,
-         "failed": False, "error": False, "cancelled": False, "canceled": False}
-_FAILED_STATES = ("failed", "error", "cancelled", "canceled")
-
-
-def _headers(token: str) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+_FINISHED_STATES = ("finished",)
+_FAILED_STATES = ("failed", "skip")
 
 
 def prepare_environment(plan: dict) -> dict:
@@ -43,21 +40,23 @@ def prepare_environment(plan: dict) -> dict:
     fetched = []
 
     ifwi = sources.get("ifwi") or {}
-    if ifwi.get("kind") == "local":
-        binary_file = ifwi.get("local_path", "")
-        if not Path(binary_file).is_file():
-            return err(ErrorCode.ENV_PREPARE_FAILED, "IFWI binary no longer exists",
-                       {"source": "ifwi", "path": binary_file})
-    else:
-        res = prepare.prepare_ifwi(ifwi.get("project"), ifwi.get("phase"),
-                                   ifwi.get("version"), ifwi.get("swimlane"),
-                                   ifwi.get("binary_name"),
-                                   bool(ifwi.get("from_build_targets")))
-        if not res["ok"]:
-            return res
-        binary_file = res["data"]["binary_file"]
-        warnings += res["data"].get("warnings", [])
-        fetched.append({"source": "ifwi", "url": res["data"]["ifwi_url"]})
+    binary_file = ""
+    if ifwi and ifwi.get("kind") != "none":
+        if ifwi.get("kind") == "local":
+            binary_file = ifwi.get("local_path", "")
+            if not Path(binary_file).is_file():
+                return err(ErrorCode.ENV_PREPARE_FAILED, "IFWI binary no longer exists",
+                           {"source": "ifwi", "path": binary_file})
+        else:
+            res = prepare.prepare_ifwi(ifwi.get("project"), ifwi.get("phase"),
+                                       ifwi.get("version"), ifwi.get("swimlane"),
+                                       ifwi.get("binary_name"),
+                                       bool(ifwi.get("from_build_targets")))
+            if not res["ok"]:
+                return res
+            binary_file = res["data"]["binary_file"]
+            warnings += res["data"].get("warnings", [])
+            fetched.append({"source": "ifwi", "url": res["data"]["ifwi_url"]})
 
     ingredients = []
     for ingredient in (sources.get("ingredients") or []):
@@ -89,14 +88,19 @@ def prepare_environment(plan: dict) -> dict:
             config_targets = res["data"]["config_targets"]
             tool_root = res["data"]["tool_root"]
         elif local.is_dir():
-            cli_dir = stitch_runner.find_cli_dir(local)
+            cli_dir = stitch_runner.find_cli_dir(local, project=plan.get("project"))
             if cli_dir is None:
                 return err(ErrorCode.ENV_PREPARE_FAILED,
-                           "no cli.py or stitch2.py under stitch_path",
+                           "no cli.py, muppet.py or stitch2.py under stitch_path",
                            {"source": "stitch_tool", "path": str(local)})
             stitch_dir = str(cli_dir)
             venv_python = str(stitch_runner.find_venv_python(cli_dir))
-            config_targets = sorted(p.stem for p in (cli_dir / "config").glob("Config_Stitch_*.ini"))
+            config_dir = stitch_runner.find_config_dir(cli_dir)
+            config_targets = []
+            if config_dir:
+                config_targets = sorted(p.stem for p in config_dir.glob("Config_Stitch_*.ini"))
+                if not config_targets:
+                    config_targets = sorted(p.stem for p in config_dir.glob("*.ini")) + sorted(p.stem for p in config_dir.glob("*.json"))
             tool_root = str(local)
         else:
             return err(ErrorCode.ENV_PREPARE_FAILED, "stitch path no longer exists",
@@ -214,102 +218,120 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
                "warnings": env["data"]["warnings"] + built["data"]["warnings"]})
 
 
-def _submit(endpoint: str, token: str, plan: dict) -> dict:
+def _submit(endpoint: str, script_name: str, fiv_project_id: str, plan: dict) -> dict:
     try:
-        resp = requests.post(f"{endpoint}/jobs", json={"plan": plan},
-                             headers=_headers(token), timeout=_SUBMIT_TIMEOUT,
-                             verify=False)
+        resp = requests.post(f"{endpoint}/start_auto_task/",
+                             data={"fiv_project_id": fiv_project_id,
+                                   "script_name": script_name,
+                                   "args": json.dumps({"plan": plan})},
+                             timeout=_SUBMIT_TIMEOUT, verify=False)
     except requests.RequestException as exc:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach the stitch runner",
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach AUTO_INTEGRATION_SERVICE",
                    {"endpoint": endpoint, "reason": str(exc)})
     if resp.status_code in (401, 403):
-        return err(ErrorCode.AUTH_FAILED, "stitch runner rejected the credentials",
+        return err(ErrorCode.AUTH_FAILED, "AUTO_INTEGRATION_SERVICE rejected the request",
                    {"endpoint": endpoint, "status": resp.status_code})
     if resp.status_code >= 400:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "stitch runner refused the job",
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE refused the task",
                    {"endpoint": endpoint, "status": resp.status_code,
                     "body": resp.text[:2000]})
     try:
         body = resp.json()
     except ValueError:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "stitch runner returned invalid JSON",
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned invalid JSON",
                    {"endpoint": endpoint, "body": resp.text[:2000]})
-    job_id = body.get("job_id") or body.get("id")
-    if not job_id:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "stitch runner returned no job_id",
+    if str(body.get("result", "")).upper() != "SUCCESS":
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE did not accept the task",
+                   {"endpoint": endpoint, "body": body, "comment": body.get("comment")})
+    task_id = body.get("auto_server_task_id")
+    if not task_id:
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned no auto_server_task_id",
                    {"endpoint": endpoint, "body": body})
-    return ok({"job_id": str(job_id)})
+    return ok({"task_id": str(task_id), "rancher_log": body.get("rancher_log")})
 
 
-def _poll(endpoint: str, token: str, job_id: str, timeout_seconds: int,
-          poll_interval: int) -> dict:
+def _poll(endpoint: str, task_id: str, timeout_seconds: int, poll_interval: int) -> dict:
     deadline = time.monotonic() + timeout_seconds
-    last = {}
     while True:
         try:
-            resp = requests.get(f"{endpoint}/jobs/{job_id}", headers=_headers(token),
+            resp = requests.get(f"{endpoint}/get_custom_task_by_id/",
+                                params={"task_id": task_id},
                                 timeout=_POLL_TIMEOUT, verify=False)
         except requests.RequestException as exc:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "lost contact with the stitch runner",
-                       {"endpoint": endpoint, "job_id": job_id, "reason": str(exc)})
+            return err(ErrorCode.REMOTE_EXEC_FAILED, "lost contact with AUTO_INTEGRATION_SERVICE",
+                       {"endpoint": endpoint, "task_id": task_id, "reason": str(exc)})
         if resp.status_code in (401, 403):
-            return err(ErrorCode.AUTH_FAILED, "stitch runner rejected the credentials",
+            return err(ErrorCode.AUTH_FAILED, "AUTO_INTEGRATION_SERVICE rejected the request",
                        {"endpoint": endpoint, "status": resp.status_code})
         if resp.status_code >= 400:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "stitch runner returned an error",
-                       {"endpoint": endpoint, "job_id": job_id,
+            return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned an error",
+                       {"endpoint": endpoint, "task_id": task_id,
                         "status": resp.status_code, "body": resp.text[:2000]})
         try:
-            last = resp.json()
+            body = resp.json()
         except ValueError:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "stitch runner returned invalid JSON",
-                       {"endpoint": endpoint, "job_id": job_id, "body": resp.text[:2000]})
-        status = str(last.get("status", "")).lower()
-        if status in _FAILED_STATES:
-            return err(ErrorCode.STITCH_RUN_FAILED, "remote stitch job failed",
-                       {"job_id": job_id, "status": status,
-                        "exit_code": last.get("exit_code"),
-                        "command_line": last.get("command_line"),
-                        "log_tail": last.get("log_tail")})
-        if _DONE.get(status):
-            return ok({"job": last})
+            return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned invalid JSON",
+                       {"endpoint": endpoint, "task_id": task_id, "body": resp.text[:2000]})
+        task_data = body.get("task_data") or {}
+        status = str(task_data.get("task_status", "")).lower()
+        if status in _FINISHED_STATES or status in _FAILED_STATES:
+            return ok({"status": status, "task_result": task_data.get("task_result")})
         if time.monotonic() >= deadline:
-            return err(ErrorCode.REMOTE_TIMEOUT, "remote stitch job did not finish in time",
-                       {"job_id": job_id, "status": status,
+            return err(ErrorCode.REMOTE_TIMEOUT, "remote stitch task did not finish in time",
+                       {"task_id": task_id, "status": status,
                         "timeout_seconds": timeout_seconds})
         time.sleep(poll_interval)
 
 
 def _execute_remote(plan: dict, exec_cfg: dict) -> dict:
     plan_id = plan.get("plan_id", "")
-    endpoint, token = exec_cfg["endpoint"], config.get_execution_token()
+    endpoint = exec_cfg["endpoint"]
 
-    submitted = _submit(endpoint, token, plan)
+    submitted = _submit(endpoint, exec_cfg["script_name"], exec_cfg["fiv_project_id"], plan)
     if not submitted["ok"]:
         return submitted
-    job_id = submitted["data"]["job_id"]
+    task_id = submitted["data"]["task_id"]
 
-    polled = _poll(endpoint, token, job_id, exec_cfg["timeout_seconds"],
-                   exec_cfg["poll_interval_seconds"])
+    polled = _poll(endpoint, task_id, exec_cfg["timeout_seconds"], exec_cfg["poll_interval_seconds"])
     if not polled["ok"]:
         polled["detail"]["endpoint"] = endpoint
         return polled
-    job = polled["data"]["job"]
 
-    entries = job.get("deliverables") or []
-    fetched = deliverables.fetch(plan_id, entries, token) if entries else \
-        deliverables.collect(plan_id, [])
+    raw_result = polled["data"]["task_result"]
+    if isinstance(raw_result, str):
+        try:
+            raw_result = json.loads(raw_result) if raw_result else {}
+        except ValueError:
+            return err(ErrorCode.REMOTE_EXEC_FAILED, "remote stitch task_result is not valid JSON",
+                       {"task_id": task_id, "task_result": raw_result[:2000]})
+    result = raw_result or {}
+
+    if polled["data"]["status"] in _FAILED_STATES or not result.get("ok", False):
+        detail = (result.get("detail") or {}) if isinstance(result, dict) else {}
+        detail.update({"task_id": task_id, "endpoint": endpoint})
+        return err(result.get("error_code", ErrorCode.STITCH_RUN_FAILED),
+                   result.get("message", "remote stitch task failed"), detail)
+
+    data = result.get("data") or {}
+    entries = data.get("deliverables") or []
+    if entries:
+        token = config.get_artifactory_token()
+        if not token["ok"]:
+            return token
+        fetched = deliverables.fetch(plan_id, entries, token["data"]["token"])
+    else:
+        fetched = deliverables.collect(plan_id, [])
     if not fetched["ok"]:
         return fetched
     stitched = next((item["path"] for item in fetched["data"]["items"]
                      if item["kind"] == "stitched_bin"), None)
     log = next((item["path"] for item in fetched["data"]["items"]
                 if item["kind"] == "log"), None)
-    return ok({"plan_id": plan_id, "mode": "remote", "job_id": job_id,
+    return ok({"plan_id": plan_id, "mode": "remote", "task_id": task_id,
                "endpoint": endpoint,
-               "command_line": job.get("command_line"),
-               "exit_code": job.get("exit_code", 0),
+               "command_line": data.get("command_line"),
+               "exit_code": data.get("exit_code", 0),
                "stitched_bin": stitched, "log_path": log,
-               "environment": job.get("environment", {}),
+               "environment": data.get("environment", {}),
                "deliverables": fetched["data"],
-               "warnings": job.get("warnings", [])})
+               "warnings": data.get("warnings", [])})

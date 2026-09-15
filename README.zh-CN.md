@@ -112,6 +112,33 @@ cp .env.example .env
 都是按机器走的，按服务器实际运行的位置选 —— 注意写在 WSL 里的配置要用 Linux 路径，即使 VS Code 本体跑在
 Windows 上。
 
+### 命令行用法
+
+所有功能同样以独立命令 `ifwi-cli` 提供 —— 不需要 MCP 宿主，脚本、CI、临时终端操作都能直接用。
+`pip install -e .` 会把它注册到 `PATH`；如果 entry point 没生效（比如可编辑安装装的不是最新的），可以改用
+模块方式运行：`python -m ifwi_mcp.cli`。
+
+命令分组和 tool 一致：`fiv ...` 对应 FIV Portal 查询，`stitch ...` 对应 plan/build/run 流程，`oem parse`
+对应 OEM 解码，另外还有几个顶层工具命令（`download`、`list-local-files`、`extract-archive`）。运行
+`ifwi-cli --help`、`ifwi-cli fiv --help`、`ifwi-cli stitch --help` 可以看到每一组下面的所有子命令。
+
+```bash
+ifwi-cli fiv list-releases --project DMR --phase PowerOn
+
+ifwi-cli stitch build-plan --project DMR --phase PowerOn \
+  --ingredients '[{"name": "PowerOn_DMRAP_MMC1", "version": "0.967.0"}]' \
+  --config-ini Config_Stitch_OKSDCRB1_IPCleanDFXEnable_Trace_DebugSigned
+# -> 打印保存好的 plan，包含它的 plan_id
+
+ifwi-cli stitch execute-plan --plan-id <plan_id>
+
+ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
+```
+
+每个命令都会把 MCP tool 返回的同一套统一结果结构（`{"ok": true, "data": ...}` 或
+`{"ok": false, "error_code": ..., "message": ..., "detail": ...}`）以 JSON 形式打印到 stdout，`ok` 为
+`true` 时退出码 `0`，否则 `1` —— 方便配合 `jq` 写脚本。
+
 ### 排障
 
 - **改了代码不生效**：MCP server 是常驻进程，需重启。VS Code 里配了 `dev.watch` 会自动重启；否则用
@@ -147,15 +174,19 @@ Windows 上。
 一个 JSON 配置文件持有**执行开关**。路径取 `IFWI_MCP_CONFIG`，默认位于缓存目录旁边
 （`~/.ifwi-stitching-mcp/config.json`）。文件不存在即表示"全部用默认值"，也就是本地执行。
 
-> **`execution.mode = "remote"` 目前还在开发中，尚不可用** —— 现在没有配套的 runner 能接收 plan。请继续使用
-> 默认的 `local` 模式；下面这些字段是为将来远程执行落地时准备的文档。
+`execution.mode = "remote"` 会把 plan 派发给 Intel 的 `AUTO_INTEGRATION_SERVICE`——也就是 fiv-portal
+自己提交 `submit_vdc`/`web_stitch` 任务所用的同一套 `start_auto_task`/`get_custom_task_by_id` 机制——
+它会按 `task_dispatcher.json` 里的 `script_name` 条目把本仓库克隆到 worker 上运行
+`remote_stitch_entry.py`，复用完全相同的本地执行逻辑。详见下文的[远程 runner 协议](#远程-runner-协议)。
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "https://stitch-runner.example.com/api/v1",
-    "token": "<runner-access-token>",
+    "endpoint": "https://auto-integration-service.example.intel.com",
+    "script_name": "mcp_stitch",
+    "fiv_project_id": "123",
+    "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
   },
@@ -170,15 +201,19 @@ Windows 上。
 
 | 键 | 默认值 | 用途 |
 |----|--------|------|
-| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 把 plan 交给远程 runner。 |
-| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，runner 任务 API 的基础 URL。 |
-| `execution.token` | — | 访问 runner 的 Bearer token。任何工具都不会回显它。 |
+| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 把 plan 派发给 `AUTO_INTEGRATION_SERVICE`。 |
+| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，`AUTO_INTEGRATION_SERVICE` 的基础 URL。 |
+| `execution.script_name` | `mcp_stitch` | 要调用的 `task_dispatcher.json` 条目名。 |
+| `execution.fiv_project_id` | — | **`mode` 为 `remote` 时必填**，传给 `start_auto_task` 的 `fiv_project_id`。 |
+| `execution.artifactory_repo` | — | 远程 worker 上传产物所用的 Artifactory 基础 URL（由 worker 自己的 env/config 使用，本进程不直接用它）。 |
+| `execution.token` | — | 预留给未来鉴权用；目前不会发给 `AUTO_INTEGRATION_SERVICE`（它不需要）。 |
 | `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程轮询超时即放弃。 |
 | `execution.poll_interval_seconds` | `5` | 远程任务状态的轮询间隔。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
-`IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
+`IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_SCRIPT_NAME`、
+`IFWI_MCP_EXEC_FIV_PROJECT_ID`、`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
 （逗号分隔）会覆盖文件里的值。无效的 execution 段会导致**启动失败**，因此配错的远程端点会在任何实际工作
 开始前就被拦下。
 
@@ -203,6 +238,9 @@ Windows 上。
 |----------|------------|
 | `IFWI_MCP_EXEC_MODE` | `execution.mode` |
 | `IFWI_MCP_EXEC_ENDPOINT` | `execution.endpoint` |
+| `IFWI_MCP_EXEC_SCRIPT_NAME` | `execution.script_name` |
+| `IFWI_MCP_EXEC_FIV_PROJECT_ID` | `execution.fiv_project_id` |
+| `IFWI_MCP_ARTIFACTORY_REPO` | `execution.artifactory_repo` |
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
@@ -214,17 +252,24 @@ Windows 上。
 
 #### 远程 runner 协议
 
-> **尚不可用** —— 这里描述的是未来远程 runner 应该遵循的协议；目前并不存在这样的 runner。
+当 `mode` 为 `remote` 时，服务器会通过 Intel 的 `AUTO_INTEGRATION_SERVICE` 派发任务——这与 fiv-portal
+自己提交 `submit_vdc`/`web_stitch` 任务的机制完全一样：
 
-当 `mode` 为 `remote` 时，服务器会：
+1. `POST <endpoint>/start_auto_task/`（表单编码）：`{"fiv_project_id": ..., "script_name":
+   "mcp_stitch", "args": "{\"plan\": {...}}"}` → `{"result": "SUCCESS", "auto_server_task_id": "..."}`
+2. 轮询 `GET <endpoint>/get_custom_task_by_id/?task_id=<auto_server_task_id>`，直到
+   `task_data.task_status` 变为 `finished`/`failed`/`skip`，把 `task_data.task_result` 当作 worker
+   自己返回的 `{"ok": ..., "data": {...}}` 结果信封来解析
+3. 把 `task_result.data.deliverables`（`[{"name", "url", "kind"}]`）里的每个 URL 下载到本地
+   deliverables 目录——与本地模式收集产物的方式相同
 
-1. `POST <endpoint>/jobs`，请求体 `{"plan": {...}}` → 期望返回 `{"job_id": "..."}`
-2. 轮询 `GET <endpoint>/jobs/<job_id>` → 期望返回 `{"status": "running|succeeded|failed", "exit_code": 0,
-   "command_line": "...", "log_tail": "...", "deliverables": [{"name", "url", "kind"}]}`
-3. 把每个产物 URL 下载到本地 deliverables 目录
-
-runner 需要自行完成与本地模式相同的环境准备 —— plan 里已经携带了所需的全部信息。以上三步都会带
-`Authorization: Bearer <execution.token>`。
+`AUTO_INTEGRATION_SERVICE` 的 `task_dispatcher.json`（位于 `fiv-portal-common-handler` 仓库）把
+`script_name: mcp_stitch` 路由到本仓库根目录下的 `remote_stitch_entry.py`：它会把本仓库克隆到
+worker 上，安装 `requirements.txt`，然后运行 `remote_stitch_entry.py --plan-json '<plan>'`。该入口
+脚本直接复用 `executor._execute_local` 在 worker 上跑 stitch 工具，再用与下载相同的
+`ARTIFACTORY_TOKEN` Bearer 鉴权方式，把产物上传到 Artifactory（`execution.artifactory_repo` /
+`IFWI_MCP_ARTIFACTORY_REPO`，取 worker 自己的配置），最后把结果信封打印到 stdout。发给
+`AUTO_INTEGRATION_SERVICE` 本身的请求不带任何 `Authorization` 头——它不需要。
 
 ### 工具
 
@@ -242,7 +287,8 @@ runner 需要自行完成与本地模式相同的环境准备 —— plan 里已
 | `fiv_get_binary_ingredients` | `(project, phase, version, binary_name=None, swimlane=None, package_name=None)` | 列出某个 release binary 里烤进去的 ingredient（名称、版本等）—— 例如读出某个 `.bin` 用了哪个 MMC 版本。`binary_name` 必须精确匹配 `fiv_list_release_binaries`/`fiv_list_ifwi_binaries` 返回的条目；若省略且该 release 有不止一个 binary，会返回 `IFWI_BINARY_AMBIGUOUS` 并列出全部候选，而不是自己猜一个。 |
 | `fiv_find_ingredient` | `(project, name, version)` | 按精确名称和版本解析 ingredient 的下载 URL。 |
 | `fiv_list_ingredient_versions` | `(project, name, status="ALL", include_stitch_ingredient=0)` | 列出 FIV 记录过的某个 ingredient 的全部历史版本 —— 权威来源，走 FIV 专用接口，而不是扫描历史 release binary 推断。 |
-| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | 解析 stitch 工具包（`stitch_url` 为可下载的 `.7z`）及其文件列表。若 `build_target` 中没有任何包上报 stitch 工具，会回退去 Artifactory 上直接浏览 `release_root`（`<release_root>/<target 名称>/<package>`）再判定找不到。 |
+| `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | 解析 stitch 工具包（`stitch_url` 为可下载的 `.7z`）及其文件列表。若为 UP 项目，会自动转调 `fiv_find_env_package`。若 `build_target` 中没有任何包上报 stitch 工具，会回退去 Artifactory 上直接浏览 `release_root`（`<release_root>/<target 名称>/<package>`）再判定找不到。 |
+| `fiv_find_env_package` | `(project, phase, version, swimlane=None)` | 解析 UP (Unified Patch) release 的 env package URL（优先从 `get_ifwi_release_detail` 的 `env_atf_link` 或 download links 中提取）。 |
 | `fiv_match_build_by_oem` | `(project, product, ifwi_version, flavor, phase, swimlane=None)` | **路径 B** —— 用解析出的 OEM 信息反查 build。 |
 | `parse_ifwi_oem` | `(local_ifwi_path)` | 解码本地 IFWI 的 OEM 区域（偏移 `0xF00`，256 字节），返回 `product`、`ifwi_version`、`flavor_value`、`flavor_type`、`hash`。 |
 | `download` | `(url_or_path, category="ifwi", dest_name=None)` | 下载 Artifactory URL，或把本地文件拷入缓存。`category` ∈ `ifwi` / `ingredients` / `stitch`。 |
@@ -259,6 +305,7 @@ runner 需要自行完成与本地模式相同的环境准备 —— plan 里已
 | `stitch_prepare_environment` | `(plan_id)` | 只准备环境（下载并解压），不执行。 |
 | `stitch_execute_plan` | `(plan_id)` | 准备环境 → 本地或远程执行 → 收集产物。 |
 | `stitch_get_deliverables` | `(plan_id)` | 重新读取某份已完成 plan 的产物清单。 |
+| `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | 生成或更新 UP (Unified Patch) Muppet 的 config ini 文件。 |
 
 `phase` ∈ `Blue` / `Orange` / `Purple` / `Daily`。`version` 形如 `YYYY.WW.D.NN`（允许带前导点）。
 
@@ -325,6 +372,16 @@ runner 需要自行完成与本地模式相同的环境准备 —— plan 里已
 1. `parse_ifwi_oem(local.bin)` → `product`、`ifwi_version`、`flavor_value`
 2. `fiv_match_build_by_oem(project, product, ifwi_version, flavor, phase)` → 定位到 swimlane / 包
 3. 接着走 `stitch_build_plan` / `stitch_execute_plan`（把本地镜像作为 `ifwi_path` 传入）
+
+#### 路径 C —— Unified Patch (UP) 构建流程
+
+对于 UP 项目（`fiv_get_project` 返回 `category: "UP"`），构建工具为对应 release 中的 env package（Muppet 工具）：
+
+1. `fiv_get_project(project)` → 确认项目类型为 UP（`category: "UP"`）。
+2. `fiv_find_env_package(project, phase, version, swimlane)`（或 `fiv_find_stitch_tool` 自动分流）→ 获取并下载该 release 的 `env_atf_link` 环境包。
+3. `create_up_config(output_path, default_params=..., ingredients=...)` → 生成 UP 的 config ini 文件（包含 `[default]`、`[FIT1]`、`[SOC]`、`[ucode_section]` 等配置）。
+4. `stitch_build_plan(project, phase, ingredients, config_ini)` → 生成 UP 构建 plan，将在 `MUPPET/` 或 `MUPPT_<project>/` 目录下执行 `python muppet.py -c <config_ini>`。
+5. `stitch_execute_plan(plan_id)` → 在本地或远程执行，并从 `<build_path>/<version>/release/` 自动收集产物。
 
 ### 开发
 

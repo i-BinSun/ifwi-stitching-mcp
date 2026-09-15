@@ -12,6 +12,9 @@ dependencies = ["fastmcp", "requests", "py7zr", "python-dotenv"]
 [project.optional-dependencies]
 dev = ["pytest", "responses"]
 
+[project.scripts]
+ifwi-cli = "ifwi_mcp.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["ifwi_mcp*"]
 

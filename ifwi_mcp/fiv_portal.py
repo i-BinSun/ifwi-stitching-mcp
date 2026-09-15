@@ -627,10 +627,77 @@ def _browse_release_root_for_stitch(release_root: str) -> Optional[dict]:
     return None
 
 
+def find_env_package(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
+    """Resolve a UP (Unified Patch) release's env package URL.
+
+    In UP projects, the build/environment package is registered during engineering
+    builds, promoted into release metadata, and exposed in get_ifwi_release_detail
+    as `env_atf_link` (or under download_links/links_info as 'Env Package' / '<uid>_env.7z').
+    """
+    bad = _validate_common(project, phase, version)
+    if bad:
+        return bad
+    pid = resolve_project_id(project)
+    if not pid["ok"]:
+        return pid
+    lane = _resolve_swimlane_or_multi(project, phase, version, swimlane)
+    if not lane["ok"]:
+        return lane
+    swimlane = lane["data"]["swimlane"]
+
+    params = {"project_id": pid["data"]["project_id"], "phase": phase, "version": version}
+    if swimlane:
+        params["swimlane"] = swimlane
+    detail = _get("get_ifwi_release_detail/", params)
+    if not detail["ok"]:
+        return detail
+    data = detail["data"]["json"]
+    if not isinstance(data, dict) or data.get("code") == 1:
+        reason = (data or {}).get("error") if isinstance(data, dict) else "unexpected payload"
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no release detail for this version",
+                   {"project": project, "phase": phase, "version": version,
+                    "swimlane": swimlane, "reason": reason})
+
+    env_url = data.get("env_atf_link") or ""
+    if not env_url:
+        candidates = []
+        for item in (data.get("links_info") or []) + (data.get("download_links") or []):
+            if not isinstance(item, dict):
+                continue
+            item_name = str(item.get("item_name", "")).lower()
+            file_name = str(item.get("file_name", "")).lower()
+            link = item.get("link", "")
+            if "env" in item_name or "_env.7z" in file_name or file_name.endswith("env.7z"):
+                if link:
+                    candidates.append(link)
+        if candidates:
+            env_url = candidates[0]
+
+    if not env_url:
+        return err(ErrorCode.STITCH_TOOL_NOT_FOUND, "no env package found for UP release",
+                   {"project": project, "phase": phase, "version": version,
+                    "swimlane": swimlane})
+
+    package_name = env_url.rstrip("/").split("/")[-1]
+    return ok({"project_id": pid["data"]["project_id"],
+               "phase": phase,
+               "version": version,
+               "swimlane_branch": data.get("swimlane_branch"),
+               "stitch_url": env_url,
+               "env_url": env_url,
+               "package_name": package_name,
+               "binaries": [],
+               "source": "env_package"})
+
+
 def find_stitch_tool(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
     bad = _validate_common(project, phase, version)
     if bad:
         return bad
+    proj = get_project(project)
+    if proj.get("ok") and proj.get("data", {}).get("category") == "UP":
+        return find_env_package(project, phase, version, swimlane)
+
     pid = resolve_project_id(project)
     if not pid["ok"]:
         return pid

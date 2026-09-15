@@ -131,20 +131,25 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
         return _invalid("soft_strap has invalid syntax",
                         {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
 
+    proj_res = fiv_portal.get_project(project)
+    is_up_project = proj_res.get("ok") and proj_res.get("data", {}).get("category") == "UP"
+
     # --- IFWI source -----------------------------------------------------
     if ifwi_path:
         if not Path(ifwi_path).is_file():
             return _invalid("ifwi_path does not exist",
                             {"param": "ifwi_path", "expected": "existing .bin file"})
         ifwi_source = {"kind": "local", "local_path": str(Path(ifwi_path).resolve())}
-    else:
-        if not version:
-            return _invalid("version is required unless ifwi_path is given",
-                            {"param": "version", "expected": "e.g. 2026.28.3.01"})
+    elif version:
         ifwi_source = {"kind": "fiv", "project": project, "phase": phase,
                        "version": version, "swimlane": swimlane,
                        "binary_name": ifwi_binary,
                        "from_build_targets": bool(ifwi_from_build_targets)}
+    elif is_up_project:
+        ifwi_source = {"kind": "none"}
+    else:
+        return _invalid("version is required unless ifwi_path is given",
+                        {"param": "version", "expected": "e.g. 2026.28.3.01"})
 
     # --- Ingredient sources ------------------------------------------------
     ingredient_sources = []
@@ -189,19 +194,23 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     ingredient_match_preview, preview_warnings = _preview_local_ingredients(
         stitch_source, config_ini, local_ingredients)
 
-    argv = [P_PYTHON, "cli.py",
-            "--binary_file", P_BINARY,
-            "--ingredient_name", "|".join(ingredient_names),
-            "--ingredient_path", P_INGREDIENT,
-            "--config_ini", P_CONFIG_INI]
-    if soft_strap:
-        argv += ["--soft_strap", soft_strap]
+    if is_up_project:
+        argv = [P_PYTHON, "muppet.py", "-c", P_CONFIG_INI]
+    else:
+        argv = [P_PYTHON, "cli.py",
+                "--binary_file", P_BINARY,
+                "--ingredient_name", "|".join(ingredient_names),
+                "--ingredient_path", P_INGREDIENT,
+                "--config_ini", P_CONFIG_INI]
+        if soft_strap:
+            argv += ["--soft_strap", soft_strap]
 
     plan = {
         "plan_version": PLAN_VERSION,
         "plan_id": _new_plan_id(),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "project": project,
+        "category": "UP" if is_up_project else "IFWI",
         "phase": phase,
         "version": version,
         "swimlane": swimlane,
