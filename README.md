@@ -167,14 +167,16 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 | `result.py` | `ok()` / `err()` helpers + `ErrorCode` constants | — |
 | `config.py` | env vars, `.env` loading, config file, cache layout, startup validation, token access | the **only** module reading `os.environ` / the config file |
 | `fiv_portal.py` | FIV Portal REST client (projects, releases, swimlanes, finders) | HTTP + JSON only — no file I/O, no subprocess |
-| `downloader.py` | Artifactory download + local copy → cache | files only — no FIV knowledge |
+| `artifactory.py` | Artifactory download/caching + deliverables upload | transfers only — no FIV knowledge |
 | `oem_parser.py` | zero-dependency OEM region decoder | stdlib only — no network, no subprocess |
 | `archive.py` | `.zip` / `.tar*` / `.7z` extraction | pure file I/O |
-| `stitch_runner.py` | extract archive + build venv + render and run the `cli.py` command | the **only** module using subprocess / venv |
+| `up_config.py` | generate/parse UP (Unified Patch) Muppet config ini files | config file manipulation |
+| `stitch_runner.py` | extract archive + build venv + render and run `cli.py` / `muppet.py` | the **only** module using subprocess / venv |
 | `prepare.py` | find → download → extract, for IFWI / ingredient / stitch tool | orchestration of the layers above |
 | `plan.py` | confirmed answers → validated plan + rendered command line | no network, no subprocess |
 | `executor.py` | prepare the environment, then run the plan locally or on a remote runner | reads the execution switch |
 | `deliverables.py` | collect results + artifacts into one dir with a manifest | pure I/O + downloads |
+| `cli.py` | standalone CLI (`ifwi-cli`) with subcommands for all MCP capabilities | CLI entry point |
 | `server.py` | FastMCP app: registers tools as thin pass-through wrappers | orchestration only |
 
 ### Advanced configuration

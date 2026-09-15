@@ -157,14 +157,16 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `result.py` | `ok()` / `err()` 辅助函数 + `ErrorCode` 常量 | — |
 | `config.py` | 环境变量、`.env` 加载、配置文件、缓存布局、启动校验、token 访问 | **唯一**读取 `os.environ` 和配置文件的模块 |
 | `fiv_portal.py` | FIV Portal REST 客户端（项目、release、swimlane、各类查找） | 只做 HTTP + JSON —— 不碰文件，不起子进程 |
-| `downloader.py` | Artifactory 下载 + 本地拷贝 → 缓存 | 只处理文件 —— 不感知 FIV |
+| `artifactory.py` | Artifactory 下载/缓存 + 产物上传 | 只处理传输与缓存 —— 不感知 FIV |
 | `oem_parser.py` | 零依赖的 OEM 区域解码器 | 仅标准库 —— 不联网，不起子进程 |
 | `archive.py` | `.zip` / `.tar*` / `.7z` 解压 | 纯文件 I/O |
-| `stitch_runner.py` | 解压归档 + 建 venv + 渲染并执行 `cli.py` 命令 | **唯一**使用 subprocess / venv 的模块 |
+| `up_config.py` | 生成/解析 UP (Unified Patch) Muppet 的 config ini 文件 | 配置文件读写 |
+| `stitch_runner.py` | 解压归档 + 建 venv + 渲染并执行 `cli.py` / `muppet.py` 命令 | **唯一**使用 subprocess / venv 的模块 |
 | `prepare.py` | 查找 → 下载 → 解压，覆盖 IFWI / ingredient / stitch 工具 | 编排上面几层 |
 | `plan.py` | 已确认的答案 → 校验过的 plan + 渲染出的命令行 | 不联网，不起子进程 |
 | `executor.py` | 准备环境，然后在本地或远程 runner 上执行 plan | 读取执行开关 |
 | `deliverables.py` | 把结果与产物收集到同一目录并生成清单 | 纯 I/O + 下载 |
+| `cli.py` | 独立命令行终端（`ifwi-cli`），提供与所有 MCP 工具对齐的子命令 | CLI 交互入口 |
 | `server.py` | FastMCP 应用：把上述能力注册成薄封装工具 | 只做编排 |
 
 ### 高级配置
