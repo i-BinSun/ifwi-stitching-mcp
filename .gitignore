@@ -31,12 +31,6 @@ htmlcov/
 .env
 config.json
 
-# Local scripts / temporary caches
-export_fdu_tickets.py
-update_fdu_classification.py
-fdu_tickets_*.csv
-fiv_projects_cache.json
-
 # Editor / OS
 .idea/
 .vscode/
