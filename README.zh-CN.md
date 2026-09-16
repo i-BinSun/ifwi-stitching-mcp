@@ -308,6 +308,7 @@ worker 上，安装 `requirements.txt`，然后运行 `remote_stitch_entry.py --
 | `stitch_execute_plan` | `(plan_id)` | 准备环境 → 本地或远程执行 → 收集产物。 |
 | `stitch_get_deliverables` | `(plan_id)` | 重新读取某份已完成 plan 的产物清单。 |
 | `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | 生成或更新 UP (Unified Patch) Muppet 的 config ini 文件。 |
+| `cache_cleanup` | `(max_age_days=14, categories=None, dry_run=True)` | 清理超过 N 天未使用的缓存（下载、解压、工作区、产物）。默认只做 dry run。 |
 
 `phase` ∈ `Blue` / `Orange` / `Purple` / `Daily`。`version` 形如 `YYYY.WW.D.NN`（允许带前导点）。
 

@@ -321,6 +321,7 @@ All tools return the unified result shape described above.
 | `stitch_execute_plan` | `(plan_id)` | Prepare, run (local or remote), and collect the deliverables. |
 | `stitch_get_deliverables` | `(plan_id)` | Re-read the deliverables manifest of a finished plan. |
 | `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | Generate or update a UP (Unified Patch) Muppet config ini file. |
+| `cache_cleanup` | `(max_age_days=14, categories=None, dry_run=True)` | Delete cached downloads, extractions, workspaces and deliverables older than N days. Defaults to a dry run. |
 
 `phase` ∈ `Blue` / `Orange` / `Purple` / `Daily`. `version` matches `YYYY.WW.D.NN` (a leading dot is tolerated).
 

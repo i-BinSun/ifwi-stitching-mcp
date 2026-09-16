@@ -187,6 +187,12 @@ SPECS = [
         _opt("--fit1-params", default=None),
         _opt("--soc-params", default=None),
     ]),
+
+    Spec("cache", "cleanup", server.cache_cleanup, [
+        _opt("--max-age-days", type=int, default=14),
+        _opt("--categories", default=None),
+        _opt("--dry-run", action=argparse.BooleanOptionalAction, default=True),
+    ]),
 ]
 
 

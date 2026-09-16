@@ -29,6 +29,11 @@ _FINISHED_STATES = ("finished",)
 _FAILED_STATES = ("failed", "skip")
 
 
+def _auth_headers() -> dict:
+    token = config.get_execution_token()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def prepare_environment(plan: dict) -> dict:
     """Fetch and unpack everything the plan needs, before any command runs.
 
@@ -224,6 +229,7 @@ def _submit(endpoint: str, script_name: str, fiv_project_id: str, plan: dict) ->
                              data={"fiv_project_id": fiv_project_id,
                                    "script_name": script_name,
                                    "args": json.dumps({"plan": plan})},
+                             headers=_auth_headers(),
                              timeout=_SUBMIT_TIMEOUT, verify=False)
     except requests.RequestException as exc:
         return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach AUTO_INTEGRATION_SERVICE",
@@ -256,6 +262,7 @@ def _poll(endpoint: str, task_id: str, timeout_seconds: int, poll_interval: int)
         try:
             resp = requests.get(f"{endpoint}/get_custom_task_by_id/",
                                 params={"task_id": task_id},
+                                headers=_auth_headers(),
                                 timeout=_POLL_TIMEOUT, verify=False)
         except requests.RequestException as exc:
             return err(ErrorCode.REMOTE_EXEC_FAILED, "lost contact with AUTO_INTEGRATION_SERVICE",

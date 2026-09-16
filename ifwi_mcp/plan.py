@@ -21,6 +21,7 @@ PLAN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # Placeholders resolved against the prepared environment right before execution.
 P_PYTHON = "{python}"
+P_ENTRY = "{entry_script}"
 P_BINARY = "{binary_file}"
 P_INGREDIENT = "{ingredient_path}"
 P_CONFIG_INI = "{config_ini}"
@@ -195,9 +196,9 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
         stitch_source, config_ini, local_ingredients)
 
     if is_up_project:
-        argv = [P_PYTHON, "muppet.py", "-c", P_CONFIG_INI]
+        argv = [P_PYTHON, P_ENTRY, "-c", P_CONFIG_INI]
     else:
-        argv = [P_PYTHON, "cli.py",
+        argv = [P_PYTHON, P_ENTRY,
                 "--binary_file", P_BINARY,
                 "--ingredient_name", "|".join(ingredient_names),
                 "--ingredient_path", P_INGREDIENT,
@@ -226,7 +227,7 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     return ok({"plan_id": plan["plan_id"], "plan": plan,
                "plan_path": saved["data"]["plan_path"],
                "command_line": render_command_line(plan),
-               "placeholders": [P_PYTHON, P_BINARY, P_INGREDIENT, P_CONFIG_INI],
+               "placeholders": [P_PYTHON, P_ENTRY, P_BINARY, P_INGREDIENT, P_CONFIG_INI],
                "ingredient_match_preview": ingredient_match_preview,
                "warnings": preview_warnings})
 

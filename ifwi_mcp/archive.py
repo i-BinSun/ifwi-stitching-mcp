@@ -1,4 +1,5 @@
 """Common archive extraction (.zip / .tar* / .7z). Pure file I/O — no network."""
+import shutil
 import tarfile
 import zipfile
 from pathlib import Path
@@ -8,6 +9,56 @@ import py7zr
 
 from . import config, lock
 from .result import ok, err, ErrorCode
+
+# Longest-first, so ".tar.gz" wins over ".gz".
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2",
+                     ".txz", ".7z", ".zip", ".tar", ".gz", ".bz2", ".xz", ".zst")
+_COMPLETE_SUFFIX = ".extract_complete"
+COMPLETE_SUFFIX = _COMPLETE_SUFFIX
+
+
+def cache_name(filename: str) -> str:
+    """Cache-directory name for an archive: strip only the archive suffix.
+
+    Package names embed the version (PowerOn_MMC1_0.958.0.7z), so splitting on the
+    first dot would collapse every version into one directory and silently serve a
+    stale one back.
+    """
+    lower = filename.lower()
+    for suffix in _ARCHIVE_SUFFIXES:
+        if lower.endswith(suffix):
+            return filename[:-len(suffix)] or filename
+    return filename
+
+
+def _marker(dest: Path) -> Path:
+    return dest.parent / f"{dest.name}{_COMPLETE_SUFFIX}"
+
+
+def is_extracted(dest: Path) -> bool:
+    """True only for a directory a previous extraction finished writing."""
+    return dest.is_dir() and _marker(dest).is_file()
+
+
+def mark_extracted(dest: Path) -> None:
+    _marker(dest).write_text("", encoding="utf-8")
+
+
+def discard_extraction(dest: Path) -> None:
+    """Drop a half-written extraction so the next attempt starts from scratch."""
+    _marker(dest).unlink(missing_ok=True)
+    shutil.rmtree(dest, ignore_errors=True)
+
+
+def _unsafe_members(names) -> list:
+    """Member names that would escape the destination directory."""
+    bad = []
+    for name in names:
+        norm = str(name).replace("\\", "/")
+        if norm.startswith("/") or (len(norm) > 1 and norm[1] == ":") or \
+                any(part == ".." for part in norm.split("/")):
+            bad.append(str(name))
+    return bad
 
 
 def extract_into(src: Path, dest: Path) -> Optional[dict]:
@@ -30,6 +81,11 @@ def extract_into(src: Path, dest: Path) -> Optional[dict]:
                     t.extractall(dest)
         elif py7zr.is_7zfile(src):
             with py7zr.SevenZipFile(src, mode="r") as z:
+                # py7zr does not sanitize member paths the way zipfile/tarfile do.
+                unsafe = _unsafe_members(z.getnames())
+                if unsafe:
+                    return err(ErrorCode.EXTRACT_FAILED, "archive contains unsafe member paths",
+                               {"archive": str(src), "members": unsafe[:20]})
                 z.extractall(dest)
         else:
             return err(ErrorCode.EXTRACT_FAILED, "unsupported archive format",
@@ -51,7 +107,7 @@ def extract_archive(archive_path: str, dest_name: Optional[str] = None) -> dict:
         return err(ErrorCode.INVALID_ARGUMENT, "dest_name must be a bare filename",
                    {"param": "dest_name", "expected": "no path separators or .."})
     src = Path(archive_path)
-    dest = config.cache_subdir("extracted") / (dest_name or src.name.split(".")[0])
+    dest = config.cache_subdir("extracted") / (dest_name or cache_name(src.name))
 
     def _describe(source: str) -> dict:
         files = [p for p in dest.rglob("*") if p.is_file()]
@@ -59,7 +115,7 @@ def extract_archive(archive_path: str, dest_name: Optional[str] = None) -> dict:
         return ok({"extract_dir": dest.as_posix(), "file_count": len(files), "bins": bins,
                    "source": source})
 
-    if dest.is_dir() and any(dest.rglob("*")):
+    if is_extracted(dest):
         return _describe("cache")
 
     if not src.is_file():
@@ -68,12 +124,15 @@ def extract_archive(archive_path: str, dest_name: Optional[str] = None) -> dict:
 
     try:
         with lock.acquire(str(dest)):
-            if dest.is_dir() and any(dest.rglob("*")):
+            if is_extracted(dest):
                 return _describe("cache")
+            discard_extraction(dest)
             dest.mkdir(parents=True, exist_ok=True)
             failure = extract_into(src, dest)
             if failure:
+                discard_extraction(dest)
                 return failure
+            mark_extracted(dest)
             return _describe("extract")
     except TimeoutError as exc:
         return err(ErrorCode.LOCK_TIMEOUT, "timed out waiting for another extraction of the same archive",

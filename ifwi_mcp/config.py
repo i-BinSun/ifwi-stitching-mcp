@@ -25,6 +25,14 @@ _EXEC_MODES = ("local", "remote")
 _DEFAULT_TIMEOUT = 3600
 _DEFAULT_POLL = 5
 
+# Parsed config file, keyed by (path, mtime_ns, size) so an edit is picked up at once.
+_config_file_cache: dict = {}
+
+
+def reset_cache() -> None:
+    """Drop the memoized config-file contents."""
+    _config_file_cache.clear()
+
 
 class ConfigError(Exception):
     pass
@@ -88,6 +96,14 @@ def load_config_file() -> dict:
     if not path.is_file():
         return ok({"config": {}, "path": str(path), "exists": False})
     try:
+        stat = path.stat()
+    except OSError:
+        return ok({"config": {}, "path": str(path), "exists": False})
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _config_file_cache.get(key)
+    if cached is not None:
+        return ok({"config": cached, "path": str(path), "exists": True})
+    try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return err(ErrorCode.CONFIG_INVALID, "config file is not readable JSON",
@@ -95,6 +111,8 @@ def load_config_file() -> dict:
     if not isinstance(data, dict):
         return err(ErrorCode.CONFIG_INVALID, "config file must contain a JSON object",
                    {"path": str(path), "expected": "object"})
+    _config_file_cache.clear()
+    _config_file_cache[key] = data
     return ok({"config": data, "path": str(path), "exists": True})
 
 
@@ -178,9 +196,13 @@ def get_execution_config() -> dict:
                     "expected": "the AUTO_INTEGRATION_SERVICE fiv_project_id to submit under"})
 
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
-               "has_token": bool(get_execution_token()),
+               "has_token": bool(_token_from(section)),
                "timeout_seconds": timeout, "poll_interval_seconds": poll,
                "script_name": script_name, "fiv_project_id": fiv_project_id})
+
+
+def _token_from(section: dict) -> str:
+    return os.environ.get("IFWI_MCP_EXEC_TOKEN") or str(section.get("token") or "")
 
 
 def get_execution_token() -> str:
@@ -191,7 +213,7 @@ def get_execution_token() -> str:
     loaded = _section("execution")
     if not loaded["ok"]:
         return ""
-    return str(loaded["data"]["section"].get("token") or "")
+    return _token_from(loaded["data"]["section"])
 
 
 def get_stitch_config() -> dict:

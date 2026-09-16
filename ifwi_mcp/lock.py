@@ -40,9 +40,17 @@ def acquire(key: str, timeout: float = 900):
             try:
                 age = time.time() - path.stat().st_mtime
             except OSError:
-                continue  # released between the failed create and this stat
+                time.sleep(_POLL_SECONDS)  # released between the failed create and this stat
+                continue
             if age > _STALE_SECONDS:
-                path.unlink(missing_ok=True)
+                # Rename-then-delete, so only one of several stealers wins the steal.
+                stolen = path.with_name(f"{path.name}.stale.{os.getpid()}")
+                try:
+                    os.replace(str(path), str(stolen))
+                    os.unlink(str(stolen))
+                except OSError:
+                    pass
+                time.sleep(_POLL_SECONDS)
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for lock: {key}")

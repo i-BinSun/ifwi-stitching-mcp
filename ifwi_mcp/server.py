@@ -2,11 +2,12 @@
 import functools
 import json
 import sys
+import traceback
 from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import (archive, artifactory, config, deliverables, executor, fiv_portal,
+from . import (archive, artifactory, cache, config, deliverables, executor, fiv_portal,
                oem_parser, plan as plan_mod, prepare, stitch_runner, up_config)
 from .result import err, ErrorCode
 
@@ -20,7 +21,13 @@ def _guard(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            return err(ErrorCode.INTERNAL_ERROR, "unexpected error", {"exception": str(exc)})
+            # stdout is the MCP transport; diagnostics only ever go to stderr.
+            traceback.print_exc(file=sys.stderr)
+            return err(ErrorCode.INTERNAL_ERROR,
+                       f"unexpected {type(exc).__name__} in {fn.__name__}",
+                       {"tool": fn.__name__, "exception_type": type(exc).__name__,
+                        "exception": str(exc),
+                        "traceback": traceback.format_exc()[-2000:]})
     return wrapper
 
 
@@ -368,6 +375,30 @@ def stitch_get_deliverables(plan_id: str) -> dict:
     return deliverables.load_manifest(plan_id)
 
 
+@_guard
+def cache_cleanup(max_age_days: int = 14, categories: Optional[str] = None,
+                  dry_run: bool = True) -> dict:
+    """Delete cached downloads, extractions, workspaces and deliverables older than N days.
+
+    Nothing here is irreplaceable - everything is re-downloaded or re-extracted on demand.
+    Defaults to dry_run=True: run it once to see what would go, then again with
+    dry_run=False. categories is an optional JSON array string, e.g. '["work", "extracted"]';
+    omit it to sweep all of work, extracted, stitch, ifwi, ingredients, deliverables, plans.
+    max_age_days=0 clears the selected categories outright.
+    """
+    selected = None
+    if categories:
+        try:
+            selected = json.loads(categories)
+        except (ValueError, TypeError) as exc:
+            return err(ErrorCode.INVALID_ARGUMENT, "categories must be a JSON array string",
+                       {"param": "categories", "reason": str(exc)})
+        if not isinstance(selected, list):
+            return err(ErrorCode.INVALID_ARGUMENT, "categories must be a JSON array",
+                       {"param": "categories", "got": type(selected).__name__})
+    return cache.cleanup(max_age_days, selected, dry_run)
+
+
 # Register each plain function as an MCP tool (keeps the plain callable importable for tests).
 for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_releases,
             fiv_find_ifwi, fiv_list_release_binaries, fiv_list_ifwi_binaries,
@@ -378,7 +409,7 @@ for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_rel
             list_local_files, extract_archive, extract_stitch_tool, run_stitch,
             get_execution_config, stitch_build_plan, stitch_get_plan, stitch_list_plans,
             stitch_prepare_environment, stitch_execute_plan, stitch_get_deliverables,
-            create_up_config):
+            create_up_config, cache_cleanup):
     mcp.tool(_fn)
 
 

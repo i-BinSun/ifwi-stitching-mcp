@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from . import config, lock
+from . import archive, config, lock
 from .result import ok, err, ErrorCode
 
 _CATEGORIES = ("ifwi", "ingredients", "stitch")
@@ -41,15 +41,31 @@ def _fetch_url(url_or_path: str, target: Path) -> dict:
     if not (200 <= resp.status_code < 300):
         return err(ErrorCode.DOWNLOAD_FAILED, "download returned error status",
                    {"url": url_or_path, "http_status": resp.status_code})
+
+    # Only meaningful when the body isn't transfer-decoded on the way in.
+    expected = None
+    if not resp.headers.get("Content-Encoding"):
+        try:
+            expected = int(resp.headers["Content-Length"])
+        except (KeyError, TypeError, ValueError):
+            expected = None
+
     part = target.with_name(target.name + ".part")
     written = 0
     try:
-        with open(part, "wb") as fh:
+        with resp, open(part, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=65536):
                 if chunk:
                     fh.write(chunk)
                     written += len(chunk)
+        if expected is not None and written != expected:
+            return err(ErrorCode.DOWNLOAD_FAILED, "download is truncated",
+                       {"url": url_or_path, "expected_bytes": expected,
+                        "received_bytes": written})
         os.replace(part, target)
+    except (requests.RequestException, OSError) as exc:
+        return err(ErrorCode.DOWNLOAD_FAILED, "download was interrupted",
+                   {"url": url_or_path, "reason": str(exc), "received_bytes": written})
     finally:
         part.unlink(missing_ok=True)
     return ok({"local_path": str(target), "source": "download", "bytes": written})
@@ -60,6 +76,9 @@ def _copy_local(src: Path, target: Path) -> dict:
     try:
         shutil.copyfile(src, part)
         os.replace(part, target)
+    except OSError as exc:
+        return err(ErrorCode.DOWNLOAD_FAILED, "local file could not be copied into the cache",
+                   {"path": str(src), "reason": str(exc)})
     finally:
         part.unlink(missing_ok=True)
     return ok({"local_path": str(target), "source": "copy", "bytes": target.stat().st_size})
@@ -105,7 +124,7 @@ def list_local_files() -> dict:
     for category in _CATEGORIES:
         base = config.cache_subdir(category)
         for path in sorted(base.glob("*")):
-            if path.is_file():
+            if path.is_file() and not path.name.endswith(archive.COMPLETE_SUFFIX):
                 files.append({"path": path.as_posix(), "category": category, "bytes": path.stat().st_size})
     return ok({"files": files})
 

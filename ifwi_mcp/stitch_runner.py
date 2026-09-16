@@ -18,7 +18,7 @@ import venv
 from pathlib import Path
 from typing import Optional
 
-from . import archive, config, lock
+from . import archive, cache, config, lock
 from .result import ok, err, ErrorCode
 
 _SOFT_STRAP_RE = re.compile(r"^(\w+:\w+=[^,\s]+)([ ,]\w+:\w+=[^,\s]+)*$")
@@ -28,7 +28,8 @@ _WORKSPACE_SKIP_NAMES = {"stitching", "output"}
 _ENTRY_SCRIPT = "cli.py"
 _LEGACY_ENTRY_DIR = "Source"
 _LEGACY_ENTRY_SCRIPT = "stitch2.py"
-_ENTRY_SCRIPTS = ("cli.py", "muppet.py", "fxtmuppet.py", "fxtmuppt.py", "stitch2.py")
+_MUPPET_ENTRY_SCRIPTS = ("muppet.py", "fxtmuppet.py", "fxtmuppt.py")
+_ENTRY_SCRIPTS = (_ENTRY_SCRIPT, *_MUPPET_ENTRY_SCRIPTS, _LEGACY_ENTRY_SCRIPT)
 
 
 def _quote_argv(argv: list) -> str:
@@ -40,7 +41,7 @@ def _quote_argv(argv: list) -> str:
 
 def is_muppet_script(script_name: str) -> bool:
     """Return True if script_name is a UP / Muppet autobuild entry script."""
-    return (script_name or "").lower() in ("muppet.py", "fxtmuppet.py", "fxtmuppt.py")
+    return (script_name or "").lower() in _MUPPET_ENTRY_SCRIPTS
 
 
 def find_entry_script(stitch_dir: Path) -> Optional[str]:
@@ -147,12 +148,19 @@ def _venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
-def find_venv_python(stitch_dir: Path) -> Path:
+def _venv_python_or_fallback(stitch_dir: Path) -> tuple:
+    """(interpreter, warning). Falls back to this process's interpreter, loudly."""
     for ancestor in [stitch_dir, *stitch_dir.parents]:
         candidate = ancestor / "venv"
         if candidate.is_dir():
-            return _venv_python(candidate)
-    return Path(sys.executable)
+            return _venv_python(candidate), None
+    return Path(sys.executable), (
+        f"no venv/ found at or above {stitch_dir}; running the stitch tool with "
+        f"{sys.executable} instead — its dependencies may be missing")
+
+
+def find_venv_python(stitch_dir: Path) -> Path:
+    return _venv_python_or_fallback(stitch_dir)[0]
 
 
 def _read_regex_mandatory(config_ini: Path, ingredient_name: str) -> Optional[dict]:
@@ -312,16 +320,20 @@ def _resolve_ingredient_arg(config_ini: Path, ingredient_name: str,
 
 def _extract_stitch_tool_locked(archive_path: str, tool_root: Path) -> dict:
     src = Path(archive_path)
-    cli_dir = find_cli_dir(tool_root) if tool_root.is_dir() else None
+    cli_dir = find_cli_dir(tool_root) if archive.is_extracted(tool_root) else None
     if cli_dir is None:
+        archive.discard_extraction(tool_root)
         tool_root.mkdir(parents=True, exist_ok=True)
         extract_err = archive.extract_into(src, tool_root)
         if extract_err:
+            archive.discard_extraction(tool_root)
             return extract_err
         cli_dir = find_cli_dir(tool_root)
         if cli_dir is None:
+            archive.discard_extraction(tool_root)
             return err(ErrorCode.EXTRACT_FAILED, "cli.py or stitch2.py not found after extraction",
                        {"archive": archive_path, "reason": "no entry script found"})
+        archive.mark_extracted(tool_root)
 
     venv_dir = tool_root / "venv"
     if not venv_dir.is_dir():
@@ -347,11 +359,12 @@ def _extract_stitch_tool_locked(archive_path: str, tool_root: Path) -> dict:
                 deps_source = "fallback"
         if pip_argv is not None:
             proc = subprocess.run([str(vpython), "-m", "pip", "install", *pip_argv],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
             if proc.returncode != 0:
                 return err(ErrorCode.VENV_SETUP_FAILED, "pip install failed",
                            {"pip_output": (proc.stdout + proc.stderr)[-2000:]})
-            deps_marker.write_text("")
+            deps_marker.write_text("", encoding="utf-8")
 
     config_dir = find_config_dir(cli_dir)
     targets = []
@@ -368,7 +381,7 @@ def extract_stitch_tool(archive_path: str) -> dict:
     if not src.is_file():
         return err(ErrorCode.EXTRACT_FAILED, "archive not found",
                    {"archive": archive_path, "reason": "not a file"})
-    tool_root = config.cache_subdir("stitch") / src.name.split(".")[0]
+    tool_root = config.cache_subdir("stitch") / archive.cache_name(src.name)
     try:
         with lock.acquire(str(tool_root)):
             return _extract_stitch_tool_locked(archive_path, tool_root)
@@ -385,7 +398,8 @@ def _link_entry(src: Path, dst: Path) -> None:
     if src.is_dir():
         if sys.platform.startswith("win"):
             proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
             if proc.returncode != 0:
                 raise OSError(f"mklink /J failed: {(proc.stdout + proc.stderr).strip()}")
         else:
@@ -397,6 +411,28 @@ def _link_entry(src: Path, dst: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def _unlink_entry(path: Path) -> None:
+    """Remove one workspace entry without deleting through it into the shared tool."""
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            os.rmdir(path)  # Windows directory junction
+    elif path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _remove_workspace(root: Path) -> None:
+    if not root.exists():
+        return
+    try:
+        cache.remove_tree(root)
+    except OSError:
+        pass
+
+
 def materialize_workspace(tool_root: Path, key: str) -> dict:
     """A private, per-`key` working copy of a shared stitch-tool install.
 
@@ -405,19 +441,21 @@ def materialize_workspace(tool_root: Path, key: str) -> dict:
     creates and wipes on every run (Stitching/, Output/, output/) -- those are
     left absent so each caller gets its own, and the vendor tool's cleanup never
     touches another run's files.
+
+    The workspace is rebuilt every time: reusing one would leave the previous
+    run's outputs lying around to be mistaken for this run's.
     """
     digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
     workspace_root = config.cache_subdir("work") / digest / tool_root.name
-    if workspace_root.is_dir():
-        return ok({"workspace_root": str(workspace_root)})
+    _remove_workspace(workspace_root)
     try:
-        workspace_root.mkdir(parents=True)
+        workspace_root.mkdir(parents=True, exist_ok=True)
         for entry in tool_root.iterdir():
             if entry.name.lower() in _WORKSPACE_SKIP_NAMES:
                 continue
             _link_entry(entry, workspace_root / entry.name)
     except OSError as exc:
-        shutil.rmtree(workspace_root, ignore_errors=True)
+        _remove_workspace(workspace_root)
         return err(ErrorCode.WORKSPACE_SETUP_FAILED, "could not materialize isolated workspace",
                    {"tool_root": str(tool_root), "reason": str(exc)})
     return ok({"workspace_root": str(workspace_root)})
@@ -461,15 +499,16 @@ def build_stitch_command(stitch_dir: str, binary_file: Optional[str], ingredient
         return resolved
     resolved_ini = Path(resolved["data"]["config_ini_path"])
 
-    vpython = find_venv_python(sdir)
+    vpython, venv_warning = _venv_python_or_fallback(sdir)
     entry_argv, run_cwd = _entry_invocation(sdir, entry_script)
+    base_warnings = [venv_warning] if venv_warning else []
 
     # UP / Muppet execution
     if is_muppet_script(entry_script):
         argv = [str(vpython)] + entry_argv + ["-c", str(resolved_ini)]
         return ok({"argv": argv, "command_line": _quote_argv(argv), "cwd": str(run_cwd),
                    "config_ini": str(resolved_ini), "ingredient_args": [],
-                   "warnings": []})
+                   "warnings": base_warnings})
 
     # Standard IFWI stitch execution
     if not binary_file or not Path(binary_file).is_file():
@@ -493,7 +532,7 @@ def build_stitch_command(stitch_dir: str, binary_file: Optional[str], ingredient
         return err(ErrorCode.INVALID_ARGUMENT, "soft_strap has invalid syntax",
                    {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
 
-    names, args, warnings = [], [], []
+    names, args, warnings = [], [], list(base_warnings)
     for item in ingredients:
         name = item["name"].strip()
         arg, item_warnings = _resolve_ingredient_arg(resolved_ini, name, item["path"].strip())
@@ -535,7 +574,7 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
         log_path = config.cache_subdir("work") / f"stitch_{_run_counter[0]}.log"
     try:
         proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                              env=_augmented_env(sdir))
+                              encoding="utf-8", errors="replace", env=_augmented_env(sdir))
     except subprocess.TimeoutExpired:
         return err(ErrorCode.STITCH_RUN_FAILED, "stitch command timed out",
                    {"command_line": _quote_argv(argv), "timeout_seconds": timeout})
@@ -543,7 +582,8 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
         return err(ErrorCode.STITCH_RUN_FAILED, "stitch command could not be started",
                    {"command_line": _quote_argv(argv), "reason": str(exc)})
     combined = (proc.stdout or "") + (proc.stderr or "")
-    log_path.write_text(combined)
+    # The vendor tool's output is arbitrary bytes; never let encoding kill a finished run.
+    log_path.write_text(combined, encoding="utf-8", errors="replace")
 
     if proc.returncode != 0:
         return err(ErrorCode.STITCH_RUN_FAILED, "stitch entry script exited non-zero",
@@ -590,7 +630,14 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
             if files:
                 bins = sorted(files, key=lambda p: p.stat().st_mtime)
 
-    stitched_bin = str(bins[-1]) if bins else str(log_path)
+    if not bins:
+        return err(ErrorCode.STITCH_NO_OUTPUT,
+                   "stitch entry script exited 0 but produced no output file",
+                   {"exit_code": 0, "searched": [str(d) for d in candidate_output_dirs],
+                    "log_tail": combined[-2000:], "full_log_path": str(log_path),
+                    "command_line": _quote_argv(argv)})
+
+    stitched_bin = str(bins[-1])
     return ok({"stitched_bin": stitched_bin, "log_path": str(log_path),
                "output_dir": str(output_dir), "exit_code": 0,
                "command_line": _quote_argv(argv)})

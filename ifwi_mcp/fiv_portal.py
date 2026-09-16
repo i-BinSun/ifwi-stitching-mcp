@@ -1,7 +1,9 @@
 # ifwi_mcp/fiv_portal.py
 """FIV Portal REST client. Pure HTTP + JSON — no file I/O, no subprocess."""
+import hashlib
 import json
 import re
+import time
 from typing import Optional
 
 import requests
@@ -11,6 +13,20 @@ from .result import ok, err, ErrorCode
 
 PHASES = ("Blue", "Orange", "Purple", "Daily")
 _VERSION_RE = re.compile(r"^\.?\d{4}\.\d+\.\d+\.\d+$")
+
+# resolve_project_id() sits under nearly every call, and a single tool call can walk
+# through it half a dozen times; without this each one refetched the whole listing.
+_PROJECTS_TTL_SECONDS = 300
+_projects_cache: dict = {}
+
+# The endpoint caps at 20 rows unless a limit is passed; this is a bounded "give me
+# everything recent" without asking the server for an unbounded result set.
+_RELEASE_LIMIT = 2000
+
+
+def reset_cache() -> None:
+    """Drop the memoized project listing (tests, or after a FIV-side project change)."""
+    _projects_cache.clear()
 
 
 def _get(endpoint: str, params: dict, prefix: str = "app/rest") -> dict:
@@ -54,11 +70,20 @@ def _validate_common(project: str, phase: str, version: str) -> Optional[dict]:
 
 
 def list_projects() -> dict:
+    auth = config.get_fiv_auth_header()
+    if not auth["ok"]:
+        return auth
+    key = (config.get_base_url(),
+           hashlib.sha1(auth["data"]["header_value"].encode("utf-8")).hexdigest())
+    cached = _projects_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _PROJECTS_TTL_SECONDS:
+        return ok({"projects": cached[1], "source": "cache"})
     result = _get("get_project_info/", {})
     if not result["ok"]:
         return result
     projects = [{"id": p.get("id"), "name": p.get("name"), "project_name": p.get("project_name")}
                 for p in result["data"]["json"]]
+    _projects_cache[key] = (time.monotonic(), projects)
     return ok({"projects": projects})
 
 
@@ -226,7 +251,7 @@ def list_releases(project: str, phase: str, swimlane: Optional[str] = None) -> d
     # the server; when omitted the server returns only the project's default lane, so
     # to list a non-default lane (e.g. an imh2 branch) the caller must name it.
     params = {"project_id": pid["data"]["project_id"], "phase": phase,
-              "version": "", "limit": 1000000}
+              "version": "", "limit": _RELEASE_LIMIT}
     if swimlane:
         params["swimlane"] = swimlane
     result = _get("get_ifwi_release/", params)
@@ -246,8 +271,12 @@ def list_releases(project: str, phase: str, swimlane: Optional[str] = None) -> d
     } for r in rows]
     # Newest first by publish_time (ISO strings sort correctly); None sinks to bottom.
     releases.sort(key=lambda x: x.get("publish_time") or "", reverse=True)
+    warnings = []
+    if len(releases) >= _RELEASE_LIMIT:
+        warnings.append(f"result truncated at {_RELEASE_LIMIT} releases; older ones are not listed")
     return ok({"project_id": pid["data"]["project_id"], "phase": phase,
-               "count": len(releases), "latest": releases[0], "releases": releases})
+               "count": len(releases), "latest": releases[0], "releases": releases,
+               "warnings": warnings})
 
 
 def find_ifwi(project: str, phase: str, version: str, swimlane: Optional[str] = None) -> dict:
