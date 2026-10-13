@@ -22,6 +22,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _DEFAULT_CACHE = Path.home() / ".ifwi-stitching-mcp" / "cache"
 _EXEC_MODES = ("local", "remote")
+_SERVE_MODES = ("local", "server")
 _DEFAULT_TIMEOUT = 3600
 _DEFAULT_POLL = 5
 
@@ -166,6 +167,13 @@ def get_execution_config() -> dict:
                    {"path": path, "param": "execution.mode", "expected": list(_EXEC_MODES),
                     "got": mode})
 
+    serving = get_serve_config()
+    if not serving["ok"]:
+        return serving
+    if serving["data"]["mode"] == "server" and mode != "remote":
+        return err(ErrorCode.CONFIG_INVALID, "server mode requires remote execution",
+                   {"path": path, "param": "execution.mode", "expected": "remote", "got": mode})
+
     endpoint = str(os.environ.get("IFWI_MCP_EXEC_ENDPOINT") or section.get("endpoint") or "").rstrip("/")
     if mode == "remote":
         if not endpoint:
@@ -188,17 +196,11 @@ def get_execution_config() -> dict:
 
     script_name = str(os.environ.get("IFWI_MCP_EXEC_SCRIPT_NAME") or
                       section.get("script_name") or "mcp_stitch").strip()
-    fiv_project_id = str(os.environ.get("IFWI_MCP_EXEC_FIV_PROJECT_ID") or
-                         section.get("fiv_project_id") or "").strip()
-    if mode == "remote" and not fiv_project_id:
-        return err(ErrorCode.CONFIG_INVALID, "remote execution requires execution.fiv_project_id",
-                   {"path": path, "param": "execution.fiv_project_id",
-                    "expected": "the AUTO_INTEGRATION_SERVICE fiv_project_id to submit under"})
 
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
                "has_token": bool(_token_from(section)),
                "timeout_seconds": timeout, "poll_interval_seconds": poll,
-               "script_name": script_name, "fiv_project_id": fiv_project_id})
+               "script_name": script_name})
 
 
 def _token_from(section: dict) -> str:
@@ -214,6 +216,43 @@ def get_execution_token() -> str:
     if not loaded["ok"]:
         return ""
     return _token_from(loaded["data"]["section"])
+
+
+def get_serve_config() -> dict:
+    """MCP transport, independent of where stitch jobs execute."""
+    loaded = _section("serve")
+    if not loaded["ok"]:
+        return loaded
+    section, path = loaded["data"]["section"], loaded["data"]["path"]
+    mode = str(os.environ.get("IFWI_MCP_SERVE_MODE") or section.get("mode") or "local").strip().lower()
+    if mode not in _SERVE_MODES:
+        return err(ErrorCode.CONFIG_INVALID, "serve.mode must be 'local' or 'server'",
+                   {"path": path, "param": "serve.mode", "expected": list(_SERVE_MODES), "got": mode})
+    host = str(os.environ.get("IFWI_MCP_SERVE_HOST") or section.get("host") or "127.0.0.1").strip()
+    if not host:
+        return err(ErrorCode.CONFIG_INVALID, "serve.host cannot be empty",
+                   {"path": path, "param": "serve.host"})
+    port = _positive_int(os.environ.get("IFWI_MCP_SERVE_PORT") or section.get("port"),
+                         8000, "serve.port", path)
+    if isinstance(port, dict):
+        return port
+    if port > 65535:
+        return err(ErrorCode.CONFIG_INVALID, "serve.port must be at most 65535",
+                   {"path": path, "param": "serve.port"})
+    token = os.environ.get("IFWI_MCP_SERVE_TOKEN") or str(section.get("token") or "")
+    if mode == "server" and not token:
+        return err(ErrorCode.CONFIG_INVALID, "server mode requires a bearer token",
+                   {"path": path, "param": "serve.token", "env": "IFWI_MCP_SERVE_TOKEN"})
+    return ok({"mode": mode, "host": host, "port": port, "has_token": bool(token)})
+
+
+def get_serve_token() -> str:
+    """Server-mode bearer token; never include it in the public configuration result."""
+    env = os.environ.get("IFWI_MCP_SERVE_TOKEN")
+    if env:
+        return env
+    loaded = _section("serve")
+    return str(loaded["data"]["section"].get("token") or "") if loaded["ok"] else ""
 
 
 def get_stitch_config() -> dict:
@@ -269,4 +308,7 @@ def validate_startup() -> dict:
     execution = get_execution_config()
     if not execution["ok"]:
         return execution
+    serving = get_serve_config()
+    if not serving["ok"]:
+        return serving
     return ok({})

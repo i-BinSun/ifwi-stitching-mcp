@@ -294,7 +294,12 @@ def _execute_remote(plan: dict, exec_cfg: dict) -> dict:
     plan_id = plan.get("plan_id", "")
     endpoint = exec_cfg["endpoint"]
 
-    submitted = _submit(endpoint, exec_cfg["script_name"], exec_cfg["fiv_project_id"], plan)
+    fiv_project_id = plan.get("fiv_project_id")
+    if not isinstance(fiv_project_id, str) or not fiv_project_id.strip():
+        return err(ErrorCode.PLAN_INVALID, "remote execution requires a per-plan fiv_project_id",
+                   {"param": "fiv_project_id", "expected": "non-empty FIV project ID"})
+
+    submitted = _submit(endpoint, exec_cfg["script_name"], fiv_project_id.strip(), plan)
     if not submitted["ok"]:
         return submitted
     task_id = submitted["data"]["task_id"]

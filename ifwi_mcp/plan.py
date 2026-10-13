@@ -94,7 +94,8 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                ifwi_from_build_targets: bool = False,
                stitch_version: Optional[str] = None,
                stitch_path: Optional[str] = None,
-               soft_strap: Optional[str] = None) -> dict:
+               soft_strap: Optional[str] = None,
+               fiv_project_id: Optional[str] = None) -> dict:
     """Validate the confirmed answers and render the command line for them.
 
     Every source is either "fiv" (fetched during environment preparation) or
@@ -128,6 +129,10 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     if not config_ini or not config_ini.strip():
         return _invalid("config_ini is required",
                         {"param": "config_ini", "expected": "e.g. Config_Stitch_DMR"})
+    if fiv_project_id is not None and (not isinstance(fiv_project_id, str) or
+                                       not fiv_project_id.strip()):
+        return _invalid("fiv_project_id must be a non-empty string",
+                        {"param": "fiv_project_id"})
     if soft_strap and not _SOFT_STRAP_RE.match(soft_strap):
         return _invalid("soft_strap has invalid syntax",
                         {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
@@ -211,6 +216,7 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
         "plan_id": _new_plan_id(),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "project": project,
+        "fiv_project_id": fiv_project_id.strip() if fiv_project_id is not None else None,
         "category": "UP" if is_up_project else "IFWI",
         "phase": phase,
         "version": version,

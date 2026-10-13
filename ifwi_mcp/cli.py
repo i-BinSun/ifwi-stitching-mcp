@@ -164,6 +164,7 @@ SPECS = [
         _opt("--stitch-version", default=None),
         _opt("--stitch-path", default=None),
         _opt("--soft-strap", default=None),
+        _opt("--fiv-project-id", default=None),
     ]),
     Spec("stitch", "get-plan", server.stitch_get_plan, [
         _opt("--plan-id", required=True),

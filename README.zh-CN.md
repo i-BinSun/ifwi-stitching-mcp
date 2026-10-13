@@ -112,6 +112,49 @@ cp .env.example .env
 都是按机器走的，按服务器实际运行的位置选 —— 注意写在 WSL 里的配置要用 Linux 路径，即使 VS Code 本体跑在
 Windows 上。
 
+### 共享服务器部署
+
+`IFWI_MCP_SERVE_MODE` 控制客户端如何连接 MCP，与拼接任务在哪里执行无关。默认 `local` 保持原有的
+stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务。可在服务器的环境中设置
+`IFWI_MCP_SERVE_MODE=server`、`IFWI_MCP_SERVE_HOST=127.0.0.1`、`IFWI_MCP_SERVE_PORT=8000`、
+`IFWI_MCP_SERVE_TOKEN=<高强度随机令牌>`，并配置 `IFWI_MCP_EXEC_MODE=remote`、
+`IFWI_MCP_EXEC_ENDPOINT=<runner 地址>`，
+然后运行 `python -m ifwi_mcp.server`。令牌必填，
+客户端需发送 Bearer 认证；对外访问建议使用 TLS 反向代理，默认仅监听服务器本机回环地址。
+这些设置也可以放入 JSON 配置文件的 `serve` 段（`mode`、`host`、`port`、`token`），环境变量优先。
+
+`IFWI_MCP_EXEC_MODE` 是另一项独立配置：stdio 本地部署允许本地或远程执行；
+**`SERVE_MODE=server` 必须配置 `EXEC_MODE=remote`**，以及执行端点
+`IFWI_MCP_EXEC_ENDPOINT`，否则启动失败。FIV 项目 ID 由每次拼接请求提供，不在服务端写死。
+原有 `/mcp` 接口仍可使用，此外还提供独立的 REST JSON 接口（都使用服务端 Bearer 令牌认证）：
+
+- `POST /query`：必填 `project`、`phase` 和含一或两个版本号的 `versions`。一个版本返回 `data.release.ingredients`；两个不同版本只返回变更的 `data.differences`（每项为 `name`、`from_version`、`to_version`；某版本不存在的 ingredient 为 `null`）。
+- `POST /stitching`：必填 `project`（FIV 项目名称）、`fiv_project_id`（本次请求提交到远程调度服务的项目 ID）、`phase`、`version`、`config_ini` 以及非空的 `ingredients` 名称到版本映射。服务端确认 release binary、建立计划，再通过远程 runner 执行并返回 `plan_id` 与产物。`config_ini` 是 stitch tool 中的配置名称，不是客户端的文件路径。
+- 两个接口均可选传 `swimlane`、`binary_name`；拼接接口另可选传 `stitch_version`、`soft_strap`。多 swimlane/binary 时返回候选列表，须指定后重试，不自动猜测 binary。
+- 两个接口默认同步；`"async":true` 时立即返回 HTTP 202、`job_id` 和 `status_url`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed` 以及完整结果。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启后不可查询。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
+
+示例请求体（每个示例是一次独立请求）：
+
+查询一个版本（`POST /query`）：
+```json
+{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01"] }
+```
+
+对比两个版本（`POST /query`）：
+```json
+{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01", "2026.36.3.01"], "binary_name": "chosen-binary" }
+```
+
+异步拼接（`POST /stitching`）：
+```json
+{ "project": "DMR", "fiv_project_id": "123", "phase": "Orange", "version": "2026.35.3.01", "ingredients": {"PowerOn_DMRAP_MMC1": "0.967.0"}, "config_ini": "Config_Stitch_DMR", "binary_name": "chosen-binary", "async": true }
+```
+
+`binary_name` 需要替换为实际 release binary 名称；如果省略后收到多个候选，请根据返回值选一个再调用。
+
+工具中的本地路径指服务器文件系统，不是客户端文件系统；现有计划和产物缓存也未实现用户隔离。
+在增加按用户授权、路径限制、存储隔离和安全上传之前，不应作为多租户服务开放。
+
 ### 命令行用法
 
 所有功能同样以独立命令 `ifwi-cli` 提供 —— 不需要 MCP 宿主，脚本、CI、临时终端操作都能直接用。
@@ -187,7 +230,6 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
     "mode": "remote",
     "endpoint": "https://auto-integration-service.example.intel.com",
     "script_name": "mcp_stitch",
-    "fiv_project_id": "123",
     "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
@@ -206,7 +248,6 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 把 plan 派发给 `AUTO_INTEGRATION_SERVICE`。 |
 | `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，`AUTO_INTEGRATION_SERVICE` 的基础 URL。 |
 | `execution.script_name` | `mcp_stitch` | 要调用的 `task_dispatcher.json` 条目名。 |
-| `execution.fiv_project_id` | — | **`mode` 为 `remote` 时必填**，传给 `start_auto_task` 的 `fiv_project_id`。 |
 | `execution.artifactory_repo` | — | 远程 worker 上传产物所用的 Artifactory 基础 URL（由 worker 自己的 env/config 使用，本进程不直接用它）。 |
 | `execution.token` | — | 预留给未来鉴权用；目前不会发给 `AUTO_INTEGRATION_SERVICE`（它不需要）。 |
 | `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程轮询超时即放弃。 |
@@ -215,7 +256,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
 `IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_SCRIPT_NAME`、
-`IFWI_MCP_EXEC_FIV_PROJECT_ID`、`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
+`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
 （逗号分隔）会覆盖文件里的值。无效的 execution 段会导致**启动失败**，因此配错的远程端点会在任何实际工作
 开始前就被拦下。
 
@@ -241,7 +282,6 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_EXEC_MODE` | `execution.mode` |
 | `IFWI_MCP_EXEC_ENDPOINT` | `execution.endpoint` |
 | `IFWI_MCP_EXEC_SCRIPT_NAME` | `execution.script_name` |
-| `IFWI_MCP_EXEC_FIV_PROJECT_ID` | `execution.fiv_project_id` |
 | `IFWI_MCP_ARTIFACTORY_REPO` | `execution.artifactory_repo` |
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
@@ -259,6 +299,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 
 1. `POST <endpoint>/start_auto_task/`（表单编码）：`{"fiv_project_id": ..., "script_name":
    "mcp_stitch", "args": "{\"plan\": {...}}"}` → `{"result": "SUCCESS", "auto_server_task_id": "..."}`
+  （`fiv_project_id` 取自本次请求生成的 plan，不是服务器级默认值）。
 2. 轮询 `GET <endpoint>/get_custom_task_by_id/?task_id=<auto_server_task_id>`，直到
    `task_data.task_status` 变为 `finished`/`failed`/`skip`，把 `task_data.task_result` 当作 worker
    自己返回的 `{"ok": ..., "data": {...}}` 结果信封来解析

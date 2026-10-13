@@ -254,6 +254,13 @@ def run_stitch(stitch_dir: str, binary_file: str, ingredients: str, config_ini: 
     single run (pipe-joined internally, as cli.py's own --ingredient_name/--ingredient_path
     expect): [{"name": "PowerOn_DMRAP_MMC1", "path": "/abs/dir"}, {"name": "...", "path": "..."}].
     """
+    serving = config.get_serve_config()
+    if not serving["ok"]:
+        return serving
+    if serving["data"]["mode"] == "server":
+        return err(ErrorCode.CONFIG_INVALID,
+                   "run_stitch runs locally; use stitch_execute_plan or POST /stitching in server mode",
+                   {"param": "serve.mode", "expected": "local"})
     parsed, error = _parse_ingredients(ingredients)
     if error:
         return error
@@ -273,7 +280,8 @@ def stitch_build_plan(project: str, phase: str, ingredients: str, config_ini: st
                       ifwi_from_build_targets: bool = False,
                       stitch_version: Optional[str] = None,
                       stitch_path: Optional[str] = None,
-                      soft_strap: Optional[str] = None) -> dict:
+                      soft_strap: Optional[str] = None,
+                      fiv_project_id: Optional[str] = None) -> dict:
     """Turn the answers confirmed with the user into a saved plan plus its command line.
 
     Call this once every parameter is settled. Nothing runs, so the returned
@@ -298,13 +306,16 @@ def stitch_build_plan(project: str, phase: str, ingredients: str, config_ini: st
     — get the list from fiv_prepare_stitch/extract_stitch_tool's `config_targets` and match it
     to the chosen IFWI binary's flavor. It is resolved against the prepared stitch tool's
     config/ dir at run time, so never ask the user for a local filesystem path here.
+
+    When remote execution is configured, supply fiv_project_id for this request; it is
+    forwarded to AUTO_INTEGRATION_SERVICE when executing the saved plan.
     """
     parsed, error = _parse_ingredients(ingredients)
     if error:
         return error
     return plan_mod.build_plan(project, phase, parsed, config_ini, version,
                                swimlane, ifwi_binary, ifwi_path, ifwi_from_build_targets,
-                               stitch_version, stitch_path, soft_strap)
+                               stitch_version, stitch_path, soft_strap, fiv_project_id)
 
 
 @_guard
@@ -418,7 +429,19 @@ def main() -> None:
     if not startup["ok"]:
         print(json.dumps(startup), file=sys.stderr)
         sys.exit(1)
-    mcp.run()
+    serving = config.get_serve_config()["data"]
+    if serving["mode"] == "server":
+        from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+        # Auth is attached to the network-facing instance before it starts serving.
+        mcp.auth = StaticTokenVerifier({config.get_serve_token(): {"client_id": "ifwi-mcp-client",
+                                                           "scopes": []}})
+        import uvicorn
+        from .http_api import create_app
+
+        uvicorn.run(create_app(mcp), host=serving["host"], port=serving["port"])
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

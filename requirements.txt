@@ -2,3 +2,4 @@ fastmcp
 requests
 py7zr
 python-dotenv
+uvicorn
