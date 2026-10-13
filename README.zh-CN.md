@@ -123,6 +123,31 @@ stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务
 客户端需发送 Bearer 认证；对外访问建议使用 TLS 反向代理，默认仅监听服务器本机回环地址。
 这些设置也可以放入 JSON 配置文件的 `serve` 段（`mode`、`host`、`port`、`token`），环境变量优先。
 
+#### Docker 部署
+
+[Dockerfile](Dockerfile) 默认以非 root 用户启动 HTTP 服务，容器内监听 `0.0.0.0:8000`，
+stitch 任务仅支持远程执行。先构建镜像，再在**运行时**提供令牌和 runner 地址，不要作为构建参数写进镜像：
+
+```bash
+docker build -t ifwi-stitching-mcp .
+docker run --name ifwi-stitching-mcp --restart unless-stopped \
+  --env-file /secure/path/ifwi-mcp.env \
+  -p 127.0.0.1:8000:8000 \
+  -v ifwi-mcp-data:/data \
+  ifwi-stitching-mcp
+```
+
+环境文件需包含 `IFWI_MCP_SERVE_TOKEN`（高强度随机令牌）、
+`IFWI_MCP_EXEC_ENDPOINT`（`AUTO_INTEGRATION_SERVICE` 地址）；查询需要 `FIV_TOKEN`，
+下载产物需要 `ARTIFACTORY_TOKEN`。镜像已设置 `IFWI_MCP_SERVE_MODE=server`、
+`IFWI_MCP_SERVE_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
+`IFWI_MCP_CACHE_DIR=/data/cache`。数据卷保存计划、缓存和产物；异步任务状态仍在内存中，
+重启后丢失，因此轮询时应运行单个服务进程。`fiv_project_id` 由每次拼接请求携带。
+
+示例仅绑定宿主机回环地址；对外提供服务应部署 HTTPS 反向代理。若代理不在同一宿主机，
+需有意识地调整宿主机监听地址并限制防火墙访问。MCP 工具能访问容器内的文件路径，
+不要挂载敏感宿主目录，也不要把令牌交给不可信用户。
+
 `IFWI_MCP_EXEC_MODE` 是另一项独立配置：stdio 本地部署允许本地或远程执行；
 **`SERVE_MODE=server` 必须配置 `EXEC_MODE=remote`**，以及执行端点
 `IFWI_MCP_EXEC_ENDPOINT`，否则启动失败。FIV 项目 ID 由每次拼接请求提供，不在服务端写死。

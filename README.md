@@ -144,6 +144,36 @@ remote VS Code MCP client can register a server with `type: "http"`,
 Use a TLS-terminating reverse proxy for shared access; the default loopback bind is
 only reachable from the server itself. Do not place tokens in a committed MCP host config.
 
+#### Docker deployment
+
+The [Dockerfile](Dockerfile) starts the authenticated HTTP server on container port
+`8000` with remote-only stitch execution. Build the image, then provide credentials
+and the runner URL **at runtime** (never with Docker build arguments):
+
+```bash
+docker build -t ifwi-stitching-mcp .
+docker run --name ifwi-stitching-mcp --restart unless-stopped \
+  --env-file /secure/path/ifwi-mcp.env \
+  -p 127.0.0.1:8000:8000 \
+  -v ifwi-mcp-data:/data \
+  ifwi-stitching-mcp
+```
+
+The runtime env file must define `IFWI_MCP_SERVE_TOKEN` (a strong random value) and
+`IFWI_MCP_EXEC_ENDPOINT` (the `AUTO_INTEGRATION_SERVICE` URL), plus `FIV_TOKEN`
+for queries and `ARTIFACTORY_TOKEN` for artifact downloads. The image sets
+`IFWI_MCP_SERVE_MODE=server`, `IFWI_MCP_SERVE_HOST=0.0.0.0`,
+`IFWI_MCP_EXEC_MODE=remote` and `IFWI_MCP_CACHE_DIR=/data/cache`. The named volume
+persists plans, cached files and deliverables; asynchronous job *status* is still
+in-memory and lost on restart. Run a single server process for reliable polling.
+`fiv_project_id` belongs in each stitch request, not the env file.
+
+The example publishes to host loopback only. For external clients, front it with an
+HTTPS reverse proxy; if the proxy runs on another machine, deliberately change the
+host-side bind and restrict access with a firewall. The container is not a trusted
+multi-tenant sandbox: MCP tools can read or write paths on the container filesystem,
+so only grant tokens to trusted callers and do not mount sensitive host directories.
+
 `IFWI_MCP_EXEC_MODE` is separate: local serving (stdio) supports either local or
 remote execution. **Server mode requires `IFWI_MCP_EXEC_MODE=remote`**, plus
 `IFWI_MCP_EXEC_ENDPOINT`; startup fails otherwise. The FIV project ID is supplied

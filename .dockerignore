@@ -1,0 +1,25 @@
+# Never send secrets, host config, or repository history to the builder.
+.env
+.env.*
+!.env.example
+.mcp.json
+config.json
+.git/
+.vscode/
+.claude/
+.venv/
+venv/
+env/
+
+# Runtime output and local-only working files.
+docs/
+tests/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
