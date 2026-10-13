@@ -147,8 +147,21 @@ only reachable from the server itself. Do not place tokens in a committed MCP ho
 #### Docker deployment
 
 The [Dockerfile](Dockerfile) starts the authenticated HTTP server on container port
-`8000` with remote-only stitch execution. Build the image, then provide credentials
-and the runner URL **at runtime** (never with Docker build arguments):
+`8000` with remote-only stitch execution. With [compose.yaml](compose.yaml), copy
+[deploy.env.example](deploy.env.example) to an ignored `deploy.env` on the Docker host,
+replace the placeholders, then run:
+
+```bash
+docker compose up -d --build
+docker compose logs -f ifwi-stitching-mcp
+```
+
+Compose reads `deploy.env` at **container startup** via `env_file`; it is not copied
+into the image. The repository's `.env` is not used by this service (Compose may use
+it for variable interpolation). Keep `deploy.env` on the deployment host and do not
+commit it. To use another path, change `env_file` to that path before starting.
+Alternatively, build and run without Compose (supplying credentials at runtime,
+never as Docker build arguments):
 
 ```bash
 docker build -t ifwi-stitching-mcp .

@@ -29,6 +29,7 @@ htmlcov/
 
 # Local secrets / runtime config
 .env
+deploy.env
 config.json
 
 # Editor / OS

@@ -126,7 +126,19 @@ stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务
 #### Docker 部署
 
 [Dockerfile](Dockerfile) 默认以非 root 用户启动 HTTP 服务，容器内监听 `0.0.0.0:8000`，
-stitch 任务仅支持远程执行。先构建镜像，再在**运行时**提供令牌和 runner 地址，不要作为构建参数写进镜像：
+stitch 任务仅支持远程执行。使用 [compose.yaml](compose.yaml) 时，先将
+[deploy.env.example](deploy.env.example) 复制为部署机器上的 `deploy.env`，替换占位值后启动：
+
+```bash
+docker compose up -d --build
+docker compose logs -f ifwi-stitching-mcp
+```
+
+Compose 通过 `env_file` 在**容器启动时**注入 `deploy.env`，不会将它复制进镜像；
+仓库原有的 `.env` 不作为该服务的运行配置（Compose 可能用它做变量插值）。
+请把 `deploy.env` 留在部署机器上，不要提交；如需用其他路径，可修改 `env_file`。
+不用 Compose 时也可以手动构建和运行；令牌和 runner 地址应在**运行时**提供，
+不要作为构建参数写进镜像：
 
 ```bash
 docker build -t ifwi-stitching-mcp .

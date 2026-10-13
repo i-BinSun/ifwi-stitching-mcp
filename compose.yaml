@@ -1,0 +1,14 @@
+services:
+  ifwi-stitching-mcp:
+    build: .
+    image: ifwi-stitching-mcp:local
+    restart: unless-stopped
+    env_file:
+      - ./deploy.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ifwi-mcp-data:/data
+
+volumes:
+  ifwi-mcp-data:
