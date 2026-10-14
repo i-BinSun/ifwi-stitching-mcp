@@ -20,7 +20,7 @@ from pathlib import Path
 
 import requests
 
-from . import config, deliverables, plan as plan_mod, prepare, stitch_runner
+from . import archive, artifactory, config, deliverables, plan as plan_mod, prepare, stitch_runner
 from .result import ok, err, ErrorCode
 
 _SUBMIT_TIMEOUT = 60
@@ -53,10 +53,17 @@ def prepare_environment(plan: dict) -> dict:
                 return err(ErrorCode.ENV_PREPARE_FAILED, "IFWI binary no longer exists",
                            {"source": "ifwi", "path": binary_file})
         else:
-            res = prepare.prepare_ifwi(ifwi.get("project"), ifwi.get("phase"),
-                                       ifwi.get("version"), ifwi.get("swimlane"),
-                                       ifwi.get("binary_name"),
-                                       bool(ifwi.get("from_build_targets")))
+            if ifwi.get("url"):
+                dl = artifactory.download(ifwi["url"], category="ifwi")
+                if not dl["ok"]:
+                    return dl
+                res = ok({"binary_file": dl["data"]["local_path"],
+                          "ifwi_url": ifwi["url"], "warnings": []})
+            else:
+                res = prepare.prepare_ifwi(ifwi.get("project"), ifwi.get("phase"),
+                                           ifwi.get("version"), ifwi.get("swimlane"),
+                                           ifwi.get("binary_name"),
+                                           bool(ifwi.get("from_build_targets")))
             if not res["ok"]:
                 return res
             binary_file = res["data"]["binary_file"]
@@ -72,8 +79,18 @@ def prepare_environment(plan: dict) -> dict:
                 return err(ErrorCode.ENV_PREPARE_FAILED, "ingredient path no longer exists",
                            {"source": "ingredient", "name": name, "path": ingredient_dir})
         else:
-            res = prepare.prepare_ingredient(ingredient.get("project"), name,
-                                             ingredient.get("version"))
+            if ingredient.get("url"):
+                dl = artifactory.download(ingredient["url"], category="ingredients")
+                if not dl["ok"]:
+                    return dl
+                extracted = archive.extract_archive(dl["data"]["local_path"])
+                if not extracted["ok"]:
+                    return extracted
+                res = ok({"ingredient_dir": extracted["data"]["extract_dir"],
+                          "ingredient_url": ingredient["url"], "warnings": []})
+            else:
+                res = prepare.prepare_ingredient(ingredient.get("project"), name,
+                                                 ingredient.get("version"))
             if not res["ok"]:
                 return res
             ingredient_dir = res["data"]["ingredient_dir"]
@@ -111,9 +128,17 @@ def prepare_environment(plan: dict) -> dict:
             return err(ErrorCode.ENV_PREPARE_FAILED, "stitch path no longer exists",
                        {"source": "stitch_tool", "path": str(local)})
     else:
-        res = prepare.prepare_stitch(tool.get("project"), tool.get("phase"),
-                                     tool.get("version"), tool.get("swimlane"),
-                                     search_neighbors=True)
+        if tool.get("url"):
+            dl = artifactory.download(tool["url"], category="stitch")
+            if not dl["ok"]:
+                return dl
+            res = stitch_runner.extract_stitch_tool(dl["data"]["local_path"])
+            if res["ok"]:
+                res["data"]["prepared"] = True
+        else:
+            res = prepare.prepare_stitch(tool.get("project"), tool.get("phase"),
+                                         tool.get("version"), tool.get("swimlane"),
+                                         search_neighbors=True)
         if not res["ok"]:
             return res
         if not res["data"].get("prepared"):
@@ -182,6 +207,19 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
     if not env["ok"]:
         return env
     stitch = plan.get("stitch") or {}
+    config_ini = stitch.get("config_ini", "")
+    if stitch.get("auto_config"):
+        targets = env["data"]["config_targets"]
+        binary = (plan.get("sources") or {}).get("ifwi", {}).get("binary_name", "")
+        exact = [name for name in targets
+                 if name.casefold() == f"Config_Stitch_{binary}".casefold()]
+        if len(exact) == 1:
+            config_ini = exact[0]
+        elif len(targets) == 1:
+            config_ini = targets[0]
+        else:
+            return err(ErrorCode.CONFIG_AMBIGUOUS, "cannot select config for binary on worker",
+                       {"binary_name": binary, "candidates": targets})
 
     isolated = _isolated_stitch_dir(env["data"], plan_id or uuid.uuid4().hex)
     if not isolated["ok"]:
@@ -190,7 +228,7 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
     built = stitch_runner.build_stitch_command(
         isolated["data"]["stitch_dir"], env["data"]["binary_file"],
         env["data"]["ingredients"],
-        stitch.get("config_ini", ""), stitch.get("soft_strap"))
+        config_ini, stitch.get("soft_strap"))
     if not built["ok"]:
         return built
 

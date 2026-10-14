@@ -194,37 +194,42 @@ with each stitch request rather than hard-coded in the server configuration.
 The existing authenticated MCP endpoint `/mcp` remains available. The same server also
 exposes independent authenticated REST JSON interfaces:
 
-- `POST /query`: specify `project`, `phase`, and one or two release `versions`.
+- `POST /query`: specify `fiv_project_id`, `phase`, and one or two release `versions`.
   One version returns `data.release.ingredients`; two versions return only the
   changed ingredient versions in `data.differences` as
   `{name, from_version, to_version}` (a missing ingredient is `null`).
-- `POST /stitching`: specify `project`, `fiv_project_id`, `phase`, `version`, `config_ini`, and a
-  non-empty `ingredients` name-to-version map. The service resolves the release
-  binary, builds a plan, and executes it on the **remote** runner. The result
-  includes `plan_id` and deliverables. `project` is the FIV project name for release
-  lookups; `fiv_project_id` is the ID sent to the task dispatcher for **this request**.
-  `config_ini` is a configuration name from
-  the stitch tool, not a path on the client machine.
-- Both operations accept optional `swimlane` and `binary_name`; stitching also
-  accepts `stitch_version` and `soft_strap`. When multiple swimlanes or binaries
-  match, an error returns candidates; choose one and retry. No binary is guessed.
-- Both POST operations default to synchronous JSON results. Set `"async": true` to get HTTP 202 with `data.job_id` and `data.status_url`; `GET /jobs/{job_id}` returns `data.state` (`running`, `succeeded`, `failed`) and the complete unified `data.result` when done. Jobs are process-local, limited to 256 and retained for one hour after completion; a process restart loses job status. Failed operations still return their detailed error under `data.result`.
+- `POST /stitching`: specify `fiv_project_id`, `phase`, `version`, and a non-empty
+  `ingredients` name-to-version map. The server resolves FIV metadata into pinned
+  IFWI, ingredient and stitch-tool URLs, saves a plan and submits that same plan to
+  the **remote** runner. Only the worker downloads, extracts, validates the tool's
+  config and runs the stitch. The result includes `plan_id` and deliverables.
+- Set `"dry_run": true` on `/stitching` to preview `source_urls`, the inferred
+  `config_ini` and placeholder-based `command_template` without downloading or
+  submitting a remote stitch. The config hint cannot be verified until the worker
+  extracts the tool. FIV metadata is still queried. The preview returns its final
+  result directly with HTTP 200, even if `"async": true` was provided; it does not
+  create a job.
+- Both operations accept optional `swimlane` and `binary_name`. When several
+  swimlanes or binaries match, choose one from the returned candidates. For
+  stitching, multiple stitch configs without a unique match also return HTTP 409
+  with config candidates; no config is guessed.
+- Query and real stitching default to synchronous JSON results. Set `"async": true` to get HTTP 202 with `data.job_id` and `data.status_url`; `GET /jobs/{job_id}` returns `data.state` (`running`, `succeeded`, `failed`) and the complete unified `data.result` when done. Stitching dry runs always return directly. Jobs are process-local, limited to 256 and retained for one hour after completion; a process restart loses job status. Failed operations still return their detailed error under `data.result`.
 
 Example JSON bodies (one request per example; omit optional fields when not needed):
 
 Query one version (`POST /query`):
 ```json
-{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01"] }
+{ "fiv_project_id": "232", "phase": "Orange", "versions": ["2026.35.3.01"] }
 ```
 
 Compare two versions (`POST /query`):
 ```json
-{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01", "2026.36.3.01"], "binary_name": "chosen-binary" }
+{ "fiv_project_id": "232", "phase": "Orange", "versions": ["2026.35.3.01", "2026.36.3.01"], "binary_name": "chosen-binary" }
 ```
 
 Submit an asynchronous stitch (`POST /stitching`):
 ```json
-{ "project": "DMR", "fiv_project_id": "123", "phase": "Orange", "version": "2026.35.3.01", "ingredients": {"PowerOn_DMRAP_MMC1": "0.967.0"}, "config_ini": "Config_Stitch_DMR", "binary_name": "chosen-binary", "async": true }
+{ "fiv_project_id": "232", "phase": "Orange", "version": "2026.35.3.01", "ingredients": {"PowerOn_DMRAP_MMC1": "0.967.0"}, "binary_name": "chosen-binary", "async": true }
 ```
 
 `binary_name` must be a real release binary name;

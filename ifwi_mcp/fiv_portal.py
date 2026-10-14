@@ -157,6 +157,24 @@ def resolve_project_id(project: str) -> dict:
                {"candidates": [p["name"] for p in projects]})
 
 
+def resolve_project_by_id(fiv_project_id: str) -> dict:
+    """Find the FIV project name for an exact numeric ID (REST request identity)."""
+    if not isinstance(fiv_project_id, str) or not fiv_project_id.strip().isdigit():
+        return err(ErrorCode.INVALID_ARGUMENT, "fiv_project_id must be a numeric string",
+                   {"param": "fiv_project_id"})
+    listing = list_projects()
+    if not listing["ok"]:
+        return listing
+    project_id = int(fiv_project_id.strip())
+    for project in listing["data"]["projects"]:
+        if str(project.get("id")) == str(project_id):
+            name = project.get("name") or project.get("project_name")
+            if name:
+                return ok({"project_id": str(project_id), "project": name})
+    return err(ErrorCode.PROJECT_NOT_FOUND, "no project matched fiv_project_id",
+               {"fiv_project_id": str(project_id)})
+
+
 def _release_rows(project_id: int, phase: str, version: str, swimlane: Optional[str]) -> dict:
     params = {"project_id": project_id, "phase": phase, "version": version}
     if swimlane:

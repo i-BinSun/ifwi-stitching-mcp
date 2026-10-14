@@ -95,7 +95,8 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                stitch_version: Optional[str] = None,
                stitch_path: Optional[str] = None,
                soft_strap: Optional[str] = None,
-               fiv_project_id: Optional[str] = None) -> dict:
+               fiv_project_id: Optional[str] = None,
+               source_urls: Optional[dict] = None) -> dict:
     """Validate the confirmed answers and render the command line for them.
 
     Every source is either "fiv" (fetched during environment preparation) or
@@ -136,6 +137,17 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     if soft_strap and not _SOFT_STRAP_RE.match(soft_strap):
         return _invalid("soft_strap has invalid syntax",
                         {"param": "soft_strap", "expected": "k:v=val[,k:v=val]"})
+    if source_urls is not None:
+        if (not isinstance(source_urls, dict) or
+                any(not isinstance(source_urls.get(key), str) or
+                    not source_urls[key].startswith(("https://", "http://"))
+                    for key in ("ifwi", "stitch_tool")) or
+                not isinstance(source_urls.get("ingredients"), list) or
+                len(source_urls["ingredients"]) != len(ingredients) or
+                any(not isinstance(url, str) or not url.startswith(("https://", "http://"))
+                    for url in source_urls["ingredients"])):
+            return _invalid("source_urls must contain URLs for IFWI, stitch tool and every ingredient",
+                            {"param": "source_urls"})
 
     proj_res = fiv_portal.get_project(project)
     is_up_project = proj_res.get("ok") and proj_res.get("data", {}).get("category") == "UP"
@@ -200,6 +212,14 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
     ingredient_match_preview, preview_warnings = _preview_local_ingredients(
         stitch_source, config_ini, local_ingredients)
 
+    # REST plans pin URLs at planning time. The worker consumes these instead of
+    # re-querying FIV; other MCP plans keep their existing lazy resolution path.
+    if source_urls is not None:
+        ifwi_source["url"] = source_urls["ifwi"]
+        stitch_source["url"] = source_urls["stitch_tool"]
+        for source, url in zip(ingredient_sources, source_urls["ingredients"]):
+            source["url"] = url
+
     if is_up_project:
         argv = [P_PYTHON, P_ENTRY, "-c", P_CONFIG_INI]
     else:
@@ -224,7 +244,8 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
         "sources": {"ifwi": ifwi_source, "ingredients": ingredient_sources,
                     "stitch_tool": stitch_source},
         "stitch": {"ingredient_names": ingredient_names, "config_ini": config_ini,
-                   "soft_strap": soft_strap},
+                   "soft_strap": soft_strap,
+                   "auto_config": source_urls is not None},
         "command_template": argv,
     }
     saved = save_plan(plan)

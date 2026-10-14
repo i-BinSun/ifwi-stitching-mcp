@@ -165,29 +165,45 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 `IFWI_MCP_EXEC_ENDPOINT`，否则启动失败。FIV 项目 ID 由每次拼接请求提供，不在服务端写死。
 原有 `/mcp` 接口仍可使用，此外还提供独立的 REST JSON 接口（都使用服务端 Bearer 令牌认证）：
 
-- `POST /query`：必填 `project`、`phase` 和含一或两个版本号的 `versions`。一个版本返回 `data.release.ingredients`；两个不同版本只返回变更的 `data.differences`（每项为 `name`、`from_version`、`to_version`；某版本不存在的 ingredient 为 `null`）。
-- `POST /stitching`：必填 `project`（FIV 项目名称）、`fiv_project_id`（本次请求提交到远程调度服务的项目 ID）、`phase`、`version`、`config_ini` 以及非空的 `ingredients` 名称到版本映射。服务端确认 release binary、建立计划，再通过远程 runner 执行并返回 `plan_id` 与产物。`config_ini` 是 stitch tool 中的配置名称，不是客户端的文件路径。
-- 两个接口均可选传 `swimlane`、`binary_name`；拼接接口另可选传 `stitch_version`、`soft_strap`。多 swimlane/binary 时返回候选列表，须指定后重试，不自动猜测 binary。
-- 两个接口默认同步；`"async":true` 时立即返回 HTTP 202、`job_id` 和 `status_url`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed` 以及完整结果。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启后不可查询。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
+- `POST /query`：必填 `fiv_project_id`、`phase` 和含一或两个版本号的 `versions`。一个版本返回 `data.release.ingredients`；两个不同版本只返回变更的 `data.differences`（每项为 `name`、`from_version`、`to_version`；某版本不存在的 ingredient 为 `null`）。
+- `POST /stitching`：必填 `fiv_project_id`（FIV 项目 ID）、`phase`、`version` 以及非空的 `ingredients` 名称到版本映射。服务端只查 FIV 元数据，获取 IFWI、ingredient 和 stitch 工具的下载链接并保存命令模板；实际提交时，同一份含链接的 plan 传给远程 runner，由 worker 下载、解压、确认配置并执行。不需要客户端提供 `config_ini`、`stitch_version` 或 `soft_strap`。
+- 拼接请求可设置 `"dry_run":true`：直接返回 HTTP 200，包含 `source_urls`、`command_template`（含 worker 执行时才确定的路径占位符）和推断的 `config_ini`，不下载文件、不提交远程拼接任务。`config_ini` 只是根据 binary 名称推断的提示，最终由 worker 解压后验证或选取唯一配置。预览仍会请求 FIV 元数据；即使传了 `"async":true`，预览也直接返回最终结果，不产生 `job_id`。
+- 两个接口均可选传 `swimlane`、`binary_name`。多 swimlane/binary 时返回候选列表，须指定后重试；无法唯一匹配多个 stitch 配置时返回 HTTP 409 和配置候选，不自动猜测。
+- 查询和实际拼接默认同步；`"async":true` 时立即返回 HTTP 202、`job_id` 和 `status_url`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed` 以及完整结果。拼接 `dry_run` 始终同步直接返回。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启后不可查询。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
 
 示例请求体（每个示例是一次独立请求）：
 
 查询一个版本（`POST /query`）：
 ```json
-{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01"] }
+{ "fiv_project_id": "232", "phase": "Orange", "versions": ["2026.35.3.01"] }
 ```
 
 对比两个版本（`POST /query`）：
 ```json
-{ "project": "DMR", "phase": "Orange", "versions": ["2026.35.3.01", "2026.36.3.01"], "binary_name": "chosen-binary" }
+{ "fiv_project_id": "232", "phase": "Orange", "versions": ["2026.35.3.01", "2026.36.3.01"], "binary_name": "chosen-binary" }
 ```
 
 异步拼接（`POST /stitching`）：
 ```json
-{ "project": "DMR", "fiv_project_id": "123", "phase": "Orange", "version": "2026.35.3.01", "ingredients": {"PowerOn_DMRAP_MMC1": "0.967.0"}, "config_ini": "Config_Stitch_DMR", "binary_name": "chosen-binary", "async": true }
+{ "fiv_project_id": "232", "phase": "Orange", "version": "2026.35.3.01", "ingredients": {"PowerOn_DMRAP_MMC1": "0.967.0"}, "binary_name": "chosen-binary", "async": true }
 ```
 
+预览同一请求时改用 `"dry_run":true`、`"async":false`，直接读取响应中的 `data.source_urls` 与 `data.command_template` 后再提交实际任务；若仍传了 `"async":true`，服务器也会直接返回预览。
+
 `binary_name` 需要替换为实际 release binary 名称；如果省略后收到多个候选，请根据返回值选一个再调用。
+
+可运行的 Python 客户端示例见 [scripts/example_rest.py](scripts/example_rest.py)。先修改脚本顶部的
+`QUERY_PAYLOAD` / `STITCH_PAYLOAD` 为真实 FIV 项目 ID、版本、binary 及 ingredient，然后在项目根目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\example_rest.py query
+.\.venv\Scripts\python.exe scripts\example_rest.py stitching
+.\.venv\Scripts\python.exe scripts\example_rest.py stitching --confirm-stitch
+```
+
+示例会从 `deploy.env`（或 `IFWI_MCP_SERVE_TOKEN` 环境变量）读取 Bearer 令牌。查询命令请求
+`POST /query`；拼接命令请求 `POST /stitching`。
+不加 `--confirm-stitch` 时只预览计划及命令模板，不提交任务；加上后才提交并轮询。
 
 工具中的本地路径指服务器文件系统，不是客户端文件系统；现有计划和产物缓存也未实现用户隔离。
 在增加按用户授权、路径限制、存储隔离和安全上传之前，不应作为多租户服务开放。

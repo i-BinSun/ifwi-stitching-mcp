@@ -26,7 +26,8 @@ def _status(result: dict) -> int:
     code = result["error_code"]
     if code in (ErrorCode.INVALID_ARGUMENT, ErrorCode.PLAN_INVALID):
         return 400
-    if code in (ErrorCode.MULTIPLE_SWIMLANES, ErrorCode.IFWI_BINARY_AMBIGUOUS):
+    if code in (ErrorCode.MULTIPLE_SWIMLANES, ErrorCode.IFWI_BINARY_AMBIGUOUS,
+                ErrorCode.CONFIG_AMBIGUOUS):
         return 409
     return 502 if code != ErrorCode.INTERNAL_ERROR else 500
 
@@ -56,7 +57,7 @@ def _complete(job_id, operation, payload):
                          "result": result, "updated": time.monotonic()}
 
 
-async def _post(request, operation):
+async def _post(request, operation, *, direct_dry_run=False):
     if not _authorized(request):
         return JSONResponse(err(ErrorCode.AUTH_FAILED, "bearer token required"), status_code=401)
     try:
@@ -65,7 +66,9 @@ async def _post(request, operation):
         return _response(err(ErrorCode.INVALID_ARGUMENT, "request body must be valid JSON"))
     if not isinstance(payload, dict) or type(payload.get("async", False)) is not bool:
         return _response(err(ErrorCode.INVALID_ARGUMENT, "payload must be an object with optional boolean async"))
-    if payload.get("async"):
+    # A stitch preview is a final response, never a queued job. Preserve the
+    # normal async behavior for queries and real stitching requests.
+    if payload.get("async") and not (direct_dry_run and payload.get("dry_run") is True):
         with _LOCK:
             now = time.monotonic()
             for key, job in list(_JOBS.items()):
@@ -92,7 +95,7 @@ async def query(request):
 
 
 async def stitching(request):
-    return await _post(request, interfaces.stitching)
+    return await _post(request, interfaces.stitching, direct_dry_run=True)
 
 
 async def job_status(request):
