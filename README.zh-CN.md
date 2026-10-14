@@ -118,7 +118,7 @@ Windows 上。
 stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务。可在服务器的环境中设置
 `IFWI_MCP_SERVE_MODE=server`、`IFWI_MCP_SERVE_HOST=127.0.0.1`、`IFWI_MCP_SERVE_PORT=8000`、
 `IFWI_MCP_SERVE_TOKEN=<高强度随机令牌>`，并配置 `IFWI_MCP_EXEC_MODE=remote`、
-`IFWI_MCP_EXEC_ENDPOINT=<runner 地址>`，
+`IFWI_MCP_EXEC_ENDPOINT=<Job API 地址>`、`IFWI_MCP_ARTIFACTORY_REPO=<pod 发布结果的 Artifactory 目录>`，
 然后运行 `python -m ifwi_mcp.server`。令牌必填，
 客户端需发送 Bearer 认证；对外访问建议使用 TLS 反向代理，默认仅监听服务器本机回环地址。
 这些设置也可以放入 JSON 配置文件的 `serve` 段（`mode`、`host`、`port`、`token`），环境变量优先。
@@ -150,7 +150,7 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 ```
 
 环境文件需包含 `IFWI_MCP_SERVE_TOKEN`（高强度随机令牌）、
-`IFWI_MCP_EXEC_ENDPOINT`（`AUTO_INTEGRATION_SERVICE` 地址）；查询需要 `FIV_TOKEN`，
+`IFWI_MCP_EXEC_ENDPOINT`（FIV Job API 地址）、`IFWI_MCP_ARTIFACTORY_REPO`（pod 发布结果的位置）；查询需要 `FIV_TOKEN`，
 下载产物需要 `ARTIFACTORY_TOKEN`。镜像已设置 `IFWI_MCP_SERVE_MODE=server`、
 `IFWI_MCP_SERVE_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
 `IFWI_MCP_CACHE_DIR=/data/cache`。数据卷保存计划、缓存和产物；异步任务状态仍在内存中，
@@ -272,17 +272,15 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 一个 JSON 配置文件持有**执行开关**。路径取 `IFWI_MCP_CONFIG`，默认位于缓存目录旁边
 （`~/.ifwi-stitching-mcp/config.json`）。文件不存在即表示"全部用默认值"，也就是本地执行。
 
-`execution.mode = "remote"` 会把 plan 派发给 Intel 的 `AUTO_INTEGRATION_SERVICE`——也就是 fiv-portal
-自己提交 `submit_vdc`/`web_stitch` 任务所用的同一套 `start_auto_task`/`get_custom_task_by_id` 机制——
-它会按 `task_dispatcher.json` 里的 `script_name` 条目把本仓库克隆到 worker 上运行
-`remote_stitch_entry.py`，复用完全相同的本地执行逻辑。详见下文的[远程 runner 协议](#远程-runner-协议)。
+`execution.mode = "remote"` 会直接通过 FIV Job API 创建一个 Windows pod（与 `AUTO_INTEGRATION_SERVICE`
+使用的是同一个 API，但不需要它的数据库）。pod 克隆本仓库并运行 `python -m ifwi_mcp.worker`，复用完全相同的
+本地执行逻辑，并且只通过 Artifactory 回传结果。详见下文的[远程 runner 协议](#远程-runner-协议)。
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "https://auto-integration-service.example.intel.com",
-    "script_name": "mcp_stitch",
+    "endpoint": "http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
     "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
@@ -298,18 +296,20 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 
 | 键 | 默认值 | 用途 |
 |----|--------|------|
-| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 把 plan 派发给 `AUTO_INTEGRATION_SERVICE`。 |
-| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，`AUTO_INTEGRATION_SERVICE` 的基础 URL。 |
-| `execution.script_name` | `mcp_stitch` | 要调用的 `task_dispatcher.json` 条目名。 |
-| `execution.artifactory_repo` | — | 远程 worker 上传产物所用的 Artifactory 基础 URL（由 worker 自己的 env/config 使用，本进程不直接用它）。 |
-| `execution.token` | — | 预留给未来鉴权用；目前不会发给 `AUTO_INTEGRATION_SERVICE`（它不需要）。 |
-| `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程轮询超时即放弃。 |
-| `execution.poll_interval_seconds` | `5` | 远程任务状态的轮询间隔。 |
+| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 通过 Job API 创建 pod 执行。 |
+| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，Job API 地址（`.../v1/fivportal/job`）。 |
+| `execution.artifactory_repo` | — | **`mode` 为 `remote` 时必填**。每次运行发布到 `<artifactory_repo>/<plan_id>-<随机串>/`。 |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod 镜像，需要有 `git`、`python` 以及 Artifactory token 环境变量。 |
+| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | pod 克隆以获取 `ifwi_mcp.worker` 的仓库。 |
+| `execution.repo_ref` | `main` | pod 检出的分支或 tag。 |
+| `execution.token` | — | 可选，发给 Job API 的 Bearer 令牌（目前它不需要）。 |
+| `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程时作为 pod 的 `activedeadlineseconds` 和轮询上限（含 clone、pip 安装和拼接）。 |
+| `execution.poll_interval_seconds` | `5` | pod 任务状态的轮询间隔。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
-`IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_SCRIPT_NAME`、
-`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
+`IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_IMAGE`、`IFWI_MCP_EXEC_REPO`、
+`IFWI_MCP_EXEC_REF`、`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
 （逗号分隔）会覆盖文件里的值。无效的 execution 段会导致**启动失败**，因此配错的远程端点会在任何实际工作
 开始前就被拦下。
 
@@ -334,8 +334,10 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 |----------|------------|
 | `IFWI_MCP_EXEC_MODE` | `execution.mode` |
 | `IFWI_MCP_EXEC_ENDPOINT` | `execution.endpoint` |
-| `IFWI_MCP_EXEC_SCRIPT_NAME` | `execution.script_name` |
 | `IFWI_MCP_ARTIFACTORY_REPO` | `execution.artifactory_repo` |
+| `IFWI_MCP_EXEC_IMAGE` | `execution.image` |
+| `IFWI_MCP_EXEC_REPO` | `execution.repo_url` |
+| `IFWI_MCP_EXEC_REF` | `execution.repo_ref` |
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
@@ -347,25 +349,24 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 
 #### 远程 runner 协议
 
-当 `mode` 为 `remote` 时，服务器会通过 Intel 的 `AUTO_INTEGRATION_SERVICE` 派发任务——这与 fiv-portal
-自己提交 `submit_vdc`/`web_stitch` 任务的机制完全一样：
+当 `mode` 为 `remote` 时，服务器直接调用 FIV Job API——不经过 `AUTO_INTEGRATION_SERVICE` 任务，也不需要
+数据库。pod 回传结果的唯一通道是 Artifactory：
 
-1. `POST <endpoint>/start_auto_task/`（表单编码）：`{"fiv_project_id": ..., "script_name":
-   "mcp_stitch", "args": "{\"plan\": {...}}"}` → `{"result": "SUCCESS", "auto_server_task_id": "..."}`
-  （`fiv_project_id` 取自本次请求生成的 plan，不是服务器级默认值）。
-2. 轮询 `GET <endpoint>/get_custom_task_by_id/?task_id=<auto_server_task_id>`，直到
-   `task_data.task_status` 变为 `finished`/`failed`/`skip`，把 `task_data.task_result` 当作 worker
-   自己返回的 `{"ok": ..., "data": {...}}` 结果信封来解析
-3. 把 `task_result.data.deliverables`（`[{"name", "url", "kind"}]`）里的每个 URL 下载到本地
-   deliverables 目录——与本地模式收集产物的方式相同
+1. `POST <endpoint>`，body 为 `{"image", "command", "os": "windows", "activedeadlineseconds",
+   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`。`command` 会克隆
+   `execution.repo_url@repo_ref`、`pip install` 之后运行
+   `python -m ifwi_mcp.worker --plan-b64 <zlib+base64url 编码的 plan> --upload-url <artifactory_repo>/<run_id>`。
+   命令行里不会出现任何凭据。
+2. worker 运行 `executor._execute_local`，把每个产物上传到 `<run_id>/deliverables/<name>`，最后把
+   `{"ok": ..., "data"|"detail": ...}` 结果信封写到 `<run_id>/result.json`——成功、失败、崩溃都会写。
+   失败时仍会上传 stitch 日志，并在 `detail.deliverables` 中给出链接。
+3. 服务器轮询 `GET <endpoint>/<jobid>`，直到 `Data.status` 为 `succeeded`/`failed`，然后读取
+   `result.json`；成功时必须存在已上传的 `stitched_bin`，并把产物下载到本地 deliverables 目录。返回结果包含
+   `job_id`、`artifactory_url`、`result_url`、`stitched_bin_url` 和 `artifacts`（`[{"name", "url", "kind"}]`）。
+   pod 结束却没有 `result.json`（clone/pip 失败）时返回 `REMOTE_EXEC_FAILED`，并附带 `job_id`。
 
-`AUTO_INTEGRATION_SERVICE` 的 `task_dispatcher.json`（位于 `fiv-portal-common-handler` 仓库）把
-`script_name: mcp_stitch` 路由到本仓库根目录下的 `remote_stitch_entry.py`：它会把本仓库克隆到
-worker 上，安装 `requirements.txt`，然后运行 `remote_stitch_entry.py --plan-json '<plan>'`。该入口
-脚本直接复用 `executor._execute_local` 在 worker 上跑 stitch 工具，再用与下载相同的
-`ARTIFACTORY_TOKEN` Bearer 鉴权方式，把产物上传到 Artifactory（`execution.artifactory_repo` /
-`IFWI_MCP_ARTIFACTORY_REPO`，取 worker 自己的配置），最后把结果信封打印到 stdout。发给
-`AUTO_INTEGRATION_SERVICE` 本身的请求不带任何 `Authorization` 头——它不需要。
+pod 从自身环境读取 `ARTIFACTORY_TOKEN`（或 `IFWI_ARTIFACTORY_TOKEN`）；只有当 plan 的来源没有固定为 URL 时，
+才需要 `FIV_TOKEN`（或 `IFWI_FIVPORTAL_TOKEN`）。
 
 ### 工具
 

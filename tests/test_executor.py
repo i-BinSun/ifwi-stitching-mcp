@@ -252,100 +252,142 @@ class _Download:
 @pytest.fixture
 def remote_env(clean_env, write_config, monkeypatch):
     write_config({"execution": {"mode": "remote", "token": "secret",
-                                "endpoint": "https://auto-integration.example.com",
+                                "endpoint": "https://jobs.example.com/v1/fivportal/job",
+                                "artifactory_repo": "https://af.example.com/repo/RemoteStitch/",
                                 "timeout_seconds": 10, "poll_interval_seconds": 1}})
     monkeypatch.setenv("ARTIFACTORY_TOKEN", "af-secret")
-    calls = {"post": [], "get": []}
+    state = {"jobs": [], "status": ["running", "succeeded"], "result": None,
+             "result_status": 200, "result_urls": [], "downloads": []}
+
+    def fake_request(method, url, json=None, headers=None, **kwargs):
+        state["jobs"].append((method, url, json, headers))
+        if method == "POST":
+            return _Resp({"Code": 0, "Message": "CreateSuccess",
+                          "Data": {"jobid": "fivportal-abc", "status": ""}})
+        status = state["status"].pop(0) if len(state["status"]) > 1 else state["status"][0]
+        return _Resp({"Code": 0, "Data": {"jobid": "fivportal-abc", "status": status}})
+
+    def fake_get(url, stream=False, headers=None, **kwargs):
+        if stream:                       # deliverable download
+            state["downloads"].append(url)
+            return _Download()
+        state["result_urls"].append((url, headers))
+        return _Resp(state["result"], status_code=state["result_status"])
+
+    monkeypatch.setattr(executor.requests, "request", fake_request)
+    monkeypatch.setattr(executor.requests, "get", fake_get)
 
     # Virtual clock: sleeping advances time instead of blocking.
     clock = {"now": 0.0}
     monkeypatch.setattr(executor.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(executor.time, "sleep",
                         lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
-    return calls
+    return state
 
 
-def test_execute_remote_submits_polls_and_fetches(remote_env, monkeypatch, tmp_path):
-    task_result = {"ok": True, "data": {
+def _success_result():
+    return {"ok": True, "data": {
         "exit_code": 0, "command_line": "python cli.py ...",
-        "deliverables": [{"url": "https://runner.example.com/f/out.bin",
-                          "name": "out.bin", "kind": "stitched_bin"}],
+        "deliverables": [
+            {"url": "https://af.example.com/repo/RemoteStitch/r/deliverables/out.bin",
+             "name": "out.bin", "kind": "stitched_bin"},
+            {"url": "https://af.example.com/repo/RemoteStitch/r/deliverables/plan-test.log",
+             "name": "plan-test.log", "kind": "log"}],
         "warnings": ["remote warn"]}}
 
-    def fake_post(url, data=None, timeout=None, verify=None, headers=None):
-        remote_env["post"].append((url, data, headers))
-        return _Resp({"result": "SUCCESS", "auto_server_task_id": "t-1"})
 
-    def fake_get(url, stream=False, params=None, **kwargs):
-        if stream:                       # deliverable download, not a status poll
-            return _Download()
-        remote_env["get"].append((url, params))
-        return _Resp({"task_data": {"task_status": "finished", "task_result": task_result}})
-
-    monkeypatch.setattr(executor.requests, "post", fake_post)
-    monkeypatch.setattr(executor.requests, "get", fake_get)
-
+def test_execute_remote_creates_pod_polls_and_reads_result(remote_env, tmp_path):
+    remote_env["result"] = _success_result()
     r = executor.execute(_plan(tmp_path))
-    assert remote_env["post"][0][2]["Authorization"] == "Bearer secret"
-    assert r["ok"] is True
-    assert r["data"]["mode"] == "remote" and r["data"]["task_id"] == "t-1"
-    assert remote_env["post"][0][0] == "https://auto-integration.example.com/start_auto_task/"
-    assert remote_env["post"][0][1]["fiv_project_id"] == "42"
-    assert remote_env["post"][0][1]["script_name"] == "mcp_stitch"
-    import json as _json
-    assert _json.loads(remote_env["post"][0][1]["args"])["plan"]["plan_id"] == "plan-test"
-    assert remote_env["get"][0][0] == "https://auto-integration.example.com/get_custom_task_by_id/"
-    assert remote_env["get"][0][1] == {"task_id": "t-1"}
-    assert r["data"]["command_line"] == "python cli.py ..."
-    assert r["data"]["stitched_bin"].endswith("out.bin")
-    assert r["data"]["deliverables"]["item_count"] == 1
+    assert r["ok"] is True, r
+
+    method, url, payload, headers = remote_env["jobs"][0]
+    assert (method, url) == ("POST", "https://jobs.example.com/v1/fivportal/job")
+    assert headers["Authorization"] == "Bearer secret"
+    assert payload["os"] == "windows" and payload["activedeadlineseconds"] == 10
+    assert payload["image"].startswith("amr-registry.caas.intel.com/")
+    command = payload["command"]
+    assert "git clone" in command and "python -m ifwi_mcp.worker" in command
+    assert "af-secret" not in command          # tokens never travel on the command line
+    encoded = command.split("--plan-b64 ")[1].split()[0]
+    assert plan.decode_plan(encoded)["plan_id"] == "plan-test"
+    run_url = command.split("--upload-url ")[1].split()[0]
+    assert run_url.startswith("https://af.example.com/repo/RemoteStitch/plan-test-")
+
+    assert [j[:2] for j in remote_env["jobs"][1:]] == [
+        ("GET", "https://jobs.example.com/v1/fivportal/job/fivportal-abc")] * 2
+    assert remote_env["result_urls"][0][0] == f"{run_url}/result.json"
+    assert remote_env["result_urls"][0][1]["Authorization"] == "Bearer af-secret"
+
+    data = r["data"]
+    assert data["mode"] == "remote" and data["job_id"] == "fivportal-abc"
+    assert data["artifactory_url"] == run_url
+    assert data["stitched_bin_url"].endswith("/deliverables/out.bin")
+    assert [a["kind"] for a in data["artifacts"]] == ["stitched_bin", "log"]
+    assert data["stitched_bin"].endswith("out.bin")
+    assert data["deliverables"]["item_count"] == 2
+    assert data["warnings"] == ["remote warn"]
 
 
-def test_execute_remote_requires_per_plan_project_id(remote_env, monkeypatch, tmp_path):
-    p = _plan(tmp_path, fiv_project_id=None)
-    monkeypatch.setattr(executor.requests, "post", lambda *a, **kw: pytest.fail("must not submit"))
-    r = executor.execute(p)
-    assert r["error_code"] == ErrorCode.PLAN_INVALID
-    assert r["detail"]["param"] == "fiv_project_id"
-
-
-def test_execute_remote_submits_the_request_project_id(remote_env, monkeypatch, tmp_path):
-    posted = {}
-    def fake_post(url, **kwargs):
-        posted.update(kwargs["data"])
-        return _Resp({"result": "SUCCESS", "auto_server_task_id": "t"})
-    monkeypatch.setattr(executor.requests, "post", fake_post)
-    monkeypatch.setattr(executor.requests, "get", lambda *a, **kw: _Resp({
-        "task_data": {"task_status": "failed", "task_result": {
-            "ok": False, "error_code": "STITCH_RUN_FAILED", "message": "test"}}}))
-    executor.execute(_plan(tmp_path, fiv_project_id="77"))
-    assert posted["fiv_project_id"] == "77"
-
-
-def test_execute_remote_reports_job_failure(remote_env, monkeypatch, tmp_path):
-    monkeypatch.setattr(executor.requests, "post",
-                        lambda *a, **kw: _Resp({"result": "SUCCESS", "auto_server_task_id": "t-2"}))
-    monkeypatch.setattr(executor.requests, "get",
-                        lambda *a, **kw: _Resp({"task_data": {
-                            "task_status": "failed",
-                            "task_result": {"ok": False, "error_code": "STITCH_RUN_FAILED",
-                                            "message": "boom", "detail": {"exit_code": 3}}}}))
+def test_execute_remote_reports_worker_failure_with_log_links(remote_env, tmp_path):
+    remote_env["status"] = ["failed"]
+    remote_env["result"] = {"ok": False, "error_code": "STITCH_RUN_FAILED", "message": "boom",
+                            "detail": {"exit_code": 3, "deliverables": [
+                                {"url": "https://af/x.log", "name": "x.log", "kind": "log"}]}}
     r = executor.execute(_plan(tmp_path))
     assert r["error_code"] == ErrorCode.STITCH_RUN_FAILED
     assert r["detail"]["exit_code"] == 3
+    assert r["detail"]["job_id"] == "fivportal-abc"
+    assert r["detail"]["deliverables"][0]["url"] == "https://af/x.log"
+    assert r["detail"]["result_url"].endswith("/result.json")
+
+
+def test_execute_remote_pod_died_without_result(remote_env, tmp_path):
+    remote_env["status"] = ["failed"]
+    remote_env["result_status"] = 404
+    r = executor.execute(_plan(tmp_path))
+    assert r["error_code"] == ErrorCode.REMOTE_EXEC_FAILED
+    assert r["detail"]["job_status"] == "failed"
+    assert r["detail"]["job_id"] == "fivportal-abc"
+
+
+def test_execute_remote_success_requires_uploaded_stitched_bin(remote_env, tmp_path):
+    remote_env["result"] = {"ok": True, "data": {"deliverables": [
+        {"url": "https://af/x.log", "name": "x.log", "kind": "log"}]}}
+    r = executor.execute(_plan(tmp_path))
+    assert r["error_code"] == ErrorCode.DELIVERABLE_MISSING
+    assert remote_env["downloads"] == []
+
+
+def test_execute_remote_requires_artifactory_repo(remote_env, write_config, tmp_path):
+    write_config({"execution": {"mode": "remote", "endpoint": "https://jobs.example.com/job"}})
+    r = executor.execute(_plan(tmp_path))
+    assert r["detail"]["param"] == "execution.artifactory_repo"
+    assert remote_env["jobs"] == []
+
+
+def test_execute_remote_rejects_unsafe_plan_id(remote_env, tmp_path):
+    r = executor.execute(_plan(tmp_path, plan_id="x; whoami"))
+    assert r["error_code"] == ErrorCode.PLAN_INVALID
+    assert remote_env["jobs"] == []
+
+
+def test_execute_remote_job_api_refuses(remote_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(executor.requests, "request",
+                        lambda *a, **kw: _Resp({"Code": 1, "Message": "CreateFail"}))
+    r = executor.execute(_plan(tmp_path))
+    assert r["error_code"] == ErrorCode.REMOTE_EXEC_FAILED
 
 
 def test_execute_remote_rejects_bad_credentials(remote_env, monkeypatch, tmp_path):
-    monkeypatch.setattr(executor.requests, "post",
+    monkeypatch.setattr(executor.requests, "request",
                         lambda *a, **kw: _Resp({"error": "nope"}, status_code=401))
     assert executor.execute(_plan(tmp_path))["error_code"] == ErrorCode.AUTH_FAILED
 
 
-def test_execute_remote_times_out(remote_env, monkeypatch, tmp_path):
-    monkeypatch.setattr(executor.requests, "post",
-                        lambda *a, **kw: _Resp({"result": "SUCCESS", "auto_server_task_id": "t-3"}))
-    monkeypatch.setattr(executor.requests, "get",
-                        lambda *a, **kw: _Resp({"task_data": {"task_status": "running"}}))
+def test_execute_remote_times_out(remote_env, tmp_path):
+    remote_env["status"] = ["running"]
     r = executor.execute(_plan(tmp_path))
     assert r["error_code"] == ErrorCode.REMOTE_TIMEOUT
     assert r["detail"]["timeout_seconds"] == 10
+    assert r["detail"]["job_id"] == "fivportal-abc"

@@ -129,21 +129,17 @@ def list_local_files() -> dict:
     return ok({"files": files})
 
 
-def upload_file(local_path: str, dest_name: str) -> dict:
-    """Upload remote-stitch deliverables to Artifactory."""
+def upload_file(local_path: str, url: str) -> dict:
+    """PUT a local file to the given Artifactory URL."""
     src = Path(local_path)
     if not src.is_file():
         return err(ErrorCode.INVALID_ARGUMENT, "local_path does not exist",
                    {"param": "local_path", "expected": "existing file"})
 
-    base_result = config.get_artifactory_upload_base()
-    if not base_result["ok"]:
-        return base_result
     token_result = config.get_artifactory_token()
     if not token_result["ok"]:
         return token_result
 
-    url = f"{base_result['data']['base_url']}/{dest_name}"
     headers = {"Authorization": f"Bearer {token_result['data']['token']}"}
     try:
         with src.open("rb") as fh:
@@ -158,4 +154,4 @@ def upload_file(local_path: str, dest_name: str) -> dict:
     if not (200 <= resp.status_code < 300):
         return err(ErrorCode.UPLOAD_FAILED, "upload returned error status",
                    {"url": url, "http_status": resp.status_code, "body": resp.text[:2000]})
-    return ok({"url": url, "name": dest_name})
+    return ok({"url": url})

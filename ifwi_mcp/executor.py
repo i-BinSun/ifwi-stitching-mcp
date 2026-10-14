@@ -3,17 +3,15 @@
 The execution.mode switch in the config file decides where the work happens:
 
 * local  - download/extract everything into the cache, run cli.py in its venv.
-* remote - dispatch the plan to Intel's AUTO_INTEGRATION_SERVICE (the same
-           start_auto_task/get_custom_task_by_id mechanism fiv-portal itself uses for
-           submit_vdc/web_stitch), which clones ifwi-stitching-mcp on a worker per
-           task_dispatcher.json and runs remote_stitch_entry.py -- reusing this exact
-           local-execution codepath there. The worker uploads its deliverables to
-           Artifactory and we fetch them back.
+* remote - create a Windows pod through the FIV Job API (the same API AUTO_INTEGRATION_SERVICE
+           uses, minus its database). The pod clones this repo and runs ifwi_mcp.worker, which
+           reuses this exact local-execution codepath, uploads the deliverables to Artifactory
+           and writes result.json next to them. We poll the Job API until the pod ends, then
+           read result.json and fetch the deliverables back.
 
 Either way the caller gets the same result shape: the exact command line that ran,
 the exit code, and a deliverables manifest.
 """
-import json
 import time
 import uuid
 from pathlib import Path
@@ -23,10 +21,13 @@ import requests
 from . import archive, artifactory, config, deliverables, plan as plan_mod, prepare, stitch_runner
 from .result import ok, err, ErrorCode
 
-_SUBMIT_TIMEOUT = 60
-_POLL_TIMEOUT = 60
-_FINISHED_STATES = ("finished",)
-_FAILED_STATES = ("failed", "skip")
+REMOTE_RESULT_NAME = "result.json"
+REMOTE_DELIVERABLES_DIR = "deliverables"
+_JOB_API_TIMEOUT = 60
+_POD_OS = "windows"
+_POD_TTL_SECONDS = 12 * 3600
+_JOB_SUCCEEDED = ("succeeded", "complete", "completed")
+_JOB_FAILED = ("failed", "error")
 
 
 def _auth_headers() -> dict:
@@ -261,124 +262,162 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
                "warnings": env["data"]["warnings"] + built["data"]["warnings"]})
 
 
-def _submit(endpoint: str, script_name: str, fiv_project_id: str, plan: dict) -> dict:
+def _job_api(method: str, url: str, **kwargs) -> dict:
     try:
-        resp = requests.post(f"{endpoint}/start_auto_task/",
-                             data={"fiv_project_id": fiv_project_id,
-                                   "script_name": script_name,
-                                   "args": json.dumps({"plan": plan})},
-                             headers=_auth_headers(),
-                             timeout=_SUBMIT_TIMEOUT, verify=False)
+        resp = requests.request(method, url, headers=_auth_headers(),
+                                timeout=_JOB_API_TIMEOUT, verify=False, **kwargs)
     except requests.RequestException as exc:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach AUTO_INTEGRATION_SERVICE",
-                   {"endpoint": endpoint, "reason": str(exc)})
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach the Job API",
+                   {"url": url, "reason": str(exc)})
     if resp.status_code in (401, 403):
-        return err(ErrorCode.AUTH_FAILED, "AUTO_INTEGRATION_SERVICE rejected the request",
-                   {"endpoint": endpoint, "status": resp.status_code})
+        return err(ErrorCode.AUTH_FAILED, "Job API rejected the request",
+                   {"url": url, "status": resp.status_code})
     if resp.status_code >= 400:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE refused the task",
-                   {"endpoint": endpoint, "status": resp.status_code,
-                    "body": resp.text[:2000]})
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned an error",
+                   {"url": url, "status": resp.status_code, "body": resp.text[:2000]})
     try:
         body = resp.json()
     except ValueError:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned invalid JSON",
-                   {"endpoint": endpoint, "body": resp.text[:2000]})
-    if str(body.get("result", "")).upper() != "SUCCESS":
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE did not accept the task",
-                   {"endpoint": endpoint, "body": body, "comment": body.get("comment")})
-    task_id = body.get("auto_server_task_id")
-    if not task_id:
-        return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned no auto_server_task_id",
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned invalid JSON",
+                   {"url": url, "body": resp.text[:2000]})
+    if not isinstance(body, dict):
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned an unexpected body",
+                   {"url": url, "body": str(body)[:2000]})
+    return ok(body)
+
+
+def _pod_command(exec_cfg: dict, run_id: str, plan: dict, run_url: str) -> str:
+    """PowerShell for the pod. Every statement stands alone (no cwd, no $vars, no quotes)
+    so it behaves the same whether the Job API runs it via powershell, cmd or argv split."""
+    checkout = f"C:/ifwi-mcp-{run_id}"
+    return (f"powershell -NoProfile -Command "
+            f"git clone --quiet --depth 1 --branch {exec_cfg['repo_ref']} "
+            f"{exec_cfg['repo_url']} {checkout}; "
+            f"python -m pip install --quiet --disable-pip-version-check {checkout}; "
+            f"python -m ifwi_mcp.worker --plan-b64 {plan_mod.encode_plan(plan)} "
+            f"--upload-url {run_url}")
+
+
+def _create_job(endpoint: str, exec_cfg: dict, command: str) -> dict:
+    created = _job_api("POST", endpoint, json={
+        "image": exec_cfg["image"], "command": command, "os": _POD_OS,
+        "activedeadlineseconds": exec_cfg["timeout_seconds"],
+        "ttlsecondsafterfinished": _POD_TTL_SECONDS})
+    if not created["ok"]:
+        return created
+    body = created["data"]
+    job_id = (body.get("Data") or {}).get("jobid")
+    if body.get("Code") != 0 or not job_id:
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API did not create the stitch pod",
                    {"endpoint": endpoint, "body": body})
-    return ok({"task_id": str(task_id), "rancher_log": body.get("rancher_log")})
+    return ok({"job_id": str(job_id)})
 
 
-def _poll(endpoint: str, task_id: str, timeout_seconds: int, poll_interval: int) -> dict:
+def _wait_job(endpoint: str, job_id: str, timeout_seconds: int, poll_interval: int) -> dict:
     deadline = time.monotonic() + timeout_seconds
+    status = ""
     while True:
-        try:
-            resp = requests.get(f"{endpoint}/get_custom_task_by_id/",
-                                params={"task_id": task_id},
-                                headers=_auth_headers(),
-                                timeout=_POLL_TIMEOUT, verify=False)
-        except requests.RequestException as exc:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "lost contact with AUTO_INTEGRATION_SERVICE",
-                       {"endpoint": endpoint, "task_id": task_id, "reason": str(exc)})
-        if resp.status_code in (401, 403):
-            return err(ErrorCode.AUTH_FAILED, "AUTO_INTEGRATION_SERVICE rejected the request",
-                       {"endpoint": endpoint, "status": resp.status_code})
-        if resp.status_code >= 400:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned an error",
-                       {"endpoint": endpoint, "task_id": task_id,
-                        "status": resp.status_code, "body": resp.text[:2000]})
-        try:
-            body = resp.json()
-        except ValueError:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "AUTO_INTEGRATION_SERVICE returned invalid JSON",
-                       {"endpoint": endpoint, "task_id": task_id, "body": resp.text[:2000]})
-        task_data = body.get("task_data") or {}
-        status = str(task_data.get("task_status", "")).lower()
-        if status in _FINISHED_STATES or status in _FAILED_STATES:
-            return ok({"status": status, "task_result": task_data.get("task_result")})
+        polled = _job_api("GET", f"{endpoint}/{job_id}")
+        if not polled["ok"]:
+            return polled
+        # A Code != 0 (e.g. job not visible yet) is treated as still pending.
+        if polled["data"].get("Code") == 0:
+            status = str((polled["data"].get("Data") or {}).get("status") or "").lower()
+            if status in _JOB_SUCCEEDED or status in _JOB_FAILED:
+                return ok({"status": status})
         if time.monotonic() >= deadline:
-            return err(ErrorCode.REMOTE_TIMEOUT, "remote stitch task did not finish in time",
-                       {"task_id": task_id, "status": status,
-                        "timeout_seconds": timeout_seconds})
+            return err(ErrorCode.REMOTE_TIMEOUT, "stitch pod did not finish in time",
+                       {"status": status, "timeout_seconds": timeout_seconds})
         time.sleep(poll_interval)
+
+
+def _read_remote_result(result_url: str, token: str) -> dict:
+    try:
+        resp = requests.get(result_url, headers={"Authorization": f"Bearer {token}"},
+                            timeout=_JOB_API_TIMEOUT, verify=False)
+    except requests.RequestException as exc:
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not read the pod's result.json",
+                   {"result_url": result_url, "reason": str(exc)})
+    if resp.status_code in (401, 403):
+        return err(ErrorCode.AUTH_FAILED, "artifactory rejected credentials",
+                   {"service": "artifactory", "http_status": resp.status_code})
+    if resp.status_code == 404:
+        return err(ErrorCode.REMOTE_EXEC_FAILED,
+                   "stitch pod ended without publishing result.json (clone/pip/startup failure?)",
+                   {"result_url": result_url})
+    if resp.status_code >= 400:
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "could not read the pod's result.json",
+                   {"result_url": result_url, "http_status": resp.status_code})
+    try:
+        result = resp.json()
+    except ValueError:
+        result = None
+    if not isinstance(result, dict) or "ok" not in result:
+        return err(ErrorCode.REMOTE_EXEC_FAILED, "pod result.json is not a result envelope",
+                   {"result_url": result_url, "body": resp.text[:2000]})
+    return ok(result)
 
 
 def _execute_remote(plan: dict, exec_cfg: dict) -> dict:
     plan_id = plan.get("plan_id", "")
     endpoint = exec_cfg["endpoint"]
+    if not plan_id or not plan_mod.PLAN_ID_RE.match(plan_id):
+        return err(ErrorCode.PLAN_INVALID, "plan_id is missing or unsafe",
+                   {"param": "plan_id", "expected": "[A-Za-z0-9_.-]+"})
+    base = config.get_artifactory_upload_base()
+    if not base["ok"]:
+        return base
+    token = config.get_artifactory_token()
+    if not token["ok"]:
+        return token
 
-    fiv_project_id = plan.get("fiv_project_id")
-    if not isinstance(fiv_project_id, str) or not fiv_project_id.strip():
-        return err(ErrorCode.PLAN_INVALID, "remote execution requires a per-plan fiv_project_id",
-                   {"param": "fiv_project_id", "expected": "non-empty FIV project ID"})
+    run_id = f"{plan_id}-{uuid.uuid4().hex[:8]}"
+    run_url = f"{base['data']['base_url']}/{run_id}"
+    result_url = f"{run_url}/{REMOTE_RESULT_NAME}"
+    created = _create_job(endpoint, exec_cfg, _pod_command(exec_cfg, run_id, plan, run_url))
+    if not created["ok"]:
+        return created
+    job_id = created["data"]["job_id"]
+    where = {"job_id": job_id, "endpoint": endpoint, "artifactory_url": run_url}
 
-    submitted = _submit(endpoint, exec_cfg["script_name"], fiv_project_id.strip(), plan)
-    if not submitted["ok"]:
-        return submitted
-    task_id = submitted["data"]["task_id"]
+    waited = _wait_job(endpoint, job_id, exec_cfg["timeout_seconds"],
+                       exec_cfg["poll_interval_seconds"])
+    if not waited["ok"]:
+        waited["detail"].update(where)
+        return waited
 
-    polled = _poll(endpoint, task_id, exec_cfg["timeout_seconds"], exec_cfg["poll_interval_seconds"])
-    if not polled["ok"]:
-        polled["detail"]["endpoint"] = endpoint
-        return polled
+    read = _read_remote_result(result_url, token["data"]["token"])
+    if not read["ok"]:
+        read["detail"].update(where, job_status=waited["data"]["status"])
+        return read
+    result = read["data"]
 
-    raw_result = polled["data"]["task_result"]
-    if isinstance(raw_result, str):
-        try:
-            raw_result = json.loads(raw_result) if raw_result else {}
-        except ValueError:
-            return err(ErrorCode.REMOTE_EXEC_FAILED, "remote stitch task_result is not valid JSON",
-                       {"task_id": task_id, "task_result": raw_result[:2000]})
-    result = raw_result or {}
-
-    if polled["data"]["status"] in _FAILED_STATES or not result.get("ok", False):
-        detail = (result.get("detail") or {}) if isinstance(result, dict) else {}
-        detail.update({"task_id": task_id, "endpoint": endpoint})
-        return err(result.get("error_code", ErrorCode.STITCH_RUN_FAILED),
-                   result.get("message", "remote stitch task failed"), detail)
+    if not result["ok"]:
+        detail = dict(result.get("detail") or {})
+        detail.update(where, result_url=result_url)
+        return err(result.get("error_code") or ErrorCode.STITCH_RUN_FAILED,
+                   result.get("message") or "remote stitch failed", detail)
 
     data = result.get("data") or {}
-    entries = data.get("deliverables") or []
-    if entries:
-        token = config.get_artifactory_token()
-        if not token["ok"]:
-            return token
-        fetched = deliverables.fetch(plan_id, entries, token["data"]["token"])
-    else:
-        fetched = deliverables.collect(plan_id, [])
+    artifacts = data.get("deliverables") or []
+    stitched_url = next((a.get("url") for a in artifacts
+                         if a.get("kind") == "stitched_bin" and a.get("url")), None)
+    if not stitched_url:
+        return err(ErrorCode.DELIVERABLE_MISSING,
+                   "remote stitch reported success without an uploaded stitched binary",
+                   {**where, "result_url": result_url, "artifacts": artifacts})
+
+    fetched = deliverables.fetch(plan_id, artifacts, token["data"]["token"])
     if not fetched["ok"]:
+        fetched["detail"].update(where, artifacts=artifacts)
         return fetched
     stitched = next((item["path"] for item in fetched["data"]["items"]
                      if item["kind"] == "stitched_bin"), None)
     log = next((item["path"] for item in fetched["data"]["items"]
                 if item["kind"] == "log"), None)
-    return ok({"plan_id": plan_id, "mode": "remote", "task_id": task_id,
-               "endpoint": endpoint,
+    return ok({"plan_id": plan_id, "mode": "remote", **where,
+               "result_url": result_url,
+               "stitched_bin_url": stitched_url, "artifacts": artifacts,
                "command_line": data.get("command_line"),
                "exit_code": data.get("exit_code", 0),
                "stitched_bin": stitched, "log_path": log,

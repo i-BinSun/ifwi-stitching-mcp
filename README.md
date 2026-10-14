@@ -132,7 +132,8 @@ IFWI_MCP_SERVE_HOST=127.0.0.1
 IFWI_MCP_SERVE_PORT=8000
 IFWI_MCP_SERVE_TOKEN=<strong-random-token>
 IFWI_MCP_EXEC_MODE=remote
-IFWI_MCP_EXEC_ENDPOINT=https://runner.example.com
+IFWI_MCP_EXEC_ENDPOINT=http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job
+IFWI_MCP_ARTIFACTORY_REPO=https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch
 python -m ifwi_mcp.server
 ```
 
@@ -172,8 +173,9 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
   ifwi-stitching-mcp
 ```
 
-The runtime env file must define `IFWI_MCP_SERVE_TOKEN` (a strong random value) and
-`IFWI_MCP_EXEC_ENDPOINT` (the `AUTO_INTEGRATION_SERVICE` URL), plus `FIV_TOKEN`
+The runtime env file must define `IFWI_MCP_SERVE_TOKEN` (a strong random value),
+`IFWI_MCP_EXEC_ENDPOINT` (the FIV Job API URL) and `IFWI_MCP_ARTIFACTORY_REPO`
+(where stitch pods publish their results), plus `FIV_TOKEN`
 for queries and `ARTIFACTORY_TOKEN` for artifact downloads. The image sets
 `IFWI_MCP_SERVE_MODE=server`, `IFWI_MCP_SERVE_HOST=0.0.0.0`,
 `IFWI_MCP_EXEC_MODE=remote` and `IFWI_MCP_CACHE_DIR=/data/cache`. The named volume
@@ -312,18 +314,16 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 A JSON config file holds the **execution switch** and optional `serve` settings. It lives at `IFWI_MCP_CONFIG`, or next to the cache dir
 (`~/.ifwi-stitching-mcp/config.json`) by default. A missing file means "all defaults", i.e. local execution.
 
-`execution.mode = "remote"` dispatches the plan to Intel's `AUTO_INTEGRATION_SERVICE` — the same
-`start_auto_task`/`get_custom_task_by_id` mechanism fiv-portal itself uses for `submit_vdc`/`web_stitch` —
-which clones this repo on a worker (per `task_dispatcher.json`'s `script_name` entry) and runs
-`remote_stitch_entry.py`, reusing the exact local-execution codepath. See
-[Remote runner contract](#remote-runner-contract) below.
+`execution.mode = "remote"` creates a Windows pod through the FIV Job API (the same API
+`AUTO_INTEGRATION_SERVICE` uses, but without its database). The pod clones this repo and runs
+`python -m ifwi_mcp.worker`, reusing the exact local-execution codepath, and reports back only through
+Artifactory. See [Remote runner contract](#remote-runner-contract) below.
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "https://auto-integration-service.example.intel.com",
-    "script_name": "mcp_stitch",
+    "endpoint": "http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
     "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
@@ -339,18 +339,20 @@ which clones this repo on a worker (per `task_dispatcher.json`'s `script_name` e
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here; `remote` dispatches the plan to `AUTO_INTEGRATION_SERVICE`. |
-| `execution.endpoint` | — | **Required when `mode` is `remote`.** Base URL of `AUTO_INTEGRATION_SERVICE`. |
-| `execution.script_name` | `mcp_stitch` | `task_dispatcher.json` entry to invoke. |
-| `execution.artifactory_repo` | — | Base Artifactory URL the remote worker uploads deliverables under (used by the worker, not this process — set it via the worker's own env/config). |
-| `execution.token` | — | Reserved for future authenticated use; not sent to `AUTO_INTEGRATION_SERVICE` today (it takes none). |
-| `execution.timeout_seconds` | `3600` | Kills a local run / gives up polling a remote task after this long. |
-| `execution.poll_interval_seconds` | `5` | How often a remote task's status is polled. |
+| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here; `remote` runs it in a pod created through the Job API. |
+| `execution.endpoint` | — | **Required when `mode` is `remote`.** Job API URL (`.../v1/fivportal/job`). |
+| `execution.artifactory_repo` | — | **Required when `mode` is `remote`.** Each run publishes under `<artifactory_repo>/<plan_id>-<random>/`. |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod image; must provide `git`, `python` and the Artifactory token env var. |
+| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | Repo the pod clones to get `ifwi_mcp.worker`. |
+| `execution.repo_ref` | `main` | Branch or tag the pod checks out. |
+| `execution.token` | — | Optional Bearer token sent to the Job API (it takes none today). |
+| `execution.timeout_seconds` | `3600` | Kills a local run; for remote it is the pod's `activedeadlineseconds` and the polling limit (covers clone, pip install and stitch). |
+| `execution.poll_interval_seconds` | `5` | How often the pod's job status is polled. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
 | `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
 
-`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_SCRIPT_NAME`,
-`IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS` (comma-separated) override the file. An invalid
+`IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_IMAGE`, `IFWI_MCP_EXEC_REPO`,
+`IFWI_MCP_EXEC_REF`, `IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS` (comma-separated) override the file. An invalid
 execution section fails startup, so a misconfigured remote endpoint is caught before any work is done.
 
 #### Dependency install when the tool ships no `requirements.txt`
@@ -375,8 +377,10 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 |---------|------------|
 | `IFWI_MCP_EXEC_MODE` | `execution.mode` |
 | `IFWI_MCP_EXEC_ENDPOINT` | `execution.endpoint` |
-| `IFWI_MCP_EXEC_SCRIPT_NAME` | `execution.script_name` |
 | `IFWI_MCP_ARTIFACTORY_REPO` | `execution.artifactory_repo` |
+| `IFWI_MCP_EXEC_IMAGE` | `execution.image` |
+| `IFWI_MCP_EXEC_REPO` | `execution.repo_url` |
+| `IFWI_MCP_EXEC_REF` | `execution.repo_ref` |
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
@@ -389,26 +393,26 @@ just the mode.
 
 #### Remote runner contract
 
-When `mode` is `remote`, the server dispatches through Intel's `AUTO_INTEGRATION_SERVICE` — the same
-mechanism fiv-portal itself uses to submit `submit_vdc`/`web_stitch` tasks:
+When `mode` is `remote`, the server talks to the FIV Job API directly — no `AUTO_INTEGRATION_SERVICE`
+task, no database. Artifactory is the only channel back from the pod:
 
-1. `POST <endpoint>/start_auto_task/` (form-encoded): `{"fiv_project_id": ..., "script_name":
-   "mcp_stitch", "args": "{\"plan\": {...}}"}` → `{"result": "SUCCESS", "auto_server_task_id": "..."}`
-  (`fiv_project_id` comes from the submitted plan, not a server-wide default).
-2. polls `GET <endpoint>/get_custom_task_by_id/?task_id=<auto_server_task_id>` until
-   `task_data.task_status` is `finished`/`failed`/`skip`, reading `task_data.task_result` as the
-   worker's own `{"ok": ..., "data": {...}}` result envelope
-3. fetches every URL in `task_result.data.deliverables` (`[{"name", "url", "kind"}]`) into the local
-   deliverables dir, the same way local mode's artifacts are collected
+1. `POST <endpoint>` with `{"image", "command", "os": "windows", "activedeadlineseconds",
+   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`. `command` clones
+   `execution.repo_url@repo_ref`, `pip install`s it and runs
+   `python -m ifwi_mcp.worker --plan-b64 <zlib+base64url plan> --upload-url <artifactory_repo>/<run_id>`.
+   No credential is ever placed on the command line.
+2. The worker runs `executor._execute_local`, uploads every deliverable to
+   `<run_id>/deliverables/<name>` and finally writes its `{"ok": ..., "data"|"detail": ...}` envelope to
+   `<run_id>/result.json` — on success, failure and crash alike. On failure the stitch log is still
+   uploaded and linked from `detail.deliverables`.
+3. The server polls `GET <endpoint>/<jobid>` until `Data.status` is `succeeded`/`failed`, reads
+   `result.json`, requires an uploaded `stitched_bin` on success, and downloads the deliverables into
+   the local deliverables dir. The result carries `job_id`, `artifactory_url`, `result_url`,
+   `stitched_bin_url` and `artifacts` (`[{"name", "url", "kind"}]`). A pod that ends without
+   `result.json` (clone/pip failure) is reported as `REMOTE_EXEC_FAILED` with its `job_id`.
 
-`AUTO_INTEGRATION_SERVICE`'s `task_dispatcher.json` (in the `fiv-portal-common-handler` repo) routes
-`script_name: mcp_stitch` to `remote_stitch_entry.py` at this repo's root: it clones this repo onto the
-worker, installs `requirements.txt`, and runs `remote_stitch_entry.py --plan-json '<plan>'`. That entry
-script reuses `executor._execute_local` unmodified to run the stitch tool on the worker, then uploads the
-resulting deliverables to Artifactory (`execution.artifactory_repo` / `IFWI_MCP_ARTIFACTORY_REPO` on the
-worker's own config, using the same `ARTIFACTORY_TOKEN` Bearer-auth pattern as downloads) before printing
-its result envelope to stdout. No `Authorization` header is sent to `AUTO_INTEGRATION_SERVICE` itself —
-it takes none.
+The pod reads `ARTIFACTORY_TOKEN` (or `IFWI_ARTIFACTORY_TOKEN`) from its own environment, plus
+`FIV_TOKEN` (or `IFWI_FIVPORTAL_TOKEN`) only for plans whose sources are not pinned to URLs.
 
 ### Tools
 

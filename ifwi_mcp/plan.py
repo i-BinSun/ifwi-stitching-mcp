@@ -6,9 +6,11 @@ and the command line that will be run, with placeholders for the paths that only
 exist after the environment is prepared. Plans are JSON, so the very same plan can
 be executed locally or POSTed to a remote runner.
 """
+import base64
 import json
 import re
 import uuid
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -266,6 +268,21 @@ def render_command_line(plan: dict) -> str:
 
 def plan_dir() -> Path:
     return config.cache_subdir("plans")
+
+
+def encode_plan(plan: dict) -> str:
+    """Compress a plan into one shell-safe token ([A-Za-z0-9_-]) for a pod command line."""
+    raw = zlib.compress(json.dumps(plan, separators=(",", ":")).encode("utf-8"))
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_plan(token: str) -> dict:
+    """Inverse of encode_plan; raises ValueError (or zlib.error) on malformed input."""
+    raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    plan = json.loads(zlib.decompress(raw).decode("utf-8"))
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be a JSON object")
+    return plan
 
 
 def save_plan(plan: dict) -> dict:

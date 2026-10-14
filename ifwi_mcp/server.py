@@ -307,8 +307,8 @@ def stitch_build_plan(project: str, phase: str, ingredients: str, config_ini: st
     to the chosen IFWI binary's flavor. It is resolved against the prepared stitch tool's
     config/ dir at run time, so never ask the user for a local filesystem path here.
 
-    When remote execution is configured, supply fiv_project_id for this request; it is
-    forwarded to AUTO_INTEGRATION_SERVICE when executing the saved plan.
+    fiv_project_id is optional and only recorded in the plan; remote execution runs the
+    saved plan in a stitch pod and returns the Artifactory URLs of its deliverables.
     """
     parsed, error = _parse_ingredients(ingredients)
     if error:

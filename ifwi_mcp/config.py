@@ -4,6 +4,7 @@ This is the only module that reads os.environ or the on-disk config file.
 """
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,6 +26,11 @@ _EXEC_MODES = ("local", "remote")
 _SERVE_MODES = ("local", "server")
 _DEFAULT_TIMEOUT = 3600
 _DEFAULT_POLL = 5
+_DEFAULT_POD_IMAGE = "amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6"
+_DEFAULT_WORKER_REPO = "https://github.com/i-BinSun/ifwi-stitching-mcp.git"
+_DEFAULT_WORKER_REF = "main"
+# These values are spliced into the pod's shell command line.
+_SHELL_SAFE_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]+$")
 
 # Parsed config file, keyed by (path, mtime_ns, size) so an edit is picked up at once.
 _config_file_cache: dict = {}
@@ -55,21 +61,23 @@ def cache_subdir(name: str) -> Path:
 
 
 def get_fiv_auth_header() -> dict:
-    value = os.environ.get("FIV_TOKEN")
+    # IFWI_FIVPORTAL_TOKEN is the name stitch pods are provisioned with.
+    value = os.environ.get("FIV_TOKEN") or os.environ.get("IFWI_FIVPORTAL_TOKEN")
     if not value:
         return err(ErrorCode.MISSING_TOKEN, "FIV_TOKEN is not set", {"which": "fiv"})
     return ok({"header_value": f"Bearer {value}"})
 
 
 def get_artifactory_token() -> dict:
-    value = os.environ.get("ARTIFACTORY_TOKEN")
+    # IFWI_ARTIFACTORY_TOKEN is the name stitch pods are provisioned with.
+    value = os.environ.get("ARTIFACTORY_TOKEN") or os.environ.get("IFWI_ARTIFACTORY_TOKEN")
     if not value:
         return err(ErrorCode.MISSING_TOKEN, "ARTIFACTORY_TOKEN is not set", {"which": "artifactory"})
     return ok({"token": value})
 
 
 def get_artifactory_upload_base() -> dict:
-    """Base Artifactory URL that remote-stitch deliverables get PUT under."""
+    """Base Artifactory URL under which each remote stitch pod publishes its run."""
     raw = os.environ.get("IFWI_MCP_ARTIFACTORY_REPO")
     if raw is None:
         loaded = _section("execution")
@@ -80,7 +88,11 @@ def get_artifactory_upload_base() -> dict:
         return err(ErrorCode.CONFIG_INVALID, "execution.artifactory_repo is not set",
                    {"param": "execution.artifactory_repo",
                     "expected": "e.g. https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch"})
-    return ok({"base_url": str(raw).rstrip("/")})
+    base_url = str(raw).strip().rstrip("/")
+    if not _SHELL_SAFE_RE.match(base_url):
+        return err(ErrorCode.CONFIG_INVALID, "execution.artifactory_repo has characters unsafe for the pod command",
+                   {"param": "execution.artifactory_repo", "expected": _SHELL_SAFE_RE.pattern})
+    return ok({"base_url": base_url})
 
 
 def get_config_path() -> Path:
@@ -150,8 +162,15 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _shell_safe(value: str, param: str, path: str):
+    if not _SHELL_SAFE_RE.match(value):
+        return err(ErrorCode.CONFIG_INVALID, "value contains characters unsafe for the pod command",
+                   {"path": path, "param": param, "expected": _SHELL_SAFE_RE.pattern})
+    return value
+
+
 def get_execution_config() -> dict:
-    """Where a stitch job runs: local subprocess or a remote runner endpoint.
+    """Where a stitch job runs: local subprocess or a pod created through the Job API.
 
     Config file (execution section) is the source of truth; the IFWI_MCP_EXEC_*
     env vars override it. The token is never echoed back — only has_token.
@@ -179,7 +198,7 @@ def get_execution_config() -> dict:
         if not endpoint:
             return err(ErrorCode.CONFIG_INVALID, "remote execution requires execution.endpoint",
                        {"path": path, "param": "execution.endpoint",
-                        "expected": "http(s) URL of the stitch runner"})
+                        "expected": "http(s) URL of the Job API"})
         parsed = urlparse(endpoint)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             return err(ErrorCode.CONFIG_INVALID, "execution.endpoint must be a valid http(s) URL",
@@ -194,13 +213,19 @@ def get_execution_config() -> dict:
     if isinstance(poll, dict):
         return poll
 
-    script_name = str(os.environ.get("IFWI_MCP_EXEC_SCRIPT_NAME") or
-                      section.get("script_name") or "mcp_stitch").strip()
+    pod = {}
+    for key, env, default in (("image", "IFWI_MCP_EXEC_IMAGE", _DEFAULT_POD_IMAGE),
+                              ("repo_url", "IFWI_MCP_EXEC_REPO", _DEFAULT_WORKER_REPO),
+                              ("repo_ref", "IFWI_MCP_EXEC_REF", _DEFAULT_WORKER_REF)):
+        value = _shell_safe(str(os.environ.get(env) or section.get(key) or default).strip(),
+                            f"execution.{key}", path)
+        if isinstance(value, dict):
+            return value
+        pod[key] = value
 
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
                "has_token": bool(_token_from(section)),
-               "timeout_seconds": timeout, "poll_interval_seconds": poll,
-               "script_name": script_name})
+               "timeout_seconds": timeout, "poll_interval_seconds": poll, **pod})
 
 
 def _token_from(section: dict) -> str:
