@@ -227,17 +227,21 @@ python -m venv .venv
 `binary_name` 需要替换为实际 release binary 名称；如果省略后收到多个候选，请根据返回值选一个再调用。
 
 可运行的 Python 客户端示例见 [scripts/example_rest.py](scripts/example_rest.py)。先修改脚本顶部的
-`QUERY_PAYLOAD` / `STITCH_PAYLOAD` 为真实 FIV 项目 ID、版本、binary 及 ingredient，然后在项目根目录运行：
+`QUERY_PAYLOAD` / `STITCH_PAYLOAD` 为真实 FIV 项目 ID、版本、binary 及 ingredient，然后在脚本所在电脑运行：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\example_rest.py query
-.\.venv\Scripts\python.exe scripts\example_rest.py stitching
-.\.venv\Scripts\python.exe scripts\example_rest.py stitching --confirm-stitch
+python scripts\example_rest.py query
+python scripts\example_rest.py stitching
 ```
 
-示例会从 `deploy.env`、`.env`（或 `IFWI_MCP_SERVER_TOKEN` 环境变量）读取 Bearer 令牌。查询命令请求
-`POST /query`；拼接命令请求 `POST /stitching`。
-不加 `--confirm-stitch` 时只预览计划及命令模板，不提交任务；加上后才提交并轮询。
+客户端脚本只依赖 Python 和 `requests`，可单独复制到其他电脑使用（安装依赖：`pip install requests`）。
+先在**客户端进程的环境变量**中设置 `IFWI_MCP_BASE_URL`（REST 服务根地址，不带 `/mcp`，
+例如 `http://fivdevops.ccr.corp.intel.com:8767`）和 `IFWI_MCP_SERVER_TOKEN`（服务端共享的 Bearer 令牌），
+再运行上面的命令。脚本**不会读取**仓库中的 `.env` 或 `deploy.env`；不要把令牌硬编码进脚本或提交到 Git。
+如果客户端在内网访问时遇到代理拦截，请在客户端环境中为该域名配置 `NO_PROXY`。
+查询命令请求
+`POST /query`；`stitching` 命令会**直接提交实际拼接任务**并轮询结果，不会先预览。
+如需预览，可单独调用上述 REST 接口并传入 `"dry_run": true`，预览不会执行拼接。
 
 工具中的本地路径指服务器文件系统，不是客户端文件系统；现有计划和产物缓存也未实现用户隔离。
 在增加按用户授权、路径限制、存储隔离和安全上传之前，不应作为多租户服务开放。
