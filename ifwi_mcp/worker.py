@@ -18,17 +18,6 @@ from . import artifactory, config, executor, plan as plan_mod
 from .result import ok, err, ErrorCode
 
 
-def _publish(items: list, upload_url: str) -> dict:
-    uploaded = []
-    for item in items:
-        dest = f"{upload_url}/{executor.REMOTE_DELIVERABLES_DIR}/{item['name']}"
-        res = artifactory.upload_file(item["path"], dest)
-        if not res["ok"]:
-            return res
-        uploaded.append({"url": res["data"]["url"], "name": item["name"], "kind": item["kind"]})
-    return ok({"items": uploaded})
-
-
 def run(plan: dict, upload_url: str) -> dict:
     exec_cfg = config.get_execution_config()
     if not exec_cfg["ok"]:
@@ -38,12 +27,12 @@ def run(plan: dict, upload_url: str) -> dict:
         # Publish whatever was kept (usually the stitch log) so the failure is debuggable.
         items = ((result["detail"].get("deliverables") or {}).get("items")) or []
         if items:
-            published = _publish(items, upload_url)
+            published = executor.publish_deliverables(items, upload_url)
             if published["ok"]:
                 result["detail"]["deliverables"] = published["data"]["items"]
         return result
 
-    published = _publish(result["data"]["deliverables"]["items"], upload_url)
+    published = executor.publish_deliverables(result["data"]["deliverables"]["items"], upload_url)
     if not published["ok"]:
         return published
     data = dict(result["data"])

@@ -114,10 +114,10 @@ Windows 上。
 
 ### 共享服务器部署
 
-`IFWI_MCP_SERVE_MODE` 控制客户端如何连接 MCP，与拼接任务在哪里执行无关。默认 `local` 保持原有的
+`IFWI_MCP_SERVER_MODE` 控制客户端如何连接 MCP，与拼接任务在哪里执行无关。默认 `local` 保持原有的
 stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务。可在服务器的环境中设置
-`IFWI_MCP_SERVE_MODE=server`、`IFWI_MCP_SERVE_HOST=127.0.0.1`、`IFWI_MCP_SERVE_PORT=8000`、
-`IFWI_MCP_SERVE_TOKEN=<高强度随机令牌>`，并配置 `IFWI_MCP_EXEC_MODE=remote`、
+`IFWI_MCP_SERVER_MODE=server`、`IFWI_MCP_SERVER_HOST=127.0.0.1`、`IFWI_MCP_SERVER_PORT=8000`、
+`IFWI_MCP_SERVER_TOKEN=<高强度随机令牌>`，并配置 `IFWI_MCP_EXEC_MODE=remote`、
 `IFWI_MCP_EXEC_ENDPOINT=<Job API 地址>`、`IFWI_MCP_ARTIFACTORY_REPO=<pod 发布结果的 Artifactory 目录>`，
 然后运行 `python -m ifwi_mcp.server`。令牌必填，
 客户端需发送 Bearer 认证；对外访问建议使用 TLS 反向代理，默认仅监听服务器本机回环地址。
@@ -149,10 +149,10 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
   ifwi-stitching-mcp
 ```
 
-环境文件需包含 `IFWI_MCP_SERVE_TOKEN`（高强度随机令牌）、
+环境文件需包含 `IFWI_MCP_SERVER_TOKEN`（高强度随机令牌）、
 `IFWI_MCP_EXEC_ENDPOINT`（FIV Job API 地址）、`IFWI_MCP_ARTIFACTORY_REPO`（pod 发布结果的位置）；查询需要 `FIV_TOKEN`，
-下载产物需要 `ARTIFACTORY_TOKEN`。镜像已设置 `IFWI_MCP_SERVE_MODE=server`、
-`IFWI_MCP_SERVE_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
+下载产物需要 `ARTIFACTORY_TOKEN`。镜像已设置 `IFWI_MCP_SERVER_MODE=server`、
+`IFWI_MCP_SERVER_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
 `IFWI_MCP_CACHE_DIR=/data/cache`。数据卷保存计划、缓存和产物；异步任务状态仍在内存中，
 重启后丢失，因此轮询时应运行单个服务进程。`fiv_project_id` 由每次拼接请求携带。
 
@@ -160,16 +160,50 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 需有意识地调整宿主机监听地址并限制防火墙访问。MCP 工具能访问容器内的文件路径，
 不要挂载敏感宿主目录，也不要把令牌交给不可信用户。
 
-`IFWI_MCP_EXEC_MODE` 是另一项独立配置：stdio 本地部署允许本地或远程执行；
-**`SERVE_MODE=server` 必须配置 `EXEC_MODE=remote`**，以及执行端点
-`IFWI_MCP_EXEC_ENDPOINT`，否则启动失败。FIV 项目 ID 由每次拼接请求提供，不在服务端写死。
+#### Windows 单机部署（本机执行）
+
+没有 pod runner 时，可由一台 Windows 主机同时提供 HTTP 服务并在本机执行拼接。把配置写入仓库旁的
+`.env`（不要提交），然后启动：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+# .env：
+#   IFWI_MCP_SERVER_MODE=server
+#   IFWI_MCP_SERVER_HOST=127.0.0.1
+#   IFWI_MCP_SERVER_TOKEN=<高强度随机令牌>
+#   IFWI_MCP_EXEC_MODE=local
+#   IFWI_MCP_ARTIFACTORY_REPO=https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch
+#   IFWI_MCP_CACHE_DIR=D:\ifwi-cache
+#   FIV_TOKEN=...
+#   ARTIFACTORY_TOKEN=...
+.\.venv\Scripts\python.exe -m ifwi_mcp.server
+```
+
+- **结果只返回链接。** 未设置 `IFWI_MCP_ARTIFACTORY_REPO` 时启动失败。每次运行把产物上传到
+  `<repo>/<run_id>/deliverables/`，只返回 `plan_id`、`run_id`、`artifactory_url`、`stitched_bin`（`url`、`sha256`、`bytes`）、
+  `log_url` 和 `warnings`，不返回服务器本地路径；命令行、来源 URL 和完整产物列表写入 `<artifactory_url>/run.json` 供调试。
+  失败时返回已上传日志的链接。上传成功后删除本地产物副本，上传失败则保留。
+- **任务物理隔离，不限制并发数。** 每个异步任务一个独立线程；每次运行有独立的 `work/<run_id>/` 目录：
+  `tool/`（stitch 工具完整副本，含 venv）、`inputs/`（IFWI 与 ingredient 副本）、`tmp/`（独立 `TEMP`）和
+  `<run_id>.log`。只有下载/解压缓存是共享的，且运行从不在其中执行。每次复制都会占用磁盘空间和时间。
+- **调试保留期。** `IFWI_MCP_RUN_RETENTION_HOURS`（默认 `0`）表示任务结束后保留运行目录的小时数，
+  而不是上传后立即删除；过期目录在后续任务结束时清理，从不清理运行中的任务。每个保留的运行可能占用数百 MB。
+- **路径尽量短。** 工具文件在 `<cache>/work/<run_id>/tool/...` 下运行（缓存根目录后约 50 个字符）；请使用较短的 `IFWI_MCP_CACHE_DIR` 或开启 Windows 长路径支持。
+- server 模式下低层 MCP 工具 `run_stitch` 仍被禁用，请使用 `stitch_execute_plan` 或 `POST /stitching`。
+- 保持回环地址监听，通过 HTTPS 反向代理对外提供服务。只运行一个服务进程；任务状态保存在内存中，
+  重启会丢失仍在运行的任务状态。
+
+`IFWI_MCP_EXEC_MODE` 与 serve 模式相互独立：stdio 与 server 模式都支持本地或远程执行。
+远程执行需要 `IFWI_MCP_EXEC_ENDPOINT`；server 模式下本地执行需要 `IFWI_MCP_ARTIFACTORY_REPO`，
+否则启动失败。FIV 项目 ID 由每次拼接请求提供，不在服务端写死。
 原有 `/mcp` 接口仍可使用，此外还提供独立的 REST JSON 接口（都使用服务端 Bearer 令牌认证）：
 
 - `POST /query`：必填 `fiv_project_id`、`phase` 和含一或两个版本号的 `versions`。一个版本返回 `data.release.ingredients`；两个不同版本只返回变更的 `data.differences`（每项为 `name`、`from_version`、`to_version`；某版本不存在的 ingredient 为 `null`）。
-- `POST /stitching`：必填 `fiv_project_id`（FIV 项目 ID）、`phase`、`version` 以及非空的 `ingredients` 名称到版本映射。服务端只查 FIV 元数据，获取 IFWI、ingredient 和 stitch 工具的下载链接并保存命令模板；实际提交时，同一份含链接的 plan 传给远程 runner，由 worker 下载、解压、确认配置并执行。不需要客户端提供 `config_ini`、`stitch_version` 或 `soft_strap`。
-- 拼接请求可设置 `"dry_run":true`：直接返回 HTTP 200，包含 `source_urls`、`command_template`（含 worker 执行时才确定的路径占位符）和推断的 `config_ini`，不下载文件、不提交远程拼接任务。`config_ini` 只是根据 binary 名称推断的提示，最终由 worker 解压后验证或选取唯一配置。预览仍会请求 FIV 元数据；即使传了 `"async":true`，预览也直接返回最终结果，不产生 `job_id`。
+- `POST /stitching`：必填 `fiv_project_id`（FIV 项目 ID）、`phase`、`version` 以及非空的 `ingredients` 名称到版本映射。服务端只查 FIV 元数据，获取 IFWI、ingredient 和 stitch 工具的下载链接并保存命令模板；实际提交时，按 `IFWI_MCP_EXEC_MODE` 在本机隔离目录或远程 runner 中执行同一份含链接的 plan，执行时才下载、解压、确认配置并拼接，结果返回产物的 Artifactory 链接。不需要客户端提供 `config_ini`、`stitch_version` 或 `soft_strap`。
+- 拼接请求可设置 `"dry_run":true`：直接返回 HTTP 200，包含 `source_urls`、`command_template`（含执行时才确定的路径占位符）和推断的 `config_ini`，不下载文件、不执行拼接。`config_ini` 只是根据 binary 名称推断的提示，最终在执行时解压工具后验证或选取唯一配置。预览仍会请求 FIV 元数据；即使传了 `"async":true`，预览也直接返回最终结果，不产生 `job_id`。
 - 两个接口均可选传 `swimlane`、`binary_name`。多 swimlane/binary 时返回候选列表，须指定后重试；无法唯一匹配多个 stitch 配置时返回 HTTP 409 和配置候选，不自动猜测。
-- 查询和实际拼接默认同步；`"async":true` 时立即返回 HTTP 202、`job_id` 和 `status_url`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed` 以及完整结果。拼接 `dry_run` 始终同步直接返回。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启后不可查询。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
+- 查询和实际拼接默认同步；`"async":true` 时立即返回 HTTP 202、`job_id`、`status_url` 和 `instance_id`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed`、`instance_id` 以及完整结果。拼接 `dry_run` 始终同步直接返回。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启或轮询到另一服务进程后返回 HTTP 404 / `JOB_NOT_FOUND`，其 `detail.instance_id` 可与提交时的实例 ID 对比。已有计划和保留的运行目录不能恢复 job ID。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
 
 示例请求体（每个示例是一次独立请求）：
 
@@ -201,7 +235,7 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 .\.venv\Scripts\python.exe scripts\example_rest.py stitching --confirm-stitch
 ```
 
-示例会从 `deploy.env`（或 `IFWI_MCP_SERVE_TOKEN` 环境变量）读取 Bearer 令牌。查询命令请求
+示例会从 `deploy.env`、`.env`（或 `IFWI_MCP_SERVER_TOKEN` 环境变量）读取 Bearer 令牌。查询命令请求
 `POST /query`；拼接命令请求 `POST /stitching`。
 不加 `--confirm-stitch` 时只预览计划及命令模板，不提交任务；加上后才提交并轮询。
 
@@ -296,15 +330,16 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 
 | 键 | 默认值 | 用途 |
 |----|--------|------|
-| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令；`remote` 通过 Job API 创建 pod 执行。 |
+| `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令，每次运行使用独立的工具与输入副本；`remote` 通过 Job API 创建 pod 执行。 |
 | `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，Job API 地址（`.../v1/fivportal/job`）。 |
-| `execution.artifactory_repo` | — | **`mode` 为 `remote` 时必填**。每次运行发布到 `<artifactory_repo>/<plan_id>-<随机串>/`。 |
+| `execution.artifactory_repo` | — | **`mode` 为 `remote`，或 server 模式下为 `local` 时必填**。每次运行发布到 `<artifactory_repo>/<plan_id>-<随机串>/`。 |
 | `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod 镜像，需要有 `git`、`python` 以及 Artifactory token 环境变量。 |
 | `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | pod 克隆以获取 `ifwi_mcp.worker` 的仓库。 |
 | `execution.repo_ref` | `main` | pod 检出的分支或 tag。 |
 | `execution.token` | — | 可选，发给 Job API 的 Bearer 令牌（目前它不需要）。 |
 | `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程时作为 pod 的 `activedeadlineseconds` 和轮询上限（含 clone、pip 安装和拼接）。 |
 | `execution.poll_interval_seconds` | `5` | pod 任务状态的轮询间隔。 |
+| `execution.run_retention_hours` | `0` | server 模式本地执行时，任务结束后保留 `work/<run_id>/` 的小时数；`0` 表示上传后立即删除。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
@@ -341,6 +376,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
+| `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive`（`0`/`false`/`no`/`off` 表示关闭） |
 | `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps`（逗号分隔） |
 | `IFWI_MCP_CONFIG` | 配置文件本身的路径 |

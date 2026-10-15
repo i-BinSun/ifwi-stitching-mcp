@@ -22,6 +22,7 @@ from . import archive, cache, config, lock
 from .result import ok, err, ErrorCode
 
 _SOFT_STRAP_RE = re.compile(r"^(\w+:\w+=[^,\s]+)([ ,]\w+:\w+=[^,\s]+)*$")
+_RUN_KEY_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$")
 _run_counter = [0]
 _WORKSPACE_SKIP_NAMES = {"stitching", "output"}
 
@@ -391,24 +392,11 @@ def extract_stitch_tool(archive_path: str) -> dict:
                    {"tool_root": str(tool_root), "reason": str(exc)})
 
 
-def _link_entry(src: Path, dst: Path) -> None:
-    """Materialize dst as a same-name mirror of src: a junction/symlink for a
-    directory (no admin privilege needed for a Windows junction), a hardlink for a
-    file (falling back to a copy if hardlinking isn't possible, e.g. cross-volume)."""
+def _copy_entry(src: Path, dst: Path) -> None:
     if src.is_dir():
-        if sys.platform.startswith("win"):
-            proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)],
-                                  capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace")
-            if proc.returncode != 0:
-                raise OSError(f"mklink /J failed: {(proc.stdout + proc.stderr).strip()}")
-        else:
-            dst.symlink_to(src, target_is_directory=True)
+        shutil.copytree(src, dst, symlinks=True)
     else:
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copy2(src, dst)
+        shutil.copy2(src, dst)
 
 
 def _unlink_entry(path: Path) -> None:
@@ -433,27 +421,36 @@ def _remove_workspace(root: Path) -> None:
         pass
 
 
-def materialize_workspace(tool_root: Path, key: str) -> dict:
-    """A private, per-`key` working copy of a shared stitch-tool install.
+def run_dir(key: str) -> Path:
+    """Private directory of one run: tool copy, inputs, temp files and log."""
+    if not _RUN_KEY_RE.match(key):
+        key = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
+    return config.cache_subdir("work") / key
 
-    Every top-level entry of tool_root is linked (not copied) into the new
-    workspace, except any mutable output directories the vendor tool itself
-    creates and wipes on every run (Stitching/, Output/, output/) -- those are
-    left absent so each caller gets its own, and the vendor tool's cleanup never
-    touches another run's files.
+
+def discard_run(key: str) -> None:
+    _remove_workspace(run_dir(key))
+
+
+def materialize_workspace(tool_root: Path, key: str) -> dict:
+    """A private, per-`key` physical copy of a shared stitch-tool install.
+
+    Every top-level entry of tool_root (venv included) is copied into the new
+    workspace, so concurrent runs share no files at all. Mutable output
+    directories the vendor tool creates and wipes on every run (Stitching/,
+    Output/, output/) are left out so each run starts with fresh ones.
 
     The workspace is rebuilt every time: reusing one would leave the previous
     run's outputs lying around to be mistaken for this run's.
     """
-    digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
-    workspace_root = config.cache_subdir("work") / digest / tool_root.name
+    workspace_root = run_dir(key) / "tool"
     _remove_workspace(workspace_root)
     try:
         workspace_root.mkdir(parents=True, exist_ok=True)
         for entry in tool_root.iterdir():
             if entry.name.lower() in _WORKSPACE_SKIP_NAMES:
                 continue
-            _link_entry(entry, workspace_root / entry.name)
+            _copy_entry(entry, workspace_root / entry.name)
     except OSError as exc:
         _remove_workspace(workspace_root)
         return err(ErrorCode.WORKSPACE_SETUP_FAILED, "could not materialize isolated workspace",
@@ -552,7 +549,7 @@ def build_stitch_command(stitch_dir: str, binary_file: Optional[str], ingredient
                "warnings": warnings})
 
 
-def _augmented_env(cwd: Path) -> dict:
+def _augmented_env(cwd: Path, temp_dir: Optional[Path] = None) -> dict:
     """Some stitch tools shell out to bundled EDK2 BaseTools (GenFw, GenFfs, ...) by
     bare name, expecting them on PATH. Prepend any Tools/ dir found next to cwd or
     its parent so those resolve, without touching the caller's real PATH."""
@@ -560,21 +557,33 @@ def _augmented_env(cwd: Path) -> dict:
     extra = [p for p in (cwd / "Tools", cwd.parent / "Tools") if p.is_dir()]
     if extra:
         env["PATH"] = os.pathsep.join(str(p) for p in extra) + os.pathsep + env.get("PATH", "")
+    if temp_dir is not None:
+        for name in ("TEMP", "TMP", "TMPDIR"):
+            env[name] = str(temp_dir)
     return env
 
 
 def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
-                    timeout: Optional[int] = None) -> dict:
-    """Run a prepared stitch command, capture its log, and locate the output deliverables."""
+                    timeout: Optional[int] = None, run_root: Optional[str] = None) -> dict:
+    """Run a prepared stitch command, capture its log, and locate the output deliverables.
+
+    With run_root, the log and the tool's temp files stay inside that run's directory.
+    """
     sdir = Path(cwd)
+    log_dir = Path(run_root) if run_root else config.cache_subdir("work")
+    temp_dir = None
+    if run_root:
+        temp_dir = Path(run_root) / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
     if log_name:
-        log_path = config.cache_subdir("work") / f"{log_name}.log"
+        log_path = log_dir / f"{log_name}.log"
     else:
         _run_counter[0] += 1
-        log_path = config.cache_subdir("work") / f"stitch_{_run_counter[0]}.log"
+        log_path = log_dir / f"stitch_{_run_counter[0]}.log"
     try:
         proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                              encoding="utf-8", errors="replace", env=_augmented_env(sdir))
+                              encoding="utf-8", errors="replace",
+                              env=_augmented_env(sdir, temp_dir))
     except subprocess.TimeoutExpired:
         return err(ErrorCode.STITCH_RUN_FAILED, "stitch command timed out",
                    {"command_line": _quote_argv(argv), "timeout_seconds": timeout})

@@ -18,6 +18,8 @@ _JOBS = {}
 _LOCK = threading.Lock()
 _TTL = 3600
 _MAX_JOBS = 256
+# New on every process start; helps distinguish a restarted server from a lost job.
+_INSTANCE_ID = uuid.uuid4().hex
 
 
 def _status(result: dict) -> int:
@@ -79,13 +81,16 @@ async def _post(request, operation, *, direct_dry_run=False):
             job_id = uuid.uuid4().hex
             _JOBS[job_id] = {"state": "running", "result": None, "updated": now}
         try:
-            _POOL.submit(_complete, job_id, operation, payload)
+            # One thread per job: long stitches must never queue behind each other.
+            threading.Thread(target=_complete, args=(job_id, operation, payload),
+                             name=f"ifwi-job-{job_id[:8]}", daemon=True).start()
         except RuntimeError:
             with _LOCK:
                 del _JOBS[job_id]
             return JSONResponse(err(ErrorCode.INTERNAL_ERROR, "job queue is unavailable"), status_code=503)
         return JSONResponse({"ok": True, "data": {"job_id": job_id, "state": "running",
-                                                   "status_url": f"/jobs/{job_id}"}}, status_code=202)
+                               "status_url": f"/jobs/{job_id}",
+                               "instance_id": _INSTANCE_ID}}, status_code=202)
     result = await asyncio.get_running_loop().run_in_executor(_POOL, _run, operation, payload)
     return _response(result)
 
@@ -109,9 +114,12 @@ async def job_status(request):
             job = None
         snapshot = dict(job) if job else None
     if snapshot is None:
-        return JSONResponse(err(ErrorCode.PLAN_NOT_FOUND, "job not found"), status_code=404)
+        return JSONResponse(err(ErrorCode.JOB_NOT_FOUND,
+                                "job not found; job status is process-local and is lost after a server restart or when requests reach another instance",
+                                {"instance_id": _INSTANCE_ID}), status_code=404)
     return JSONResponse({"ok": True, "data": {"job_id": job_id, "state": snapshot["state"],
-                                              "result": snapshot["result"]}})
+                                              "result": snapshot["result"],
+                                              "instance_id": _INSTANCE_ID}})
 
 
 def create_app(mcp):

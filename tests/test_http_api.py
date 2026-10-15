@@ -5,7 +5,7 @@ from ifwi_mcp.result import ErrorCode, err, ok
 
 
 def test_authenticated_query_and_async_stitching(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
     monkeypatch.setattr(interfaces, "query", lambda payload: ok({"versions": payload["versions"]}))
     monkeypatch.setattr(interfaces, "stitching", lambda payload: ok({"plan_id": "p"}))
     from ifwi_mcp.server import mcp
@@ -15,21 +15,27 @@ def test_authenticated_query_and_async_stitching(clean_env, monkeypatch):
         assert client.post("/query", json={"versions": ["v1"]}, headers=headers).json()["data"] == {"versions": ["v1"]}
         response = client.post("/stitching", json={"async": True}, headers=headers)
         assert response.status_code == 202
-        status_url = response.json()["data"]["status_url"]
+        submitted = response.json()["data"]
+        status_url = submitted["status_url"]
+        assert submitted["instance_id"]
         assert client.get(status_url).status_code == 401
         import time
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             status = client.get(status_url, headers=headers).json()["data"]
+            assert status["instance_id"] == submitted["instance_id"]
             if status["state"] != "running":
                 break
         assert status["state"] == "succeeded"
         assert status["result"]["data"]["plan_id"] == "p"
-        assert client.get("/jobs/unknown", headers=headers).status_code == 404
+        missing = client.get("/jobs/unknown", headers=headers)
+        assert missing.status_code == 404
+        assert missing.json()["error_code"] == ErrorCode.JOB_NOT_FOUND
+        assert missing.json()["detail"]["instance_id"] == submitted["instance_id"]
 
 
 def test_query_async_and_stitching_sync_errors(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
     monkeypatch.setattr(interfaces, "query", lambda payload: ok({"count": 1}))
     monkeypatch.setattr(interfaces, "stitching", lambda payload: err(
         ErrorCode.IFWI_BINARY_AMBIGUOUS, "select binary", {"candidates": ["a", "b"]}))
@@ -44,7 +50,7 @@ def test_query_async_and_stitching_sync_errors(clean_env, monkeypatch):
 
 
 def test_stitching_dry_run_http_contract(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
     monkeypatch.setattr(interfaces, "stitching", lambda payload: ok({
         "dry_run": True, "command_template": "{python} {entry_script}"}))
     from ifwi_mcp.server import mcp

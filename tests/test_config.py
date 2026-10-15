@@ -168,6 +168,18 @@ def test_execution_fully_configurable_without_a_config_file(clean_env, monkeypat
     assert result["data"]["has_token"] is True
 
 
+def test_run_retention_defaults_to_zero_and_accepts_overrides(clean_env, write_config,
+                                                               monkeypatch):
+    assert config.get_execution_config()["data"]["run_retention_hours"] == 0
+    write_config({"execution": {"run_retention_hours": 48}})
+    assert config.get_execution_config()["data"]["run_retention_hours"] == 48
+    monkeypatch.setenv("IFWI_MCP_RUN_RETENTION_HOURS", "0")
+    assert config.get_execution_config()["data"]["run_retention_hours"] == 0
+    monkeypatch.setenv("IFWI_MCP_RUN_RETENTION_HOURS", "-1")
+    result = config.get_execution_config()
+    assert result["detail"]["param"] == "execution.run_retention_hours"
+
+
 def test_execution_rejects_non_numeric_timeout_env(clean_env, monkeypatch):
     monkeypatch.setenv("IFWI_MCP_EXEC_TIMEOUT", "soon")
     result = config.get_execution_config()
@@ -204,43 +216,50 @@ def test_serve_server_from_config_file(clean_env, write_config):
 def test_serve_env_overrides_file_and_does_not_change_execution(clean_env, write_config,
                                                                   monkeypatch):
     write_config({"serve": {"mode": "local", "port": 9000, "token": "file-token"}})
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "server")
-    monkeypatch.setenv("IFWI_MCP_SERVE_HOST", "127.0.0.1")
-    monkeypatch.setenv("IFWI_MCP_SERVE_PORT", "8123")
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "env-token")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_HOST", "127.0.0.1")
+    monkeypatch.setenv("IFWI_MCP_SERVER_PORT", "8123")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "env-token")
     assert config.get_serve_config()["data"]["port"] == 8123
     assert config.get_serve_token() == "env-token"
-    assert config.get_execution_config()["detail"]["param"] == "execution.mode"
+    assert config.get_execution_config()["data"]["mode"] == "local"
 
 
 def test_serve_server_requires_token(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
     assert config.get_serve_config()["detail"]["param"] == "serve.token"
     assert config.validate_startup()["error_code"] == ErrorCode.CONFIG_INVALID
 
 
-def test_server_mode_rejects_local_execution_even_when_token_present(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "server")
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "secret")
+def test_server_mode_local_execution_requires_artifactory_repo(clean_env, monkeypatch):
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
     result = config.validate_startup()
     assert result["error_code"] == ErrorCode.CONFIG_INVALID
-    assert result["detail"]["param"] == "execution.mode"
-    assert config.get_execution_config()["ok"] is False
+    assert result["detail"]["param"] == "execution.artifactory_repo"
+    assert config.get_execution_config()["data"]["mode"] == "local"
+
+
+def test_server_mode_accepts_local_execution_with_artifactory_repo(clean_env, monkeypatch):
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_ARTIFACTORY_REPO", "https://af.example.com/repo/Stitch")
+    assert config.validate_startup()["ok"] is True
 
 
 def test_server_mode_accepts_remote_execution(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "server")
-    monkeypatch.setenv("IFWI_MCP_SERVE_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
     monkeypatch.setenv("IFWI_MCP_EXEC_MODE", "remote")
     monkeypatch.setenv("IFWI_MCP_EXEC_ENDPOINT", "https://runner.example.com")
     assert config.validate_startup()["ok"] is True
 
 
 def test_serve_rejects_unknown_mode_and_invalid_port(clean_env, monkeypatch):
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "remote")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "remote")
     assert config.get_serve_config()["detail"]["param"] == "serve.mode"
-    monkeypatch.setenv("IFWI_MCP_SERVE_MODE", "local")
-    monkeypatch.setenv("IFWI_MCP_SERVE_PORT", "65536")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "local")
+    monkeypatch.setenv("IFWI_MCP_SERVER_PORT", "65536")
     assert config.get_serve_config()["detail"]["param"] == "serve.port"
 
 

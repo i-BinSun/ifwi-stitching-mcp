@@ -140,17 +140,19 @@ def _section(name: str) -> dict:
     return ok({"section": raw, "path": loaded["data"]["path"]})
 
 
-def _positive_int(value, default: int, param: str, path: str):
+def _positive_int(value, default: int, param: str, path: str, minimum: int = 1):
+    expected = "positive integer" if minimum == 1 else f"integer >= {minimum}"
     if value is None or value == "":
         return default
     try:
         number = int(value)
     except (TypeError, ValueError):
         return err(ErrorCode.CONFIG_INVALID, "value must be an integer",
-                   {"path": path, "param": param, "expected": "positive integer"})
-    if number <= 0:
-        return err(ErrorCode.CONFIG_INVALID, "value must be positive",
-                   {"path": path, "param": param, "expected": "positive integer"})
+                   {"path": path, "param": param, "expected": expected})
+    if number < minimum:
+        return err(ErrorCode.CONFIG_INVALID, "value must be positive" if minimum == 1
+                   else f"value must be at least {minimum}",
+                   {"path": path, "param": param, "expected": expected})
     return number
 
 
@@ -189,9 +191,6 @@ def get_execution_config() -> dict:
     serving = get_serve_config()
     if not serving["ok"]:
         return serving
-    if serving["data"]["mode"] == "server" and mode != "remote":
-        return err(ErrorCode.CONFIG_INVALID, "server mode requires remote execution",
-                   {"path": path, "param": "execution.mode", "expected": "remote", "got": mode})
 
     endpoint = str(os.environ.get("IFWI_MCP_EXEC_ENDPOINT") or section.get("endpoint") or "").rstrip("/")
     if mode == "remote":
@@ -212,6 +211,12 @@ def get_execution_config() -> dict:
                          _DEFAULT_POLL, "execution.poll_interval_seconds", path)
     if isinstance(poll, dict):
         return poll
+    # 0 deletes a server-mode run directory right after its upload.
+    retention = _positive_int(os.environ.get("IFWI_MCP_RUN_RETENTION_HOURS")
+                              or section.get("run_retention_hours"),
+                              0, "execution.run_retention_hours", path, minimum=0)
+    if isinstance(retention, dict):
+        return retention
 
     pod = {}
     for key, env, default in (("image", "IFWI_MCP_EXEC_IMAGE", _DEFAULT_POD_IMAGE),
@@ -225,7 +230,8 @@ def get_execution_config() -> dict:
 
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
                "has_token": bool(_token_from(section)),
-               "timeout_seconds": timeout, "poll_interval_seconds": poll, **pod})
+               "timeout_seconds": timeout, "poll_interval_seconds": poll,
+               "run_retention_hours": retention, **pod})
 
 
 def _token_from(section: dict) -> str:
@@ -249,31 +255,31 @@ def get_serve_config() -> dict:
     if not loaded["ok"]:
         return loaded
     section, path = loaded["data"]["section"], loaded["data"]["path"]
-    mode = str(os.environ.get("IFWI_MCP_SERVE_MODE") or section.get("mode") or "local").strip().lower()
+    mode = str(os.environ.get("IFWI_MCP_SERVER_MODE") or section.get("mode") or "local").strip().lower()
     if mode not in _SERVE_MODES:
         return err(ErrorCode.CONFIG_INVALID, "serve.mode must be 'local' or 'server'",
                    {"path": path, "param": "serve.mode", "expected": list(_SERVE_MODES), "got": mode})
-    host = str(os.environ.get("IFWI_MCP_SERVE_HOST") or section.get("host") or "127.0.0.1").strip()
+    host = str(os.environ.get("IFWI_MCP_SERVER_HOST") or section.get("host") or "127.0.0.1").strip()
     if not host:
         return err(ErrorCode.CONFIG_INVALID, "serve.host cannot be empty",
                    {"path": path, "param": "serve.host"})
-    port = _positive_int(os.environ.get("IFWI_MCP_SERVE_PORT") or section.get("port"),
+    port = _positive_int(os.environ.get("IFWI_MCP_SERVER_PORT") or section.get("port"),
                          8000, "serve.port", path)
     if isinstance(port, dict):
         return port
     if port > 65535:
         return err(ErrorCode.CONFIG_INVALID, "serve.port must be at most 65535",
                    {"path": path, "param": "serve.port"})
-    token = os.environ.get("IFWI_MCP_SERVE_TOKEN") or str(section.get("token") or "")
+    token = os.environ.get("IFWI_MCP_SERVER_TOKEN") or str(section.get("token") or "")
     if mode == "server" and not token:
         return err(ErrorCode.CONFIG_INVALID, "server mode requires a bearer token",
-                   {"path": path, "param": "serve.token", "env": "IFWI_MCP_SERVE_TOKEN"})
+                   {"path": path, "param": "serve.token", "env": "IFWI_MCP_SERVER_TOKEN"})
     return ok({"mode": mode, "host": host, "port": port, "has_token": bool(token)})
 
 
 def get_serve_token() -> str:
     """Server-mode bearer token; never include it in the public configuration result."""
-    env = os.environ.get("IFWI_MCP_SERVE_TOKEN")
+    env = os.environ.get("IFWI_MCP_SERVER_TOKEN")
     if env:
         return env
     loaded = _section("serve")
@@ -336,4 +342,9 @@ def validate_startup() -> dict:
     serving = get_serve_config()
     if not serving["ok"]:
         return serving
+    if serving["data"]["mode"] == "server" and execution["data"]["mode"] == "local":
+        # Server-mode clients only get Artifactory links, never server-local paths.
+        upload = get_artifactory_upload_base()
+        if not upload["ok"]:
+            return upload
     return ok({})

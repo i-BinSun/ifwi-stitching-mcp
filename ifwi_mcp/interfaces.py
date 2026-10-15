@@ -62,7 +62,7 @@ def query(payload: dict) -> dict:
 
 
 def stitching(payload: dict) -> dict:
-    """Resolve a release and plan it; execute remotely unless dry_run is true."""
+    """Resolve a release and plan it; execute it unless dry_run is true."""
     bad = _common(payload)
     if bad:
         return bad
@@ -119,7 +119,7 @@ def stitching(payload: dict) -> dict:
         ingredient_urls.append(found["data"]["ingredient_url"])
 
     # Config names inside the archive are unknown without downloading it. This
-    # conventional name is only a template hint; the worker checks the actual
+    # conventional name is only a template hint; execution checks the actual
     # extracted targets before invoking the vendor tool.
     config_ini = f"Config_Stitch_{binary}"
     urls = {"ifwi": ifwi_url, "stitch_tool": tool["data"]["stitch_url"],
@@ -139,10 +139,10 @@ def stitching(payload: dict) -> dict:
                    "phase": payload["phase"], "version": payload["version"],
                    "swimlane": lane, "binary_name": binary,
                    "config_ini": config_ini, "ingredients": ingredients,
-                   "config_status": "worker will validate config from the extracted stitch tool",
+                   "config_status": "validated against the extracted stitch tool during execution",
                    "source_urls": urls,
                    "command_template": built["data"]["command_line"],
                    "warnings": built["data"].get("warnings", []),
-                   "note": "Preview only: FIV URLs resolved and plan saved; no files downloaded or remote job submitted. "
-                       "The worker validates config and resolves command paths during execution."})
+                   "note": "Preview only: FIV URLs resolved and plan saved; nothing downloaded or executed. "
+                       "Execution validates the config and resolves command paths."})
     return executor.execute(built["data"]["plan"])

@@ -122,15 +122,15 @@ that a config written inside WSL needs the Linux path even when VS Code itself i
 
 ### Serving from a shared host
 
-`IFWI_MCP_SERVE_MODE` controls **how clients connect** to this MCP server; it does not
+`IFWI_MCP_SERVER_MODE` controls **how clients connect** to this MCP server; it does not
 control where stitching runs. The default `local` keeps the existing stdio behavior.
 Set it to `server` to listen for authenticated Streamable HTTP requests at `/mcp`:
 
 ```bash
-IFWI_MCP_SERVE_MODE=server
-IFWI_MCP_SERVE_HOST=127.0.0.1
-IFWI_MCP_SERVE_PORT=8000
-IFWI_MCP_SERVE_TOKEN=<strong-random-token>
+IFWI_MCP_SERVER_MODE=server
+IFWI_MCP_SERVER_HOST=127.0.0.1
+IFWI_MCP_SERVER_PORT=8000
+IFWI_MCP_SERVER_TOKEN=<strong-random-token>
 IFWI_MCP_EXEC_MODE=remote
 IFWI_MCP_EXEC_ENDPOINT=http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job
 IFWI_MCP_ARTIFACTORY_REPO=https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch
@@ -173,11 +173,11 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
   ifwi-stitching-mcp
 ```
 
-The runtime env file must define `IFWI_MCP_SERVE_TOKEN` (a strong random value),
+The runtime env file must define `IFWI_MCP_SERVER_TOKEN` (a strong random value),
 `IFWI_MCP_EXEC_ENDPOINT` (the FIV Job API URL) and `IFWI_MCP_ARTIFACTORY_REPO`
 (where stitch pods publish their results), plus `FIV_TOKEN`
 for queries and `ARTIFACTORY_TOKEN` for artifact downloads. The image sets
-`IFWI_MCP_SERVE_MODE=server`, `IFWI_MCP_SERVE_HOST=0.0.0.0`,
+`IFWI_MCP_SERVER_MODE=server`, `IFWI_MCP_SERVER_HOST=0.0.0.0`,
 `IFWI_MCP_EXEC_MODE=remote` and `IFWI_MCP_CACHE_DIR=/data/cache`. The named volume
 persists plans, cached files and deliverables; asynchronous job *status* is still
 in-memory and lost on restart. Run a single server process for reliable polling.
@@ -189,9 +189,50 @@ host-side bind and restrict access with a firewall. The container is not a trust
 multi-tenant sandbox: MCP tools can read or write paths on the container filesystem,
 so only grant tokens to trusted callers and do not mount sensitive host directories.
 
-`IFWI_MCP_EXEC_MODE` is separate: local serving (stdio) supports either local or
-remote execution. **Server mode requires `IFWI_MCP_EXEC_MODE=remote`**, plus
-`IFWI_MCP_EXEC_ENDPOINT`; startup fails otherwise. The FIV project ID is supplied
+#### Windows standalone deployment (local execution)
+
+Without a pod runner, a Windows host can serve HTTP **and** run the stitches itself.
+Put the settings in a `.env` next to the checkout (never commit it) and start the server:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+# .env:
+#   IFWI_MCP_SERVER_MODE=server
+#   IFWI_MCP_SERVER_HOST=127.0.0.1
+#   IFWI_MCP_SERVER_TOKEN=<strong-random-token>
+#   IFWI_MCP_EXEC_MODE=local
+#   IFWI_MCP_ARTIFACTORY_REPO=https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch
+#   IFWI_MCP_CACHE_DIR=D:\ifwi-cache
+#   FIV_TOKEN=...
+#   ARTIFACTORY_TOKEN=...
+.\.venv\Scripts\python.exe -m ifwi_mcp.server
+```
+
+- **Results are links.** Startup fails without `IFWI_MCP_ARTIFACTORY_REPO`. Each run uploads its
+  deliverables to `<repo>/<run_id>/deliverables/` and returns only `plan_id`, `run_id`,
+  `artifactory_url`, `stitched_bin` (`url`, `sha256`, `bytes`), `log_url` and `warnings`, never
+  server paths. The command line, source URLs and full artifact list go to
+  `<artifactory_url>/run.json` for debugging. Failures return the uploaded log link.
+  Local deliverable copies are deleted after a successful upload and kept if an upload fails.
+- **Runs are physically isolated, with no concurrency limit.** Every asynchronous job gets its own
+  thread, and every run its own `work/<run_id>/` directory: `tool/` (a full copy of the stitch tool,
+  venv included), `inputs/` (copies of the IFWI and ingredients), `tmp/` (its private `TEMP`) and
+  `<run_id>.log`. Only the download/extraction cache is shared, and runs never execute inside it.
+  Each copy costs disk space and time.
+- **Debug retention.** `IFWI_MCP_RUN_RETENTION_HOURS` (default `0`) keeps each finished run
+  directory for that many hours instead of deleting it right after upload; older ones are pruned
+  when a later run finishes, never while a run is in flight. Each kept run can take hundreds of MB.
+- **Keep paths short.** Tool files run from `<cache>/work/<run_id>/tool/...` (about 50 characters
+  after the cache root); use a short `IFWI_MCP_CACHE_DIR` or enable Windows long paths.
+- The low-level `run_stitch` MCP tool stays disabled in server mode; use `stitch_execute_plan` or
+  `POST /stitching`.
+- Keep the loopback bind and publish through an HTTPS reverse proxy. Run one server process; job
+  status is in memory, so a restart loses the status of jobs that were still running.
+
+`IFWI_MCP_EXEC_MODE` is separate from the serve mode. Both stdio and server mode support
+local or remote execution; remote needs `IFWI_MCP_EXEC_ENDPOINT`, and server mode with local
+execution needs `IFWI_MCP_ARTIFACTORY_REPO`. Startup fails otherwise. The FIV project ID is supplied
 with each stitch request rather than hard-coded in the server configuration.
 The existing authenticated MCP endpoint `/mcp` remains available. The same server also
 exposes independent authenticated REST JSON interfaces:
@@ -202,20 +243,21 @@ exposes independent authenticated REST JSON interfaces:
   `{name, from_version, to_version}` (a missing ingredient is `null`).
 - `POST /stitching`: specify `fiv_project_id`, `phase`, `version`, and a non-empty
   `ingredients` name-to-version map. The server resolves FIV metadata into pinned
-  IFWI, ingredient and stitch-tool URLs, saves a plan and submits that same plan to
-  the **remote** runner. Only the worker downloads, extracts, validates the tool's
-  config and runs the stitch. The result includes `plan_id` and deliverables.
+  IFWI, ingredient and stitch-tool URLs, saves a plan and executes that same plan
+  wherever `IFWI_MCP_EXEC_MODE` points. Downloading, extraction, config validation
+  and the stitch itself happen only during execution. The result includes `plan_id`
+  and Artifactory links to the deliverables.
 - Set `"dry_run": true` on `/stitching` to preview `source_urls`, the inferred
   `config_ini` and placeholder-based `command_template` without downloading or
-  submitting a remote stitch. The config hint cannot be verified until the worker
-  extracts the tool. FIV metadata is still queried. The preview returns its final
+  executing anything. The config hint cannot be verified until execution extracts
+  the tool. FIV metadata is still queried. The preview returns its final
   result directly with HTTP 200, even if `"async": true` was provided; it does not
   create a job.
 - Both operations accept optional `swimlane` and `binary_name`. When several
   swimlanes or binaries match, choose one from the returned candidates. For
   stitching, multiple stitch configs without a unique match also return HTTP 409
   with config candidates; no config is guessed.
-- Query and real stitching default to synchronous JSON results. Set `"async": true` to get HTTP 202 with `data.job_id` and `data.status_url`; `GET /jobs/{job_id}` returns `data.state` (`running`, `succeeded`, `failed`) and the complete unified `data.result` when done. Stitching dry runs always return directly. Jobs are process-local, limited to 256 and retained for one hour after completion; a process restart loses job status. Failed operations still return their detailed error under `data.result`.
+- Query and real stitching default to synchronous JSON results. Set `"async": true` to get HTTP 202 with `data.job_id`, `data.status_url`, and `data.instance_id`; `GET /jobs/{job_id}` returns `data.state` (`running`, `succeeded`, `failed`), `data.instance_id`, and the complete unified `data.result` when done. Stitching dry runs always return directly. Jobs are process-local, limited to 256 and retained for one hour after completion; a process restart or polling another instance loses job status (`JOB_NOT_FOUND`, HTTP 404, with the current `detail.instance_id` to compare against the submitted instance). Saved plans and run directories do not restore job IDs. Failed operations still return their detailed error under `data.result`.
 
 Example JSON bodies (one request per example; omit optional fields when not needed):
 
@@ -237,7 +279,7 @@ Submit an asynchronous stitch (`POST /stitching`):
 `binary_name` must be a real release binary name;
 if omitted and several are available, retry with a name from the returned candidates.
 
-All REST calls require `Authorization: Bearer <IFWI_MCP_SERVE_TOKEN>`. Request errors
+All REST calls require `Authorization: Bearer <IFWI_MCP_SERVER_TOKEN>`. Request errors
 use the same `ok`/`error_code`/`message`/`detail` envelope as MCP tools; invalid input
 returns HTTP 400, ambiguous binary/swimlane HTTP 409, unauthorized HTTP 401.
 File paths passed to tools refer to the **server** filesystem, not the client's.
@@ -339,15 +381,16 @@ Artifactory. See [Remote runner contract](#remote-runner-contract) below.
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here; `remote` runs it in a pod created through the Job API. |
+| `execution.mode` | `local` | `local` runs the stitch command as a subprocess here, in a private per-run copy of the tool and inputs; `remote` runs it in a pod created through the Job API. |
 | `execution.endpoint` | — | **Required when `mode` is `remote`.** Job API URL (`.../v1/fivportal/job`). |
-| `execution.artifactory_repo` | — | **Required when `mode` is `remote`.** Each run publishes under `<artifactory_repo>/<plan_id>-<random>/`. |
+| `execution.artifactory_repo` | — | **Required when `mode` is `remote`, or `local` in server mode.** Each run publishes under `<artifactory_repo>/<plan_id>-<random>/`. |
 | `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod image; must provide `git`, `python` and the Artifactory token env var. |
 | `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | Repo the pod clones to get `ifwi_mcp.worker`. |
 | `execution.repo_ref` | `main` | Branch or tag the pod checks out. |
 | `execution.token` | — | Optional Bearer token sent to the Job API (it takes none today). |
 | `execution.timeout_seconds` | `3600` | Kills a local run; for remote it is the pod's `activedeadlineseconds` and the polling limit (covers clone, pip install and stitch). |
 | `execution.poll_interval_seconds` | `5` | How often the pod's job status is polled. |
+| `execution.run_retention_hours` | `0` | Server mode with local execution: hours to keep each finished `work/<run_id>/` for debugging; `0` deletes it right after upload. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
 | `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
 
@@ -384,6 +427,7 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
+| `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive` (`0`/`false`/`no`/`off` → off) |
 | `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps` (comma-separated) |
 | `IFWI_MCP_CONFIG` | path of the config file itself |

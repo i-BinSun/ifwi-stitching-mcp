@@ -1,8 +1,8 @@
 """Reclaim space from the on-disk cache.
 
-Nothing here ever descends through a symlink/junction: the per-run workspaces under
-work/ are link farms pointing back at the shared stitch tool, and following one would
-delete the tool itself.
+Nothing here ever descends through a symlink/junction: copied run directories under
+work/ can contain links (e.g. a venv interpreter), and older workspaces were link farms
+pointing back at the shared stitch tool; following one would delete its target.
 """
 import os
 import stat as stat_mod

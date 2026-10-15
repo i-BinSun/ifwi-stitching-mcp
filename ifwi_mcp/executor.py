@@ -2,7 +2,9 @@
 
 The execution.mode switch in the config file decides where the work happens:
 
-* local  - download/extract everything into the cache, run cli.py in its venv.
+* local  - download/extract everything into the cache, then run cli.py in a private
+           per-run directory holding its own copy of the tool, venv and inputs. In
+           server mode the deliverables are uploaded to Artifactory and returned as links.
 * remote - create a Windows pod through the FIV Job API (the same API AUTO_INTEGRATION_SERVICE
            uses, minus its database). The pod clones this repo and runs ifwi_mcp.worker, which
            reuses this exact local-execution codepath, uploads the deliverables to Artifactory
@@ -12,9 +14,14 @@ The execution.mode switch in the config file decides where the work happens:
 Either way the caller gets the same result shape: the exact command line that ran,
 the exit code, and a deliverables manifest.
 """
+import json
+import re
+import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -23,11 +30,14 @@ from .result import ok, err, ErrorCode
 
 REMOTE_RESULT_NAME = "result.json"
 REMOTE_DELIVERABLES_DIR = "deliverables"
+RUN_INFO_NAME = "run.json"
 _JOB_API_TIMEOUT = 60
 _POD_OS = "windows"
 _POD_TTL_SECONDS = 12 * 3600
 _JOB_SUCCEEDED = ("succeeded", "complete", "completed")
 _JOB_FAILED = ("failed", "error")
+_ACTIVE_RUNS = set()
+_ACTIVE_LOCK = threading.Lock()
 
 
 def _auth_headers() -> dict:
@@ -165,6 +175,11 @@ def execute(plan: dict) -> dict:
         return cfg
     if cfg["data"]["mode"] == "remote":
         return _execute_remote(plan, cfg["data"])
+    serving = config.get_serve_config()
+    if not serving["ok"]:
+        return serving
+    if serving["data"]["mode"] == "server":
+        return _execute_local_published(plan, cfg["data"])
     return _execute_local(plan, cfg["data"])
 
 
@@ -175,7 +190,7 @@ def execute_plan_id(plan_id: str) -> dict:
     return execute(loaded["data"]["plan"])
 
 
-def _collect_local(plan_id: str, stitched_bin: str, log_path: str, output_dir: str) -> dict:
+def _collect_local(key: str, stitched_bin: str, log_path: str, output_dir: str) -> dict:
     entries = [{"path": stitched_bin, "kind": "stitched_bin", "required": True},
                {"path": log_path, "kind": "log", "required": False}]
     out = Path(output_dir)
@@ -183,11 +198,11 @@ def _collect_local(plan_id: str, stitched_bin: str, log_path: str, output_dir: s
         for extra in sorted(out.iterdir()):
             if extra.is_file() and str(extra) != stitched_bin:
                 entries.append({"path": str(extra), "kind": "output", "required": False})
-    return deliverables.collect(plan_id, entries)
+    return deliverables.collect(key, entries)
 
 
 def _isolated_stitch_dir(env_data: dict, key: str) -> dict:
-    """Materialize a private workspace for this run and re-root stitch_dir onto it,
+    """Copy the tool into this run's private directory and re-root stitch_dir onto it,
     so concurrent runs sharing the same underlying tool never collide."""
     tool_root = Path(env_data["tool_root"])
     stitch_dir = Path(env_data["stitch_dir"])
@@ -202,8 +217,37 @@ def _isolated_stitch_dir(env_data: dict, key: str) -> dict:
     return ok({"stitch_dir": str(workspace_root / rel), "workspace_dir": str(workspace_root)})
 
 
-def _execute_local(plan: dict, exec_cfg: dict) -> dict:
+def _isolated_inputs(env_data: dict, inputs_dir: Path) -> dict:
+    """Private copies of the IFWI binary and ingredients, so no run reads or writes
+    files another run can touch."""
+    binary_file = env_data["binary_file"]
+    ingredients = []
+    try:
+        if binary_file:
+            target = inputs_dir / "ifwi" / Path(binary_file).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            binary_file = str(shutil.copy2(binary_file, target))
+        for index, item in enumerate(env_data["ingredients"]):
+            src = Path(item["path"])
+            label = re.sub(r"[^A-Za-z0-9_.-]", "_", item["name"])
+            target = inputs_dir / "ingredients" / f"{index}_{label}"
+            if src.is_dir():
+                shutil.copytree(src, target, symlinks=True)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                target = Path(shutil.copy2(src, target / src.name))
+            ingredients.append({"name": item["name"], "path": str(target)})
+    except OSError as exc:
+        return err(ErrorCode.WORKSPACE_SETUP_FAILED, "could not copy stitch inputs into the run directory",
+                   {"inputs_dir": str(inputs_dir), "reason": str(exc)})
+    return ok({"binary_file": binary_file, "ingredients": ingredients})
+
+
+def _execute_local(plan: dict, exec_cfg: dict, run_id: str = "") -> dict:
     plan_id = plan.get("plan_id", "")
+    # A caller-owned run_id also keys the deliverables, so each run's files stay separate.
+    deliverables_key = run_id or plan_id
+    run_id = run_id or f"{plan_id or 'run'}-{uuid.uuid4().hex[:8]}"
     env = prepare_environment(plan)
     if not env["ok"]:
         return env
@@ -222,34 +266,40 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
             return err(ErrorCode.CONFIG_AMBIGUOUS, "cannot select config for binary on worker",
                        {"binary_name": binary, "candidates": targets})
 
-    isolated = _isolated_stitch_dir(env["data"], plan_id or uuid.uuid4().hex)
+    isolated = _isolated_stitch_dir(env["data"], run_id)
     if not isolated["ok"]:
         return isolated
+    run_root = stitch_runner.run_dir(run_id)
+    inputs = _isolated_inputs(env["data"], run_root / "inputs")
+    if not inputs["ok"]:
+        return inputs
 
     built = stitch_runner.build_stitch_command(
-        isolated["data"]["stitch_dir"], env["data"]["binary_file"],
-        env["data"]["ingredients"],
+        isolated["data"]["stitch_dir"], inputs["data"]["binary_file"],
+        inputs["data"]["ingredients"],
         config_ini, stitch.get("soft_strap"))
     if not built["ok"]:
         return built
 
     run = stitch_runner.execute_command(built["data"]["argv"], built["data"]["cwd"],
-                                        log_name=plan_id or None,
-                                        timeout=exec_cfg["timeout_seconds"])
+                                        log_name=run_id,
+                                        timeout=exec_cfg["timeout_seconds"],
+                                        run_root=str(run_root))
     if not run["ok"]:
         log = run["detail"].get("full_log_path")
-        if plan_id and log:
+        if deliverables_key and log:
             collected = deliverables.collect(
-                plan_id, [{"path": log, "kind": "log", "required": False}])
+                deliverables_key, [{"path": log, "kind": "log", "required": False}])
             if collected["ok"]:
                 run["detail"]["deliverables"] = collected["data"]
         return run
 
-    collected = _collect_local(plan_id, run["data"]["stitched_bin"],
+    collected = _collect_local(deliverables_key, run["data"]["stitched_bin"],
                                run["data"]["log_path"], run["data"]["output_dir"])
     if not collected["ok"]:
         return collected
     return ok({"plan_id": plan_id, "mode": "local",
+               "run_id": run_id,
                "command_line": run["data"]["command_line"],
                "exit_code": run["data"]["exit_code"],
                "stitched_bin": run["data"]["stitched_bin"],
@@ -262,6 +312,100 @@ def _execute_local(plan: dict, exec_cfg: dict) -> dict:
                "warnings": env["data"]["warnings"] + built["data"]["warnings"]})
 
 
+def publish_deliverables(items: list, upload_url: str) -> dict:
+    """Upload collected deliverables to <upload_url>/deliverables/ and return their links."""
+    uploaded = []
+    for item in items:
+        dest = f"{upload_url}/{REMOTE_DELIVERABLES_DIR}/{quote(item['name'])}"
+        res = artifactory.upload_file(item["path"], dest)
+        if not res["ok"]:
+            return res
+        uploaded.append({"url": res["data"]["url"], "name": item["name"], "kind": item["kind"],
+                         **{key: item[key] for key in ("bytes", "sha256") if key in item}})
+    return ok({"items": uploaded})
+
+
+def _finish_local_run(run_id: str, retention_hours: int) -> None:
+    """Drop the run's local deliverable copies (they are on Artifactory), then either
+    delete its run directory or keep it and prune runs older than the retention."""
+    shutil.rmtree(deliverables.deliverables_dir(run_id), ignore_errors=True)
+    if not retention_hours:
+        stitch_runner.discard_run(run_id)
+        return
+    cutoff = time.time() - retention_hours * 3600
+    with _ACTIVE_LOCK:
+        active = set(_ACTIVE_RUNS)
+    for entry in config.cache_subdir("work").iterdir():
+        try:
+            expired = entry.is_dir() and entry.stat().st_mtime < cutoff
+        except OSError:
+            continue
+        if expired and entry.name not in active:
+            stitch_runner.discard_run(entry.name)
+
+
+def _execute_local_published(plan: dict, exec_cfg: dict) -> dict:
+    """Server mode: run locally in an isolated run directory, then hand back only
+    Artifactory links. Local copies are removed once everything is uploaded, except
+    that the run directory is kept for execution.run_retention_hours."""
+    plan_id = plan.get("plan_id", "")
+    if not plan_id or not plan_mod.PLAN_ID_RE.match(plan_id):
+        return err(ErrorCode.PLAN_INVALID, "plan_id is missing or unsafe",
+                   {"param": "plan_id", "expected": "[A-Za-z0-9_.-]+"})
+    base = config.get_artifactory_upload_base()
+    if not base["ok"]:
+        return base
+    run_id = f"{plan_id}-{uuid.uuid4().hex[:8]}"
+    run_url = f"{base['data']['base_url']}/{run_id}"
+    where = {"run_id": run_id, "artifactory_url": run_url}
+    retention = exec_cfg.get("run_retention_hours", 0)
+
+    with _ACTIVE_LOCK:
+        _ACTIVE_RUNS.add(run_id)
+    try:
+        result = _execute_local(plan, exec_cfg, run_id=run_id)
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_RUNS.discard(run_id)
+    if not result["ok"]:
+        detail = dict(result["detail"])
+        items = (detail.pop("deliverables", None) or {}).get("items") or []
+        published = publish_deliverables(items, run_url) if items else ok({"items": []})
+        if published["ok"]:
+            detail.pop("full_log_path", None)
+            detail["artifacts"] = published["data"]["items"]
+            _finish_local_run(run_id, retention)
+        else:
+            detail["upload_error"] = published["message"]
+        detail.update(where)
+        return err(result["error_code"], result["message"], detail)
+
+    data = result["data"]
+    published = publish_deliverables(data["deliverables"]["items"], run_url)
+    if not published["ok"]:
+        published["detail"].update(where)
+        return published
+    artifacts = published["data"]["items"]
+    stitched = next(a for a in artifacts if a["kind"] == "stitched_bin")
+
+    run_info = stitch_runner.run_dir(run_id) / RUN_INFO_NAME
+    run_info.parent.mkdir(parents=True, exist_ok=True)
+    run_info.write_text(json.dumps({
+        "plan_id": plan_id, "run_id": run_id, "command_line": data["command_line"],
+        "exit_code": data["exit_code"], "fetched": data["environment"]["fetched"],
+        "artifacts": artifacts, "warnings": data["warnings"]}, indent=2), encoding="utf-8")
+    uploaded = artifactory.upload_file(str(run_info), f"{run_url}/{RUN_INFO_NAME}")
+    if not uploaded["ok"]:
+        uploaded["detail"].update(where)
+        return uploaded
+
+    _finish_local_run(run_id, retention)
+    return ok({"plan_id": plan_id, **where,
+               "stitched_bin": {key: stitched.get(key) for key in ("url", "sha256", "bytes")},
+               "log_url": next((a["url"] for a in artifacts if a["kind"] == "log"), None),
+               "warnings": data["warnings"]})
+
+
 def _job_api(method: str, url: str, **kwargs) -> dict:
     try:
         resp = requests.request(method, url, headers=_auth_headers(),
@@ -269,15 +413,22 @@ def _job_api(method: str, url: str, **kwargs) -> dict:
     except requests.RequestException as exc:
         return err(ErrorCode.REMOTE_EXEC_FAILED, "could not reach the Job API",
                    {"url": url, "reason": str(exc)})
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and str(body.get("Message", "")).lower() == "unauthorized":
+        return err(ErrorCode.AUTH_FAILED, "Job API rejected this caller",
+                   {"url": url, "status": resp.status_code,
+                    "job_api_code": body.get("Code"),
+                    "has_exec_token": bool(config.get_execution_token())})
     if resp.status_code in (401, 403):
         return err(ErrorCode.AUTH_FAILED, "Job API rejected the request",
                    {"url": url, "status": resp.status_code})
     if resp.status_code >= 400:
         return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned an error",
                    {"url": url, "status": resp.status_code, "body": resp.text[:2000]})
-    try:
-        body = resp.json()
-    except ValueError:
+    if body is None:
         return err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned invalid JSON",
                    {"url": url, "body": resp.text[:2000]})
     if not isinstance(body, dict):

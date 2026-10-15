@@ -1,7 +1,10 @@
 # tests/test_executor.py
+import json
+from pathlib import Path
+
 import pytest
 
-from ifwi_mcp import executor, plan
+from ifwi_mcp import deliverables, executor, plan, stitch_runner
 from ifwi_mcp.result import ok, err, ErrorCode
 
 
@@ -175,8 +178,9 @@ def run_fakes(monkeypatch, tmp_path):
                    "ingredient_args": [i["path"] for i in ingredients],
                    "warnings": ["ing warn"]})
 
-    def fake_execute(argv, cwd, log_name=None, timeout=None):
+    def fake_execute(argv, cwd, log_name=None, timeout=None, run_root=None):
         state["argv"], state["timeout"], state["log_name"] = argv, timeout, log_name
+        state["run_root"] = run_root
         if state["fail"]:
             return err(ErrorCode.STITCH_RUN_FAILED, "boom",
                        {"exit_code": 2, "full_log_path": str(log), "log_tail": "bad"})
@@ -200,7 +204,116 @@ def test_execute_local_returns_command_and_deliverables(clean_env, env_fakes,
     assert kinds == ["log", "output", "stitched_bin"]
     assert r["data"]["deliverables"]["archive"].endswith("plan-test.zip")
     assert "ing warn" in r["data"]["warnings"] and "tool warn" in r["data"]["warnings"]
-    assert run_fakes["log_name"] == "plan-test"
+    assert run_fakes["log_name"] == r["data"]["run_id"]
+    assert r["data"]["run_id"].startswith("plan-test-")
+    assert run_fakes["run_root"] == str(stitch_runner.run_dir(r["data"]["run_id"]))
+
+
+def test_execute_local_runs_on_private_copies(clean_env, env_fakes, run_fakes,
+                                              monkeypatch, tmp_path):
+    seen = []
+    fake_build = executor.stitch_runner.build_stitch_command
+
+    def build(stitch_dir, binary_file, ingredients, config_ini, soft_strap=None):
+        seen.append((stitch_dir, binary_file, ingredients))
+        return fake_build(stitch_dir, binary_file, ingredients, config_ini, soft_strap)
+
+    monkeypatch.setattr(executor.stitch_runner, "build_stitch_command", build)
+    first, second = executor.execute(_plan(tmp_path)), executor.execute(_plan(tmp_path))
+    assert first["ok"] and second["ok"]
+    assert first["data"]["run_id"] != second["data"]["run_id"]
+    for result, (stitch_dir, binary_file, ingredients) in zip((first, second), seen):
+        root = stitch_runner.run_dir(result["data"]["run_id"])
+        assert Path(stitch_dir).is_relative_to(root)
+        assert Path(binary_file).is_relative_to(root) and Path(binary_file).read_bytes() == b"b"
+        assert Path(ingredients[0]["path"]).is_relative_to(root)
+        assert Path(ingredients[0]["path"]).is_dir()
+
+
+@pytest.fixture
+def server_local(clean_env, monkeypatch):
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "secret")
+    monkeypatch.setenv("IFWI_MCP_ARTIFACTORY_REPO", "https://af.example.com/repo/Stitch/")
+    uploads = {}
+
+    def fake_upload(local_path, url):
+        uploads[url] = Path(local_path).read_bytes()
+        return ok({"url": url})
+
+    monkeypatch.setattr(executor.artifactory, "upload_file", fake_upload)
+    return uploads
+
+
+def test_server_mode_local_execution_returns_artifactory_links(server_local, env_fakes,
+                                                               run_fakes, tmp_path):
+    r = executor.execute(_plan(tmp_path))
+    assert r["ok"] is True, r
+    data = r["data"]
+    run_url = f"https://af.example.com/repo/Stitch/{data['run_id']}"
+    assert set(data) == {"plan_id", "run_id", "artifactory_url", "stitched_bin",
+                         "log_url", "warnings"}
+    assert data["artifactory_url"] == run_url
+    assert data["stitched_bin"]["url"] == f"{run_url}/deliverables/stitched.bin"
+    assert data["stitched_bin"]["sha256"] and data["stitched_bin"]["bytes"] == 3
+    assert server_local[data["stitched_bin"]["url"]] == b"out"
+    assert data["log_url"] == f"{run_url}/deliverables/plan-test.log"
+    run_info = json.loads(server_local[f"{run_url}/run.json"])
+    assert run_info["command_line"].startswith("py cli.py")
+    assert {a["kind"] for a in run_info["artifacts"]} == {"stitched_bin", "log", "output"}
+    assert run_info["fetched"] and run_info["warnings"] == data["warnings"]
+    assert not stitch_runner.run_dir(data["run_id"]).exists()
+    assert not deliverables.deliverables_dir(data["run_id"]).exists()
+
+
+def test_server_mode_retention_keeps_run_and_prunes_expired(server_local, env_fakes, run_fakes,
+                                                            monkeypatch, tmp_path):
+    import os, time
+    monkeypatch.setenv("IFWI_MCP_RUN_RETENTION_HOURS", "1")
+    expired = stitch_runner.run_dir("plan-old-run"); expired.mkdir(parents=True)
+    in_flight = stitch_runner.run_dir("plan-busy-run"); in_flight.mkdir(parents=True)
+    two_hours_ago = time.time() - 7200
+    for path in (expired, in_flight):
+        os.utime(path, (two_hours_ago, two_hours_ago))
+    executor._ACTIVE_RUNS.add("plan-busy-run")
+    try:
+        r = executor.execute(_plan(tmp_path))
+    finally:
+        executor._ACTIVE_RUNS.discard("plan-busy-run")
+    assert r["ok"] is True, r
+    kept = stitch_runner.run_dir(r["data"]["run_id"])
+    assert kept.name == r["data"]["run_id"]
+    assert (kept / "tool").is_dir() and (kept / "inputs" / "ingredients" / "0_MMC1").is_dir()
+    assert not deliverables.deliverables_dir(r["data"]["run_id"]).exists()
+    assert not expired.exists()
+    assert in_flight.exists()
+
+
+def test_server_mode_local_failure_returns_log_link(server_local, env_fakes, run_fakes,
+                                                    tmp_path):
+    run_fakes["fail"] = True
+    r = executor.execute(_plan(tmp_path))
+    assert r["error_code"] == ErrorCode.STITCH_RUN_FAILED
+    assert r["detail"]["artifacts"][0]["url"].endswith("/deliverables/plan-test.log")
+    assert "full_log_path" not in r["detail"] and "deliverables" not in r["detail"]
+    assert r["detail"]["run_id"].startswith("plan-test-")
+
+
+def test_server_mode_local_upload_failure_keeps_local_files(server_local, env_fakes,
+                                                            run_fakes, monkeypatch, tmp_path):
+    monkeypatch.setattr(executor.artifactory, "upload_file",
+                        lambda path, url: err(ErrorCode.UPLOAD_FAILED, "nope", {"url": url}))
+    r = executor.execute(_plan(tmp_path))
+    assert r["error_code"] == ErrorCode.UPLOAD_FAILED
+    assert deliverables.deliverables_dir(r["detail"]["run_id"]).is_dir()
+
+
+def test_server_mode_local_requires_artifactory_repo(server_local, env_fakes, monkeypatch,
+                                                     tmp_path):
+    monkeypatch.delenv("IFWI_MCP_ARTIFACTORY_REPO")
+    r = executor.execute(_plan(tmp_path))
+    assert r["detail"]["param"] == "execution.artifactory_repo"
+    assert env_fakes["prepared"] == []
 
 
 def test_execute_local_honours_timeout_from_config(clean_env, env_fakes, run_fakes,
@@ -383,6 +496,27 @@ def test_execute_remote_rejects_bad_credentials(remote_env, monkeypatch, tmp_pat
     monkeypatch.setattr(executor.requests, "request",
                         lambda *a, **kw: _Resp({"error": "nope"}, status_code=401))
     assert executor.execute(_plan(tmp_path))["error_code"] == ErrorCode.AUTH_FAILED
+
+
+def test_job_api_unauthorized_envelope_on_http_500(remote_env, monkeypatch):
+    monkeypatch.setattr(executor.requests, "request",
+                        lambda *a, **kw: _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
+                                              status_code=500))
+    result = executor._job_api("GET", "https://jobs.example.com/job/unknown")
+    assert result["error_code"] == ErrorCode.AUTH_FAILED
+    assert result["detail"]["status"] == 500
+    assert result["detail"]["job_api_code"] == -1
+    assert result["detail"]["has_exec_token"] is True
+    assert "secret" not in str(result)
+
+
+def test_job_api_unauthorized_without_exec_token(clean_env, monkeypatch):
+    monkeypatch.setattr(executor.requests, "request",
+                        lambda *a, **kw: _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
+                                              status_code=500))
+    result = executor._job_api("GET", "https://jobs.example.com/job/unknown")
+    assert result["error_code"] == ErrorCode.AUTH_FAILED
+    assert result["detail"]["has_exec_token"] is False
 
 
 def test_execute_remote_times_out(remote_env, tmp_path):
