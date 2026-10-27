@@ -79,6 +79,12 @@ def stitching(payload: dict) -> dict:
             for name, version in ingredients.items()):
         return err(ErrorCode.INVALID_ARGUMENT, "ingredients must be a non-empty name-to-version object",
                    {"param": "ingredients"})
+    custom_ifwi = _text(payload, "ifwi_url", False)
+    if isinstance(custom_ifwi, dict):
+        return custom_ifwi
+    if custom_ifwi and not custom_ifwi.lower().startswith(("https://", "http://")):
+        return err(ErrorCode.INVALID_ARGUMENT, "ifwi_url must be an http(s) download link",
+                   {"param": "ifwi_url"})
 
     project = fiv_portal.resolve_project_by_id(payload["fiv_project_id"])
     if not project["ok"]:
@@ -104,7 +110,9 @@ def stitching(payload: dict) -> dict:
     lane = payload.get("swimlane") or binaries["data"].get("swimlane_branch")
     chosen = next(entry for entry in binaries["data"]["binaries"]
                   if entry["binary_name"] == binary)
-    ifwi_url = chosen.get("url")
+    # A customized baseline replaces only the release binary download; the release
+    # still names the binary (for config selection) and supplies the stitch tool.
+    ifwi_url = custom_ifwi or chosen.get("url")
     if not ifwi_url:
         return err(ErrorCode.IFWI_BINARY_NOT_FOUND, "release binary has no download URL",
                    {"binary_name": binary})
@@ -112,7 +120,13 @@ def stitching(payload: dict) -> dict:
     if not tool["ok"]:
         return tool
     ingredient_urls = []
+    custom_urls = {custom_ifwi} if custom_ifwi else set()
     for name, version in ingredients.items():
+        if version.strip().lower().startswith(("https://", "http://")):
+            # A direct download link bypasses the FIV lookup.
+            ingredient_urls.append(version.strip())
+            custom_urls.add(version.strip())
+            continue
         found = fiv_portal.find_ingredient(project_name, name, version)
         if not found["ok"]:
             return found
@@ -130,7 +144,7 @@ def stitching(payload: dict) -> dict:
                             config_ini, version=payload["version"],
                             swimlane=lane, ifwi_binary=binary,
                             fiv_project_id=project["data"]["project_id"],
-                            source_urls=urls)
+                            source_urls=urls, custom_urls=custom_urls)
     if not built["ok"]:
         return built
     if payload.get("dry_run"):
@@ -138,6 +152,7 @@ def stitching(payload: dict) -> dict:
                    "project": project_name, "fiv_project_id": project["data"]["project_id"],
                    "phase": payload["phase"], "version": payload["version"],
                    "swimlane": lane, "binary_name": binary,
+                   "custom_ifwi": bool(custom_ifwi),
                    "config_ini": config_ini, "ingredients": ingredients,
                    "config_status": "validated against the extracted stitch tool during execution",
                    "source_urls": urls,

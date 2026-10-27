@@ -246,7 +246,16 @@ exposes independent authenticated REST JSON interfaces:
   IFWI, ingredient and stitch-tool URLs, saves a plan and executes that same plan
   wherever `IFWI_MCP_EXEC_MODE` points. Downloading, extraction, config validation
   and the stitch itself happen only during execution. The result includes `plan_id`
-  and Artifactory links to the deliverables.
+  and Artifactory links to the deliverables. An `ingredients` value may also be a
+  direct `http(s)://` download link instead of a version; it is used as-is and the
+  FIV lookup is skipped (the file is not validated against FIV).
+- Pass an optional `ifwi_url` (`http(s)://` link) on `/stitching` to stitch onto a
+  customized IFWI instead of the release binary. `version`, `swimlane` and
+  `binary_name` are still resolved against the release, because they select the
+  stitch tool and config; only the base binary download is replaced.
+- Files from caller-supplied links (`ifwi_url` and link-valued `ingredients`) are
+  downloaded and extracted into per-URL cache directories, so a same-named release
+  file or a different link with the same file name is never reused.
 - Set `"dry_run": true` on `/stitching` to preview `source_urls`, the inferred
   `config_ini` and placeholder-based `command_template` without downloading or
   executing anything. The config hint cannot be verified until execution extracts

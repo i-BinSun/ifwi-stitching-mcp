@@ -13,7 +13,7 @@ import uuid
 import zlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Collection, Optional
 
 from . import config, fiv_portal, prepare, stitch_runner
 from .result import ok, err, ErrorCode
@@ -98,7 +98,8 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
                stitch_path: Optional[str] = None,
                soft_strap: Optional[str] = None,
                fiv_project_id: Optional[str] = None,
-               source_urls: Optional[dict] = None) -> dict:
+               source_urls: Optional[dict] = None,
+               custom_urls: Collection[str] = ()) -> dict:
     """Validate the confirmed answers and render the command line for them.
 
     Every source is either "fiv" (fetched during environment preparation) or
@@ -221,6 +222,11 @@ def build_plan(project: str, phase: str, ingredients: list, config_ini: str,
         stitch_source["url"] = source_urls["stitch_tool"]
         for source, url in zip(ingredient_sources, source_urls["ingredients"]):
             source["url"] = url
+        # Caller-supplied links are not FIV artifacts: the worker must not reuse a
+        # same-named cache entry for them.
+        for source in [ifwi_source, stitch_source, *ingredient_sources]:
+            if source["url"] in custom_urls:
+                source["custom"] = True
 
     if is_up_project:
         argv = [P_PYTHON, P_ENTRY, "-c", P_CONFIG_INI]

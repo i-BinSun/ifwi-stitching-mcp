@@ -36,8 +36,11 @@ STITCH_PAYLOAD = {
     "phase": "Orange",
     "version": "2026.41.3.01",
     "binary_name": "OKSDCRB1_NonIPClean_Trace_DebugSigned",
+    # A value may also be a direct http(s) link to an ingredient package (skips FIV).
     "ingredients": {"MMC1": "0.967.0"},
     "swimlane": "release/post-silicon",
+    # Optional: stitch onto a customized IFWI instead of the release binary.
+    # "ifwi_url": "https://ubit-artifactory-or.intel.com/.../custom_ifwi.bin",
     "async": True,  # Real stitching returns a job to poll.
 }
 
