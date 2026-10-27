@@ -241,7 +241,7 @@ exposes independent authenticated REST JSON interfaces:
   One version returns `data.release.ingredients`; two versions return only the
   changed ingredient versions in `data.differences` as
   `{name, from_version, to_version}` (a missing ingredient is `null`).
-- `POST /stitching`: specify `fiv_project_id`, `phase`, `version`, and a non-empty
+- `POST /stitching`: specify `fiv_project_id`, `phase`, `version` (optional with `ifwi_url`), and a non-empty
   `ingredients` name-to-version map. The server resolves FIV metadata into pinned
   IFWI, ingredient and stitch-tool URLs, saves a plan and executes that same plan
   wherever `IFWI_MCP_EXEC_MODE` points. Downloading, extraction, config validation
@@ -250,9 +250,16 @@ exposes independent authenticated REST JSON interfaces:
   direct `http(s)://` download link instead of a version; it is used as-is and the
   FIV lookup is skipped (the file is not validated against FIV).
 - Pass an optional `ifwi_url` (`http(s)://` link) on `/stitching` to stitch onto a
-  customized IFWI instead of the release binary. `version`, `swimlane` and
-  `binary_name` are still resolved against the release, because they select the
-  stitch tool and config; only the base binary download is replaced.
+  customized IFWI instead of the release binary. `version` then becomes optional: the
+  server reads only the 256-byte OEM region at `0xF00` (HTTP Range; without Range
+  support it stops after that window) and derives `version` and `swimlane` from its
+  `ifwi_version` (e.g. `ap.post-silicon.2026.41.3.01`), plus `binary_name` = product +
+  flavor for official builds. The release still selects the stitch tool and config;
+  only the base binary download is replaced. An explicit `version`, `swimlane` or
+  `binary_name` that contradicts the OEM region is HTTP 400; an OEM region without a
+  release version and no `version` is HTTP 400 (no fallback to another release's stitch
+  tool); a customized flavor with several candidate binaries is HTTP 409. The dry-run
+  result includes the parsed `oem` fields.
 - Files from caller-supplied links (`ifwi_url` and link-valued `ingredients`) are
   downloaded and extracted into per-URL cache directories, so a same-named release
   file or a different link with the same file name is never reused.
@@ -486,7 +493,7 @@ All tools return the unified result shape described above.
 | `fiv_find_stitch_tool` | `(project, phase, version, swimlane=None)` | Resolve the stitch-tool package (`stitch_url` = downloadable `.7z`) + its file list. For UP projects, automatically delegates to `fiv_find_env_package`. If no `build_target` reports a stitch package, falls back to browsing `release_root` on Artifactory directly (`<release_root>/<target-name>/<package>`) before giving up. |
 | `fiv_find_env_package` | `(project, phase, version, swimlane=None)` | Resolve a UP (Unified Patch) release's env package URL from `get_ifwi_release_detail` (`env_atf_link` or download links). |
 | `fiv_match_build_by_oem` | `(project, product, ifwi_version, flavor, phase, swimlane=None)` | **Path B** — reverse-match a build from parsed OEM info. |
-| `parse_ifwi_oem` | `(local_ifwi_path)` | Decode the OEM region (offset `0xF00`, 256 bytes) of a local IFWI. Returns `product`, `ifwi_version`, `flavor_value`, `flavor_type`, `hash`. |
+| `parse_ifwi_oem` | `(local_ifwi_path)` | Decode the OEM region (offset `0xF00`, 256 bytes) of a local IFWI. Returns `product`, `ifwi_version`, `version`, `swimlane_hint`, `flavor_value`, `flavor_type`, `hash`. |
 | `download` | `(url_or_path, category="ifwi", dest_name=None)` | Download an Artifactory URL or copy a local file into the cache. `category` ∈ `ifwi` / `ingredients` / `stitch`. |
 | `list_local_files` | `()` | List files already cached across the categories. |
 | `extract_archive` | `(archive_path, dest_name=None)` | Extract any `.zip`/`.tar*`/`.7z` into the cache; returns `extract_dir`, `file_count`, and the contained `.bin` files. Use for IFWI `.7z` packages. |

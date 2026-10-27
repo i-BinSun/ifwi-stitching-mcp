@@ -118,6 +118,41 @@ def download(url_or_path: str, category: str = "ifwi", dest_name: Optional[str] 
                    {"target": str(target), "reason": str(exc)})
 
 
+def read_range(url: str, start: int, length: int) -> dict:
+    """Read bytes [start, start + length) of a remote file without downloading all of it."""
+    token_result = config.get_artifactory_token()
+    if not token_result["ok"]:
+        return token_result
+    headers = {"Authorization": f"Bearer {token_result['data']['token']}",
+               "Range": f"bytes={start}-{start + length - 1}"}
+    try:
+        resp = requests.get(url, headers=headers, stream=True, timeout=60, verify=False)
+    except requests.RequestException as exc:
+        return err(ErrorCode.DOWNLOAD_FAILED, "network error while reading the file",
+                   {"url": url, "reason": str(exc)})
+    with resp:
+        if resp.status_code in (401, 403):
+            return err(ErrorCode.AUTH_FAILED, "artifactory rejected credentials",
+                       {"service": "artifactory", "http_status": resp.status_code})
+        if resp.status_code == 416:
+            return ok({"content": b""})
+        if not (200 <= resp.status_code < 300):
+            return err(ErrorCode.DOWNLOAD_FAILED, "read returned error status",
+                       {"url": url, "http_status": resp.status_code})
+        # A server that ignores Range streams the file from byte 0; stop once the window is in.
+        skip = 0 if resp.status_code == 206 else start
+        buf = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                buf += chunk
+                if len(buf) >= skip + length:
+                    break
+        except requests.RequestException as exc:
+            return err(ErrorCode.DOWNLOAD_FAILED, "read was interrupted",
+                       {"url": url, "reason": str(exc)})
+    return ok({"content": bytes(buf[skip:skip + length])})
+
+
 def list_local_files() -> dict:
     """List all cached artifact files across categories."""
     files = []

@@ -8,7 +8,7 @@ from typing import Optional
 
 import requests
 
-from . import config
+from . import config, oem_parser
 from .result import ok, err, ErrorCode
 
 PHASES = ("Blue", "Orange", "Purple", "Daily")
@@ -205,6 +205,28 @@ def _release_swimlanes_for_version(project: str, phase: str, version: str) -> di
                    {"project": project, "phase": phase, "version": version})
     swimlanes = sorted({r.get("swimlane_branch") for r in rows if r.get("swimlane_branch")})
     return ok({"swimlanes": swimlanes})
+
+
+def swimlane_matches_hint(lane: str, hint: str) -> bool:
+    """OEM stores the lane without FIV's branch prefix: 'ap.post-silicon' ~ 'release/ap.post-silicon'."""
+    return lane == hint or lane.endswith("/" + hint)
+
+
+def resolve_swimlane_hint(project: str, phase: str, version: str, hint: str) -> dict:
+    """Find the release swimlane named by an IFWI OEM swimlane hint."""
+    lanes = _release_swimlanes_for_version(project, phase, version)
+    if not lanes["ok"]:
+        return lanes
+    candidates = lanes["data"]["swimlanes"]
+    matched = [lane for lane in candidates if swimlane_matches_hint(lane, hint)]
+    if len(matched) > 1:
+        return err(ErrorCode.MULTIPLE_SWIMLANES, "several swimlanes match the IFWI OEM swimlane",
+                   {"swimlane_hint": hint, "candidates": matched})
+    if not matched:
+        return err(ErrorCode.RELEASE_NOT_FOUND, "no release swimlane matches the IFWI OEM swimlane",
+                   {"swimlane_hint": hint, "phase": phase, "version": version,
+                    "candidates": candidates})
+    return ok({"swimlane": matched[0]})
 
 
 def list_swimlanes(project: str, phase: Optional[str] = None) -> dict:
@@ -795,26 +817,26 @@ def match_build_by_oem(project: str, product: str, ifwi_version: str, flavor: st
     if not pid["ok"]:
         return pid
     project_id = pid["data"]["project_id"]
+    lane_hint, version = oem_parser.split_ifwi_version(ifwi_version)
+    if not version:
+        return err(ErrorCode.INVALID_ARGUMENT, "OEM ifwi_version not usable as version",
+                   {"param": "ifwi_version", "expected": "[<swimlane>.]YYYY.WW.D.NN"})
 
     # Determine which swimlanes to scan.
     if swimlane:
         lanes_to_scan = [swimlane]
     else:
-        # Need a version to enumerate swimlanes; derive from OEM ifwi_version by
-        # stripping the leading dot (e.g. ".2026.28.3.01" -> "2026.28.3.01").
-        version = ifwi_version.lstrip(".")
-        if not _VERSION_RE.match(version):
-            return err(ErrorCode.INVALID_ARGUMENT, "OEM ifwi_version not usable as version",
-                       {"param": "ifwi_version", "expected": "YYYY.WW.D.NN"})
         lanes = _release_swimlanes_for_version(project, phase, version)
         if not lanes["ok"]:
             return lanes
         lanes_to_scan = lanes["data"]["swimlanes"] or [None]
+        hinted = [lane for lane in lanes_to_scan if lane and lane_hint
+                  and swimlane_matches_hint(lane, lane_hint)]
+        lanes_to_scan = hinted or lanes_to_scan
 
     product_l = product.lower()
     flavor_l = flavor.strip("_").lower()
     matches = []  # list of {"package_name","swimlane"}
-    version = ifwi_version.lstrip(".")
     for lane in lanes_to_scan:
         params = {"project_id": project_id, "phase": phase, "version": version}
         if lane:

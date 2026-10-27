@@ -18,15 +18,23 @@ OEM_INFO_LEN = 256
 _STRUCT_FMT = "<16s 48s 128s 32s 32s"
 _DATE_RE = re.compile(r"^[0-9]{8}$")
 _TIME_RE = re.compile(r"^[0-9]{6}$")
+_IFWI_VERSION_RE = re.compile(r"^(?:(?P<lane>.*)\.)?(?P<version>\d{4}\.\d+\.\d+\.\d+)$")
 
 
 def _decode_str(raw: bytes) -> str:
     return raw.split(b"\x00")[0].decode("utf-8", errors="ignore")
 
 
+def split_ifwi_version(ifwi_version: str) -> tuple:
+    """'ap.post-silicon.2026.41.3.01' -> ('ap.post-silicon', '2026.41.3.01'); (None, None) if unusable."""
+    match = _IFWI_VERSION_RE.match(ifwi_version or "")
+    if not match:
+        return None, None
+    return match.group("lane") or None, match.group("version")
+
+
 def _classify_flavor(ifwi_version: str, flavor_value: str) -> str:
-    version_parts = ifwi_version.split(".")
-    if len(version_parts) not in (4, 5):
+    if not split_ifwi_version(ifwi_version)[1]:
         return "invalid"
     flavor_parts = flavor_value.split(".")
     if len(flavor_parts) >= 3 and _TIME_RE.match(flavor_parts[-1]) and _DATE_RE.match(flavor_parts[-2]):
@@ -41,9 +49,12 @@ def decode_entry(oem_bytes: bytes) -> dict:
     product = _decode_str(product_b)
     ifwi_version = _decode_str(version_b)
     flavor_value = _decode_str(flavor_b)
+    swimlane_hint, version = split_ifwi_version(ifwi_version)
     return {
         "product": product,
         "ifwi_version": ifwi_version,
+        "version": version,
+        "swimlane_hint": swimlane_hint,
         "flavor_value": flavor_value,
         "flavor_type": _classify_flavor(ifwi_version, flavor_value),
         "hash": hash_b.hex(),
@@ -64,6 +75,11 @@ def parse_ifwi_oem(local_ifwi_path: str) -> dict:
     except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
         return err(ErrorCode.INVALID_ARGUMENT, "cannot read IFWI file",
                    {"param": "local_ifwi_path", "expected": f"readable file ({exc})"})
+    return parse_oem_region(oem_bytes)
+
+
+def parse_oem_region(oem_bytes: bytes) -> dict:
+    """Decode the 256 bytes found at OEM_INFO_START."""
     try:
         entry = decode_entry(oem_bytes)
     except Exception as exc:  # noqa: BLE001 - map any decode failure
