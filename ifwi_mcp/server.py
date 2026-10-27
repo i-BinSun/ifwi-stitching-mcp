@@ -198,7 +198,11 @@ def fiv_prepare_ifwi(project: str, phase: str, version: str, swimlane: Optional[
 
 @_guard
 def parse_ifwi_oem(local_ifwi_path: str) -> dict:
-    """Decode a local IFWI image's OEM region into product, ifwi_version, flavor and hash."""
+    """Decode a local IFWI image's OEM region into product, ifwi_version, flavor and hash.
+
+    ifwi_version may carry a swimlane prefix (ap.post-silicon.2026.41.3.01); it is split
+    into `version` (the FIV release version) and `swimlane_hint`.
+    """
     return oem_parser.parse_ifwi_oem(local_ifwi_path)
 
 

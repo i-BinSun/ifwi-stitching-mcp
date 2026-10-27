@@ -14,6 +14,7 @@ The execution.mode switch in the config file decides where the work happens:
 Either way the caller gets the same result shape: the exact command line that ran,
 the exit code, and a deliverables manifest.
 """
+import hashlib
 import json
 import re
 import shutil
@@ -45,6 +46,18 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def _custom_key(source: dict) -> str:
+    """Caller-supplied links often reuse release file names; key their cache by URL."""
+    if not source.get("custom"):
+        return ""
+    return "custom-" + hashlib.sha256(source["url"].encode()).hexdigest()[:16]
+
+
+def _cache_category(category: str, source: dict) -> str:
+    key = _custom_key(source)
+    return f"{category}/{key}" if key else category
+
+
 def prepare_environment(plan: dict) -> dict:
     """Fetch and unpack everything the plan needs, before any command runs.
 
@@ -65,7 +78,7 @@ def prepare_environment(plan: dict) -> dict:
                            {"source": "ifwi", "path": binary_file})
         else:
             if ifwi.get("url"):
-                dl = artifactory.download(ifwi["url"], category="ifwi")
+                dl = artifactory.download(ifwi["url"], category=_cache_category("ifwi", ifwi))
                 if not dl["ok"]:
                     return dl
                 res = ok({"binary_file": dl["data"]["local_path"],
@@ -91,10 +104,15 @@ def prepare_environment(plan: dict) -> dict:
                            {"source": "ingredient", "name": name, "path": ingredient_dir})
         else:
             if ingredient.get("url"):
-                dl = artifactory.download(ingredient["url"], category="ingredients")
+                dl = artifactory.download(ingredient["url"],
+                                          category=_cache_category("ingredients", ingredient))
                 if not dl["ok"]:
                     return dl
-                extracted = archive.extract_archive(dl["data"]["local_path"])
+                local_path = dl["data"]["local_path"]
+                key = _custom_key(ingredient)
+                extracted = (archive.extract_archive(
+                    local_path, f"{archive.cache_name(Path(local_path).name)}-{key}")
+                             if key else archive.extract_archive(local_path))
                 if not extracted["ok"]:
                     return extracted
                 res = ok({"ingredient_dir": extracted["data"]["extract_dir"],
