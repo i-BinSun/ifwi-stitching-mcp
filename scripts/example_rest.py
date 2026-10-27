@@ -41,7 +41,7 @@ STITCH_PAYLOAD = {
     "swimlane": "release/post-silicon",
     # Optional: stitch onto a customized IFWI instead of the release binary; version,
     # swimlane and binary_name may then be omitted (read from its OEM region).
-    # "ifwi_url": "https://ubit-artifactory-or.intel.com/.../custom_ifwi.bin",
+    # "ifwi_url": "https://af01p-or.devtools.intel.com/artifactory/.../custom_ifwi.bin",
     "async": True,  # Real stitching returns a job to poll.
 }
 
