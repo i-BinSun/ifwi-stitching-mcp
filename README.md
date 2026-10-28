@@ -294,7 +294,8 @@ exposes independent authenticated REST JSON interfaces:
   `finalizing`, `done`; remote runs only expose the pod's state). `data.result` holds the unified
   envelope once terminal, and `data.result_source` says where it came from (`callback`,
   `result_json`, `inferred` or `server`). While a remote job runs, each query checks the pod live
-  (at most every 5 s per job). Wait `poll_after_seconds` between polls.
+  (at most every 5 s per job). Wait `poll_after_seconds` between polls. Add `?events=true` to get
+  `data.events`, the job's event log (state changes, callbacks, Job API trouble, pod deletion).
 - In server mode jobs are stored in `<cache>/jobs.db` and kept for `IFWI_MCP_JOB_RETENTION_HOURS`
   (7 days) after they finish; HTTP 404 `JOB_NOT_FOUND` means the job never existed or is past
   retention. At most `IFWI_MCP_MAX_ACTIVE_JOBS` (64) jobs run at once; beyond that a submission
@@ -389,7 +390,7 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 | `prepare.py` | find → download → extract, for IFWI / ingredient / stitch tool | orchestration of the layers above |
 | `plan.py` | confirmed answers → validated plan + rendered command line | no network, no subprocess |
 | `executor.py` | prepare the environment, run the plan locally, and the remote primitives (create/poll/delete the pod, read `result.json`, build the wrapper spec) | reads the execution switch |
-| `job_store.py` | job records: `SqliteJobStore` (server mode) and `MemoryJobStore` (stdio), conditional writes | SQLite only |
+| `job_store.py` | job records and their event log: `SqliteJobStore` (server mode) and `MemoryJobStore` (stdio), conditional writes | SQLite only |
 | `jobs.py` | `JobManager`: submit, callback, refresh-on-query, finalize, cancel, restart recovery, retention | no background polling thread |
 | `interfaces.py` | validate Query and Stitching REST payloads and call existing workflow | request-level project ID for remote dispatch |
 | `http_api.py` | authenticated REST routes (`/query`, `/stitching`, `/jobs`) and the pod callback route | mounted alongside FastMCP `/mcp` |
@@ -572,7 +573,7 @@ All tools return the unified result shape described above.
 | `stitch_prepare_environment` | `(plan_id)` | Fetch and unpack everything the plan needs, without running it. |
 | `stitch_execute_plan` | `(plan_id)` | Prepare, run (local or remote), and collect the deliverables; blocks until the run ends. Prefer `stitch_submit_plan`. |
 | `stitch_submit_plan` | `(plan_id, client_request_id=None)` | Start a run and return at once with its `job_id` (same view as `GET /jobs/{id}`). |
-| `stitch_get_job` | `(job_id)` | Job status; checks a running remote pod live. Poll every `poll_after_seconds` until `terminal`. |
+| `stitch_get_job` | `(job_id, include_events=False)` | Job status; checks a running remote pod live. Poll every `poll_after_seconds` until `terminal`. `include_events=True` adds the job's event log. |
 | `stitch_cancel_job` | `(job_id)` | Cancel an unfinished job (deletes its pod). |
 | `stitch_list_jobs` | `(state=None, limit=20)` | Recent jobs, newest first. |
 | `stitch_get_deliverables` | `(plan_id)` | stdio: re-read the local deliverables manifest. Server mode: the links of the plan's latest succeeded job. |

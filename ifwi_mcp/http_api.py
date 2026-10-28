@@ -140,27 +140,33 @@ async def stitching(request):
                                       "X-Job-Id": job["job_id"]})
 
 
-def _refreshed_view(job_id):
+def _refreshed_view(job_id, include_events=False):
     manager = jobs.get_manager()
     row = manager.get(job_id)
-    return manager.view(row) if row is not None else None
+    return manager.view(row, include_events=include_events) if row is not None else None
+
+
+def _flag(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 async def job_status(request):
     if not _authorized(request):
         return _unauthorized()
     job_id = request.path_params["job_id"]
+    include_events = _flag(request.query_params.get("events"))
     manager = jobs.get_manager()
     pool, slots = manager.refresh_pool()
     if slots.acquire(blocking=False):
         try:
-            view = await asyncio.get_running_loop().run_in_executor(pool, _refreshed_view, job_id)
+            view = await asyncio.get_running_loop().run_in_executor(
+                pool, _refreshed_view, job_id, include_events)
         finally:
             slots.release()
     else:
         # Every refresh thread is busy (slow Job API): answer from the stored record.
         row = manager.get(job_id, refresh=False)
-        view = manager.view(row) if row is not None else None
+        view = manager.view(row, include_events=include_events) if row is not None else None
     if view is None:
         return JSONResponse(jobs.not_found(job_id), status_code=404)
     headers = {"Retry-After": str(view["poll_after_seconds"])} if not view["terminal"] else None

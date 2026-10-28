@@ -2,7 +2,9 @@
 
 Both stores expose the same small interface. Every state change goes through
 mutate(), which applies a caller-supplied function to the current row atomically,
-so conditional writes ("only while the job is still active") are race-free.
+so conditional writes ("only while the job is still active") are race-free. Each
+write also appends to the job's event log: the state/stage transition, if any, plus
+notes the caller attached with note().
 """
 import copy
 import json
@@ -14,7 +16,10 @@ from typing import Callable, Optional
 ACTIVE_STATES = ("queued", "running")
 TERMINAL_STATES = ("succeeded", "failed", "cancelled")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Rows carry notes for the event log under this transient key; it is never stored.
+EVENTS_KEY = "_events"
+MAX_EVENT_DETAIL = 500
 # Plain columns, in table order. JSON columns are exposed on rows without the _json suffix.
 _PLAIN = ("job_id", "kind", "executor", "state", "stage", "client_request_id", "request_hash",
           "created_at", "updated_at", "finished_at", "submitted_at", "deadline_at",
@@ -64,6 +69,52 @@ CREATE INDEX IF NOT EXISTS ix_jobs_plan    ON jobs(plan_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_idem ON jobs(kind, client_request_id)
     WHERE client_request_id IS NOT NULL;
 """
+
+# Append-only history for diagnosis: never read by any decision, purged with its job.
+_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS job_events (
+    job_id  TEXT NOT NULL,
+    at      REAL NOT NULL,
+    state   TEXT NOT NULL,
+    stage   TEXT NOT NULL,
+    detail  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_job_events_job ON job_events(job_id, at);
+"""
+
+
+def note(row: dict, text: str) -> None:
+    """Attach an event-log line to a row being written through mutate()."""
+    row.setdefault(EVENTS_KEY, []).append(str(text)[:MAX_EVENT_DETAIL])
+
+
+def _transition(before: dict, after: dict) -> str:
+    text = f"{before['state']}/{before['stage']} -> {after['state']}/{after['stage']}"
+    if after["stage"] == "finalizing" and after.get("finalize_reason"):
+        text += f" ({after['finalize_reason']})"
+    if after["state"] in TERMINAL_STATES and after["state"] != before["state"]:
+        result = after.get("result") or {}
+        outcome = "ok" if result.get("ok") else result.get("error_code")
+        text += f" [{after.get('result_source')}: {outcome}]"
+    return text
+
+
+def _events_for(before: Optional[dict], after: dict) -> list:
+    """Event rows for one write: the state/stage transition plus any attached notes."""
+    notes = after.pop(EVENTS_KEY, [])
+    at = after.get("updated_at") or after.get("created_at")
+    key = (after["job_id"], at, after["state"], after["stage"])
+    events = []
+    if before is None:
+        events.append(key + ("created",))
+    elif (before["state"], before["stage"]) != (after["state"], after["stage"]):
+        events.append(key + (_transition(before, after),))
+    events += [key + (text,) for text in notes]
+    return events
+
+
+def _event_dict(event) -> dict:
+    return {"at": event[1], "state": event[2], "stage": event[3], "detail": event[4]}
 
 
 def new_row(**fields) -> dict:
@@ -132,7 +183,11 @@ class JobStore:
 
     def purge(self, finished_before: float, created_before: float) -> int:
         """Delete finished jobs older than finished_before and any job created before
-        created_before (a never-finished remote job nobody asked about)."""
+        created_before (a never-finished remote job nobody asked about), with their events."""
+        raise NotImplementedError
+
+    def events(self, job_id: str, limit: int = 200) -> list:
+        """The job's event log, oldest first: [{at, state, stage, detail}]."""
         raise NotImplementedError
 
 
@@ -141,7 +196,12 @@ class MemoryJobStore(JobStore):
 
     def __init__(self):
         self._rows = {}
+        self._events = {}
         self._lock = threading.RLock()
+
+    def _log(self, events):
+        for event in events:
+            self._events.setdefault(event[0], []).append(event)
 
     def create(self, row, *, max_active):
         with self._lock:
@@ -155,8 +215,10 @@ class MemoryJobStore(JobStore):
             active = sum(1 for r in self._rows.values() if r["state"] in ACTIVE_STATES)
             if active >= max_active:
                 return "full", active
-            self._rows[row["job_id"]] = copy.deepcopy(row)
-            return "created", copy.deepcopy(row)
+            stored = copy.deepcopy(row)
+            self._log(_events_for(None, stored))
+            self._rows[row["job_id"]] = stored
+            return "created", copy.deepcopy(stored)
 
     def get(self, job_id):
         with self._lock:
@@ -171,6 +233,7 @@ class MemoryJobStore(JobStore):
             row = copy.deepcopy(current)
             if not fn(row):
                 return None
+            self._log(_events_for(current, row))
             self._rows[job_id] = row
             return copy.deepcopy(row)
 
@@ -195,7 +258,12 @@ class MemoryJobStore(JobStore):
                       or r["created_at"] < created_before]
             for key in doomed:
                 del self._rows[key]
+                self._events.pop(key, None)
             return len(doomed)
+
+    def events(self, job_id, limit=200):
+        with self._lock:
+            return [_event_dict(e) for e in self._events.get(job_id, [])[-limit:]]
 
 
 class SqliteJobStore(JobStore):
@@ -231,6 +299,9 @@ class SqliteJobStore(JobStore):
             version = self._write.execute("PRAGMA user_version").fetchone()[0]
             if version < 1:
                 self._write.executescript(_SCHEMA)
+            if version < 2:
+                self._write.executescript(_EVENTS_SCHEMA)
+            if version < SCHEMA_VERSION:
                 self._write.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self):
@@ -253,6 +324,12 @@ class SqliteJobStore(JobStore):
         conn.execute(f"INSERT INTO jobs ({', '.join(COLUMNS)}) VALUES ({placeholders})",
                      _to_record(row))
 
+    @staticmethod
+    def _log(conn, events):
+        if events:
+            conn.executemany("INSERT INTO job_events (job_id, at, state, stage, detail) "
+                             "VALUES (?, ?, ?, ?, ?)", events)
+
     def create(self, row, *, max_active):
         def body(conn):
             idem = row.get("client_request_id")
@@ -267,8 +344,11 @@ class SqliteJobStore(JobStore):
                                   ).fetchone()[0]
             if active >= max_active:
                 return "full", active
-            self._insert(conn, row)
-            return "created", copy.deepcopy(row)
+            stored = copy.deepcopy(row)
+            events = _events_for(None, stored)
+            self._insert(conn, stored)
+            self._log(conn, events)
+            return "created", stored
         return self._tx(body)
 
     def get(self, job_id):
@@ -280,12 +360,15 @@ class SqliteJobStore(JobStore):
             found = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if found is None:
                 return None
-            row = _from_record(found)
+            before = _from_record(found)
+            row = copy.deepcopy(before)
             if not fn(row):
                 return None
+            events = _events_for(before, row)
             assignments = ", ".join(f"{name}=?" for name in COLUMNS[1:])
             conn.execute(f"UPDATE jobs SET {assignments} WHERE job_id=?",
                          _to_record(row)[1:] + (job_id,))
+            self._log(conn, events)
             return row
         return self._tx(body)
 
@@ -323,7 +406,15 @@ class SqliteJobStore(JobStore):
 
     def purge(self, finished_before, created_before):
         def body(conn):
-            return conn.execute(
+            removed = conn.execute(
                 "DELETE FROM jobs WHERE (finished_at IS NOT NULL AND finished_at < ?) OR created_at < ?",
                 (finished_before, created_before)).rowcount
+            conn.execute("DELETE FROM job_events WHERE job_id NOT IN (SELECT job_id FROM jobs)")
+            return removed
         return self._tx(body)
+
+    def events(self, job_id, limit=200):
+        rows = self._reader().execute(
+            "SELECT job_id, at, state, stage, detail FROM job_events WHERE job_id=? "
+            "ORDER BY at DESC, rowid DESC LIMIT ?", (job_id, int(limit))).fetchall()
+        return [_event_dict(tuple(r)) for r in reversed(rows)]

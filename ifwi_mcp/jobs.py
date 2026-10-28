@@ -26,7 +26,7 @@ from typing import Optional
 
 from . import config, executor, interfaces, plan as plan_mod
 from .job_store import (ACTIVE_STATES, TERMINAL_STATES, MemoryJobStore, SqliteJobStore,
-                        new_row)
+                        new_row, note)
 from .result import ErrorCode, err, ok
 
 _LOG = logging.getLogger(__name__)
@@ -364,7 +364,7 @@ class JobManager:
         delay, started, warned = 1, time.monotonic(), False
         while True:
             try:
-                self.store.mutate(job_id, _fact(pod_job_id=pod_job_id))
+                self.store.mutate(job_id, _fact(f"pod created: {pod_job_id}", pod_job_id=pod_job_id))
                 return True
             except Exception as exc:  # noqa: BLE001 - E3b
                 if not warned:
@@ -403,8 +403,10 @@ class JobManager:
             final = self._decorate(row, result, source)
             if override:
                 row["remote"]["superseded_result"] = row["result"]
-                row["warnings"].append(
-                    f"result upgraded from inferred {(row['result'] or {}).get('error_code')}")
+                upgraded = f"result upgraded from inferred {(row['result'] or {}).get('error_code')}"
+                row["warnings"].append(upgraded)
+                note(row, f"{upgraded} to {source}: "
+                          f"{'ok' if final['ok'] else final.get('error_code')}")
             row.update(state="succeeded" if final["ok"] else "failed", stage="done",
                        result=final, result_source=source, updated_at=now,
                        finished_at=row["finished_at"] if override else now)
@@ -534,6 +536,10 @@ class JobManager:
                           signal=payload.get("signal"), callback_at=_now())
             if payload.get("pod_log_url"):
                 remote["pod_log_url"] = payload["pod_log_url"]
+            reported = payload["result"]
+            note(current, f"callback from attempt {attempt_id} (wrapper {wrapper.get('version')}, "
+                          f"{payload.get('result_source')}): "
+                          f"{'ok' if reported['ok'] else reported.get('error_code')}")
             return True
         row = self.store.mutate(job_id, facts) or row
 
@@ -615,6 +621,7 @@ class JobManager:
             if not row["deadline_extended"]:
                 # The Job API says the pod still runs: trust it once (design §8.5).
                 return self.store.mutate(row["job_id"], _active(
+                    "deadline passed but the Job API still reports the pod running; extended once",
                     deadline_at=now + cfg["timeout_seconds"], deadline_extended=1))
             return self._start_finalize(row, "deadline", cfg)
         if now > deadline_at:
@@ -645,9 +652,13 @@ class JobManager:
             row["last_checked_at"] = now
             row["updated_at"] = now
             if kind in ("pending", "running", "ended", "unknown", "gone"):
+                if remote.get("degraded"):
+                    note(row, "Job API answering again")
                 remote["consecutive_errors"] = 0
                 remote["degraded"] = False
                 if pod.get("status") is not None:
+                    if pod["status"] != row["pod_status"] and kind == "unknown":
+                        note(row, f"unexpected Job API status {pod['status']!r}")
                     row["pod_status"] = pod["status"]
             if kind in ("pending", "running", "ended", "unknown"):
                 remote.pop("gone_seen_at", None)
@@ -656,9 +667,12 @@ class JobManager:
             if kind == "unknown":
                 _LOG.warning("job %s: unexpected Job API status %r", row["job_id"], pod.get("status"))
             if kind in ("error", "gone_unconfirmed"):
+                was_degraded = bool(remote.get("degraded"))
                 remote["consecutive_errors"] = remote.get("consecutive_errors", 0) + 1
                 remote["degraded"] = remote["consecutive_errors"] >= DEGRADED_AFTER_ERRORS
                 if kind == "gone_unconfirmed":
+                    if "gone_seen_at" not in remote:
+                        note(row, "Job API: job not found (waiting for confirmation)")
                     remote.setdefault("gone_seen_at", now)
                     remote["last_error"] = "NOT_FOUND"
                 elif pod.get("auth"):
@@ -666,6 +680,8 @@ class JobManager:
                     _LOG.error("job %s: the Job API rejected the execution token", row["job_id"])
                 else:
                     remote["last_error"] = _truncate(str(pod["error"].get("message")))
+                if remote["degraded"] and not was_degraded:
+                    note(row, f"Job API degraded: {remote['last_error']}")
             return True
         return self.store.mutate(job_id, apply)
 
@@ -781,6 +797,7 @@ class JobManager:
             if warning:
                 row["warnings"].append(warning)
             row["updated_at"] = _now()
+            note(row, f"pod delete: {outcome}" + (f" ({warning})" if warning else ""))
             return True
         return self.store.mutate(job_id, apply)
 
@@ -809,6 +826,8 @@ class JobManager:
                     current["cleanup_pending"] = 1
             current["cleanup"] = cleanup
             current["updated_at"] = now
+            note(current, f"pod delete attempt {attempts}: {cleanup['pod_delete']}"
+                          + (f" ({cleanup['last_error']})" if not deleted["ok"] else ""))
             return True
         return self.store.mutate(row["job_id"], apply)
 
@@ -941,7 +960,7 @@ class JobManager:
         rows = self.store.select(states=("succeeded",), kind="stitch", plan_id=plan_id, limit=1)
         return rows[0] if rows else None
 
-    def view(self, row, *, include_result: bool = True) -> dict:
+    def view(self, row, *, include_result: bool = True, include_events: bool = False) -> dict:
         terminal = row["state"] in TERMINAL_STATES
         now = _now()
         end = row["finished_at"] if terminal and row["finished_at"] else now
@@ -971,6 +990,9 @@ class JobManager:
             view["cancel_url"] = f"/jobs/{row['job_id']}/cancel"
         if include_result:
             view["result"] = row["result"] if terminal else None
+        if include_events:
+            view["events"] = [{**event, "at": iso(event["at"])}
+                              for event in self.store.events(row["job_id"])]
         return view
 
     # ---- startup and retention ----------------------------------------------------------
@@ -1057,20 +1079,24 @@ def _clean_request(request: dict) -> dict:
             if k not in ("async", "token", "authorization") and "token" not in k.lower()}
 
 
-def _active(**fields):
+def _active(_note=None, **fields):
     def apply(row):
         if row["state"] not in ACTIVE_STATES:
             return False
         row.update(fields)
         row["updated_at"] = _now()
+        if _note:
+            note(row, _note)
         return True
     return apply
 
 
-def _fact(**fields):
+def _fact(_note=None, **fields):
     def apply(row):
         row.update(fields)
         row["updated_at"] = _now()
+        if _note:
+            note(row, _note)
         return True
     return apply
 

@@ -209,7 +209,7 @@ python -m venv .venv
 - 两个接口均可选传 `swimlane`、`binary_name`。多 swimlane/binary 时返回候选列表，须指定后重试；无法唯一匹配多个 stitch 配置时返回 HTTP 409 和配置候选，不自动猜测。
 - 查询和实际拼接默认同步。`"async":true` 时返回 HTTP 202（响应头带 `Location` 和 `Retry-After`）以及任务信息：`job_id`、`status_url`、`cancel_url`、`state`、`stage`、`terminal`、`poll_after_seconds`、`instance_id`。同步调用同样会创建任务，任务 ID 在响应头 `X-Job-Id` 中，成功时也在 `data.task_job_id`，失败时在 `detail.job_id`。拼接 `dry_run` 始终直接返回，不创建任务。
 - 可选字段 `client_request_id`（1–128 个 `[A-Za-z0-9_.:-]` 字符）用于幂等提交：同一请求用同一个值重发时返回已有任务（HTTP 200），不会再拼接一次；同一个值用在不同请求上返回 HTTP 409 `IDEMPOTENCY_CONFLICT`。每个新的逻辑请求生成一个新值，只在重试时复用。
-- `GET /jobs/{job_id}` 对存在的任务一律返回 HTTP 200。`data.terminal` 为 true 时停止轮询；`data.state` 取值为 `running`、`succeeded`、`failed`、`cancelled`（另保留 `queued`）。`data.stage` 仅用于展示（`resolving`、`submitting`、`submit_unknown`、`pending`、`running`、`finalizing`、`done`；远程任务只能看到 pod 级状态）。任务结束后 `data.result` 为完整的统一结果，`data.result_source` 说明结果来源（`callback`、`result_json`、`inferred`、`server`）。远程任务运行中，每次查询都会实时查一次 pod（同一任务 5 秒内最多一次）。两次轮询之间等待 `poll_after_seconds`。
+- `GET /jobs/{job_id}` 对存在的任务一律返回 HTTP 200。`data.terminal` 为 true 时停止轮询；`data.state` 取值为 `running`、`succeeded`、`failed`、`cancelled`（另保留 `queued`）。`data.stage` 仅用于展示（`resolving`、`submitting`、`submit_unknown`、`pending`、`running`、`finalizing`、`done`；远程任务只能看到 pod 级状态）。任务结束后 `data.result` 为完整的统一结果，`data.result_source` 说明结果来源（`callback`、`result_json`、`inferred`、`server`）。远程任务运行中，每次查询都会实时查一次 pod（同一任务 5 秒内最多一次）。两次轮询之间等待 `poll_after_seconds`。加上 `?events=true` 时还会返回 `data.events`，即该任务的事件日志（状态变化、回调、Job API 异常、删除 pod 等）。
 - server 模式下任务保存在 `<cache>/jobs.db`，结束后保留 `IFWI_MCP_JOB_RETENTION_HOURS`（7 天）；HTTP 404 `JOB_NOT_FOUND` 表示任务从未存在或已超过保留期。同时运行的任务最多 `IFWI_MCP_MAX_ACTIVE_JOBS`（64）个，超过时返回 HTTP 503 `JOB_QUEUE_FULL` 并带 `Retry-After`。
 - `GET /jobs?state=running,failed&kind=stitch&plan_id=...&limit=20&before=<created_at>` 按创建时间倒序列出任务（不含 `result`），用 `data.next_before` 翻页。
 - `POST /jobs/{job_id}/cancel` 立即把未结束的任务置为 `cancelled` 并删除其 pod（见 `data.cleanup.pod_delete`）。已结束的任务返回 HTTP 409 `JOB_ALREADY_FINISHED`；已经开始运行的本地拼接无法中断，返回 HTTP 409 `JOB_NOT_CANCELLABLE`。
@@ -309,7 +309,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `prepare.py` | 查找 → 下载 → 解压，覆盖 IFWI / ingredient / stitch 工具 | 编排上面几层 |
 | `plan.py` | 已确认的答案 → 校验过的 plan + 渲染出的命令行 | 不联网，不起子进程 |
 | `executor.py` | 准备环境、本地执行 plan，以及远程执行的基本操作（创建/查询/删除 pod、读取 `result.json`、构造 wrapper spec） | 读取执行开关 |
-| `job_store.py` | 任务记录：`SqliteJobStore`（server 模式）和 `MemoryJobStore`（stdio），带条件的写 | 只用 SQLite |
+| `job_store.py` | 任务记录及其事件日志：`SqliteJobStore`（server 模式）和 `MemoryJobStore`（stdio），带条件的写 | 只用 SQLite |
 | `jobs.py` | `JobManager`：提交、回调、查询时刷新、收尾判定、取消、重启恢复、保留期清理 | 没有后台轮询线程 |
 | `http_api.py` | 带鉴权的 REST 接口（`/query`、`/stitching`、`/jobs`）和 pod 回调接口 | 与 FastMCP `/mcp` 挂在同一个应用上 |
 | `deliverables.py` | 把结果与产物收集到同一目录并生成清单 | 纯 I/O + 下载 |
@@ -484,7 +484,7 @@ pod 镜像提供 `IFWI_ARTIFACTORY_TOKEN`（以及可选的 `IFWI_FIVPORTAL_TOKE
 | `stitch_prepare_environment` | `(plan_id)` | 只准备环境（下载并解压），不执行。 |
 | `stitch_execute_plan` | `(plan_id)` | 准备环境 → 本地或远程执行 → 收集产物；阻塞到运行结束。建议改用 `stitch_submit_plan`。 |
 | `stitch_submit_plan` | `(plan_id, client_request_id=None)` | 开始执行并立即返回 `job_id`（内容与 `GET /jobs/{id}` 相同）。 |
-| `stitch_get_job` | `(job_id)` | 查询任务状态；远程任务运行中会实时查询 pod。按 `poll_after_seconds` 轮询，直到 `terminal` 为 true。 |
+| `stitch_get_job` | `(job_id, include_events=False)` | 查询任务状态；远程任务运行中会实时查询 pod。按 `poll_after_seconds` 轮询，直到 `terminal` 为 true。`include_events=True` 时附带事件日志。 |
 | `stitch_cancel_job` | `(job_id)` | 取消未结束的任务（会删除其 pod）。 |
 | `stitch_list_jobs` | `(state=None, limit=20)` | 按时间倒序列出最近的任务。 |
 | `stitch_get_deliverables` | `(plan_id)` | stdio 模式：重新读取本地产物清单。server 模式：返回该 plan 最近一次成功任务的产物链接。 |

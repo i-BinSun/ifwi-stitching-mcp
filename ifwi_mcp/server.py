@@ -379,18 +379,20 @@ def stitch_submit_plan(plan_id: str, client_request_id: Optional[str] = None) ->
 
 
 @_guard
-def stitch_get_job(job_id: str) -> dict:
+def stitch_get_job(job_id: str, include_events: bool = False) -> dict:
     """Status of a job: state, stage, terminal, poll_after_seconds and, once terminal, result.
 
     While a remote job runs this checks the pod live. Stop polling when terminal is true.
     If the job failed, do not submit it again without the user's confirmation. On
     REMOTE_SUBMIT_UNKNOWN, warn the user that a pod may still be running.
+    include_events=True adds the job's event log (state changes, callbacks, Job API
+    trouble, pod deletion) to explain how it got where it is.
     """
     manager = jobs.get_manager()
     row = manager.get(job_id)
     if row is None:
         return jobs.not_found(job_id)
-    return ok(manager.view(row))
+    return ok(manager.view(row, include_events=include_events))
 
 
 @_guard
