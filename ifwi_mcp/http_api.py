@@ -1,47 +1,59 @@
-"""Authenticated REST facade mounted beside FastMCP's /mcp route."""
+"""Authenticated REST facade mounted beside FastMCP's /mcp route.
+
+Tracked requests (async /query, every real /stitching) are jobs in jobs.JobManager; their
+state survives a restart in server mode. /internal/jobs/{id}/result is the stitch pod's
+one-shot callback and authenticates with the per-job report token, not serve.token.
+"""
 import asyncio
 import hmac
 import logging
-import threading
-import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from starlette.responses import JSONResponse
 
-from . import config, interfaces
-from .result import ErrorCode, err
+from . import config, interfaces, jobs
+from .result import ErrorCode, err, ok
 
 _LOG = logging.getLogger(__name__)
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ifwi-api")
-_JOBS = {}
-_LOCK = threading.Lock()
-_TTL = 3600
-_MAX_JOBS = 256
-# New on every process start; helps distinguish a restarted server from a lost job.
-_INSTANCE_ID = uuid.uuid4().hex
+# Kept for diagnostics: lets a client tell a restarted server from a lost job.
+_INSTANCE_ID = jobs.INSTANCE_ID
+_CALLBACK_MAX_BYTES = 1024 * 1024
+_LIST_MAX = 100
+
+_STATUS = {
+    ErrorCode.INVALID_ARGUMENT: 400, ErrorCode.PLAN_INVALID: 400,
+    ErrorCode.MULTIPLE_SWIMLANES: 409, ErrorCode.IFWI_BINARY_AMBIGUOUS: 409,
+    ErrorCode.CONFIG_AMBIGUOUS: 409, ErrorCode.IDEMPOTENCY_CONFLICT: 409,
+    ErrorCode.JOB_CANCELLED: 409, ErrorCode.JOB_ALREADY_FINISHED: 409,
+    ErrorCode.JOB_NOT_CANCELLABLE: 409, ErrorCode.JOB_NOT_FOUND: 404,
+    ErrorCode.JOB_QUEUE_FULL: 503, ErrorCode.JOB_INTERRUPTED: 503,
+    ErrorCode.REMOTE_SCHEDULE_TIMEOUT: 504, ErrorCode.REMOTE_TIMEOUT: 504,
+    ErrorCode.WRAPPER_SPEC_INVALID: 500, ErrorCode.INTERNAL_ERROR: 500,
+}
 
 
 def _status(result: dict) -> int:
     if result["ok"]:
         return 200
-    code = result["error_code"]
-    if code in (ErrorCode.INVALID_ARGUMENT, ErrorCode.PLAN_INVALID):
-        return 400
-    if code in (ErrorCode.MULTIPLE_SWIMLANES, ErrorCode.IFWI_BINARY_AMBIGUOUS,
-                ErrorCode.CONFIG_AMBIGUOUS):
-        return 409
-    return 502 if code != ErrorCode.INTERNAL_ERROR else 500
+    return _STATUS.get(result["error_code"], 502)
 
 
-def _response(result: dict) -> JSONResponse:
-    return JSONResponse(result, status_code=_status(result))
+def _response(result: dict, headers=None) -> JSONResponse:
+    status = _status(result)
+    if status == 503 and headers is None:
+        headers = {"Retry-After": "30"}
+    return JSONResponse(result, status_code=status, headers=headers)
 
 
 def _authorized(request) -> bool:
     header = request.headers.get("Authorization", "")
     token = config.get_serve_token()
     return bool(token) and hmac.compare_digest(header, "Bearer " + token)
+
+
+def _unauthorized() -> JSONResponse:
+    return JSONResponse(err(ErrorCode.AUTH_FAILED, "bearer token required"), status_code=401)
 
 
 def _run(operation, payload):
@@ -52,80 +64,164 @@ def _run(operation, payload):
         return err(ErrorCode.INTERNAL_ERROR, "operation failed unexpectedly")
 
 
-def _complete(job_id, operation, payload):
-    result = _run(operation, payload)
-    with _LOCK:
-        _JOBS[job_id] = {"state": "succeeded" if result["ok"] else "failed",
-                         "result": result, "updated": time.monotonic()}
+async def _in_pool(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_POOL, fn, *args)
 
 
-async def _post(request, operation, *, direct_dry_run=False):
-    if not _authorized(request):
-        return JSONResponse(err(ErrorCode.AUTH_FAILED, "bearer token required"), status_code=401)
+def _job_headers(view: dict) -> dict:
+    headers = {"Location": view["status_url"], "X-Job-Id": view["job_id"]}
+    if view["poll_after_seconds"]:
+        headers["Retry-After"] = str(view["poll_after_seconds"])
+    return headers
+
+
+def _submitted(status, job) -> JSONResponse:
+    if status == "error":
+        return _response(job)
+    view = jobs.get_manager().view(job, include_result=status == "existing")
+    return JSONResponse(ok(view), status_code=202 if status == "created" else 200,
+                        headers=_job_headers(view))
+
+
+async def _payload(request):
     try:
         payload = await request.json()
     except ValueError:
-        return _response(err(ErrorCode.INVALID_ARGUMENT, "request body must be valid JSON"))
+        return None, _response(err(ErrorCode.INVALID_ARGUMENT, "request body must be valid JSON"))
     if not isinstance(payload, dict) or type(payload.get("async", False)) is not bool:
-        return _response(err(ErrorCode.INVALID_ARGUMENT, "payload must be an object with optional boolean async"))
-    # A stitch preview is a final response, never a queued job. Preserve the
-    # normal async behavior for queries and real stitching requests.
-    if payload.get("async") and not (direct_dry_run and payload.get("dry_run") is True):
-        with _LOCK:
-            now = time.monotonic()
-            for key, job in list(_JOBS.items()):
-                if job["state"] != "running" and now - job["updated"] > _TTL:
-                    del _JOBS[key]
-            if len(_JOBS) >= _MAX_JOBS:
-                return JSONResponse(err(ErrorCode.INTERNAL_ERROR, "job queue is full"), status_code=503)
-            job_id = uuid.uuid4().hex
-            _JOBS[job_id] = {"state": "running", "result": None, "updated": now}
-        try:
-            # One thread per job: long stitches must never queue behind each other.
-            threading.Thread(target=_complete, args=(job_id, operation, payload),
-                             name=f"ifwi-job-{job_id[:8]}", daemon=True).start()
-        except RuntimeError:
-            with _LOCK:
-                del _JOBS[job_id]
-            return JSONResponse(err(ErrorCode.INTERNAL_ERROR, "job queue is unavailable"), status_code=503)
-        return JSONResponse({"ok": True, "data": {"job_id": job_id, "state": "running",
-                               "status_url": f"/jobs/{job_id}",
-                               "instance_id": _INSTANCE_ID}}, status_code=202)
-    result = await asyncio.get_running_loop().run_in_executor(_POOL, _run, operation, payload)
-    return _response(result)
+        return None, _response(err(ErrorCode.INVALID_ARGUMENT,
+                                   "payload must be an object with optional boolean async"))
+    bad = jobs.check_client_request_id(payload.get("client_request_id"))
+    if bad:
+        return None, _response(bad)
+    return payload, None
 
 
 async def query(request):
-    return await _post(request, interfaces.query)
+    if not _authorized(request):
+        return _unauthorized()
+    payload, problem = await _payload(request)
+    if problem:
+        return problem
+    if not payload.get("async"):
+        return _response(await _in_pool(_run, interfaces.query, payload))
+    manager = jobs.get_manager()
+    status, job = manager.submit_query(payload, payload.get("client_request_id"))
+    return _submitted(status, job)
+
+
+def _wait_sync(job_id):
+    return jobs.get_manager().wait(job_id)
 
 
 async def stitching(request):
-    return await _post(request, interfaces.stitching, direct_dry_run=True)
+    if not _authorized(request):
+        return _unauthorized()
+    payload, problem = await _payload(request)
+    if problem:
+        return problem
+    # A stitch preview is a final response, never a job.
+    if payload.get("dry_run") is True:
+        return _response(await _in_pool(_run, interfaces.stitching, payload))
+    manager = jobs.get_manager()
+    status, job = manager.submit_stitching(payload, payload.get("client_request_id"))
+    if status == "error" or payload.get("async"):
+        return _submitted(status, job)
+    row = await _in_pool(_wait_sync, job["job_id"])
+    result = manager.sync_result(row)
+    return _response(result, headers={"Location": f"/jobs/{job['job_id']}",
+                                      "X-Job-Id": job["job_id"]})
+
+
+def _refreshed_view(job_id):
+    manager = jobs.get_manager()
+    row = manager.get(job_id)
+    return manager.view(row) if row is not None else None
 
 
 async def job_status(request):
     if not _authorized(request):
-        return JSONResponse(err(ErrorCode.AUTH_FAILED, "bearer token required"), status_code=401)
+        return _unauthorized()
     job_id = request.path_params["job_id"]
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        if job and job["state"] != "running" and time.monotonic() - job["updated"] > _TTL:
-            del _JOBS[job_id]
-            job = None
-        snapshot = dict(job) if job else None
-    if snapshot is None:
-        return JSONResponse(err(ErrorCode.JOB_NOT_FOUND,
-                                "job not found; job status is process-local and is lost after a server restart or when requests reach another instance",
-                                {"instance_id": _INSTANCE_ID}), status_code=404)
-    return JSONResponse({"ok": True, "data": {"job_id": job_id, "state": snapshot["state"],
-                                              "result": snapshot["result"],
-                                              "instance_id": _INSTANCE_ID}})
+    manager = jobs.get_manager()
+    pool, slots = manager.refresh_pool()
+    if slots.acquire(blocking=False):
+        try:
+            view = await asyncio.get_running_loop().run_in_executor(pool, _refreshed_view, job_id)
+        finally:
+            slots.release()
+    else:
+        # Every refresh thread is busy (slow Job API): answer from the stored record.
+        row = manager.get(job_id, refresh=False)
+        view = manager.view(row) if row is not None else None
+    if view is None:
+        return JSONResponse(jobs.not_found(job_id), status_code=404)
+    headers = {"Retry-After": str(view["poll_after_seconds"])} if not view["terminal"] else None
+    return JSONResponse(ok(view), headers=headers)
+
+
+async def list_jobs(request):
+    if not _authorized(request):
+        return _unauthorized()
+    params = request.query_params
+    states = tuple(s for s in (params.get("state") or "").split(",") if s) or None
+    try:
+        limit = int(params.get("limit") or 20)
+        before = float(params["before"]) if params.get("before") else None
+    except ValueError:
+        return _response(err(ErrorCode.INVALID_ARGUMENT, "limit and before must be numbers",
+                             {"param": "limit/before"}))
+    if not 1 <= limit <= _LIST_MAX:
+        return _response(err(ErrorCode.INVALID_ARGUMENT, f"limit must be between 1 and {_LIST_MAX}",
+                             {"param": "limit"}))
+    manager = jobs.get_manager()
+    pool, _ = manager.refresh_pool()
+    items = await asyncio.get_running_loop().run_in_executor(
+        pool, lambda: manager.list_jobs(states=states, kind=params.get("kind"),
+                                        plan_id=params.get("plan_id"), limit=limit, before=before))
+    next_before = None
+    if len(items) == limit:
+        last = manager.get(items[-1]["job_id"], refresh=False)
+        next_before = last["created_at"] if last else None
+    return JSONResponse(ok({"jobs": items, "count": len(items), "next_before": next_before}))
+
+
+async def cancel_job(request):
+    if not _authorized(request):
+        return _unauthorized()
+    job_id = request.path_params["job_id"]
+    manager = jobs.get_manager()
+    pool, _ = manager.refresh_pool()
+    status, body = await asyncio.get_running_loop().run_in_executor(pool, manager.cancel, job_id)
+    return JSONResponse(body, status_code=status)
+
+
+async def job_callback(request):
+    """The stitch pod's one result callback; never accepts serve.token."""
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > _CALLBACK_MAX_BYTES:
+        return JSONResponse(err(ErrorCode.INVALID_ARGUMENT, "callback body too large"), status_code=413)
+    body = await request.body()
+    if len(body) > _CALLBACK_MAX_BYTES:
+        return JSONResponse(err(ErrorCode.INVALID_ARGUMENT, "callback body too large"), status_code=413)
+    manager = jobs.get_manager()
+    try:
+        status, result = await _in_pool(manager.handle_callback, request.path_params["job_id"],
+                                        request.headers.get("Authorization", ""), body)
+    except Exception:  # noqa: BLE001 - e.g. the database is locked: the wrapper retries 5xx
+        _LOG.exception("callback handling failed")
+        return JSONResponse(err(ErrorCode.INTERNAL_ERROR, "callback could not be recorded"),
+                            status_code=503)
+    return JSONResponse(result, status_code=status)
 
 
 def create_app(mcp):
-    """Build the single ASGI app hosting MCP and the three authenticated REST routes."""
+    """Build the single ASGI app hosting MCP and the REST routes."""
     app = mcp.http_app()
     app.add_route("/query", query, methods=["POST"])
     app.add_route("/stitching", stitching, methods=["POST"])
+    app.add_route("/jobs", list_jobs, methods=["GET"])
     app.add_route("/jobs/{job_id}", job_status, methods=["GET"])
+    app.add_route("/jobs/{job_id}/cancel", cancel_job, methods=["POST"])
+    app.add_route("/internal/jobs/{job_id}/result", job_callback, methods=["POST"])
     return app

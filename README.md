@@ -132,8 +132,9 @@ IFWI_MCP_SERVER_HOST=127.0.0.1
 IFWI_MCP_SERVER_PORT=8000
 IFWI_MCP_SERVER_TOKEN=<strong-random-token>
 IFWI_MCP_EXEC_MODE=remote
-IFWI_MCP_EXEC_ENDPOINT=http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job
+IFWI_MCP_EXEC_ENDPOINT=http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job
 IFWI_MCP_ARTIFACTORY_REPO=https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch
+IFWI_MCP_REPORT_BASE_URL=https://your-host.example   # where stitch pods call back
 python -m ifwi_mcp.server
 ```
 
@@ -174,13 +175,17 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 ```
 
 The runtime env file must define `IFWI_MCP_SERVER_TOKEN` (a strong random value),
-`IFWI_MCP_EXEC_ENDPOINT` (the FIV Job API URL) and `IFWI_MCP_ARTIFACTORY_REPO`
+`IFWI_MCP_EXEC_ENDPOINT` (the Linux FIV Job API URL) and `IFWI_MCP_ARTIFACTORY_REPO`
 (where stitch pods publish their results), plus `FIV_TOKEN`
-for queries and `ARTIFACTORY_TOKEN` for artifact downloads. The image sets
+for queries and `ARTIFACTORY_TOKEN` for artifact downloads. Set `IFWI_MCP_REPORT_BASE_URL`
+to an address the stitch pods can reach (normally the HTTPS reverse proxy) and let the proxy
+forward `/internal/jobs/*/result`: each pod calls that route once with its result. The image sets
 `IFWI_MCP_SERVER_MODE=server`, `IFWI_MCP_SERVER_HOST=0.0.0.0`,
 `IFWI_MCP_EXEC_MODE=remote` and `IFWI_MCP_CACHE_DIR=/data/cache`. The named volume
-persists plans, cached files and deliverables; asynchronous job *status* is still
-in-memory and lost on restart. Run a single server process for reliable polling.
+persists plans, cached files, deliverables **and job records** (`/data/cache/jobs.db`), so
+`GET /jobs/{id}` keeps working across restarts and image rebuilds. **Do not use
+`docker compose down -v` (or `docker volume rm`) for routine redeployments** — it deletes the
+job database. Run a single server process (SQLite allows one writer process).
 `fiv_project_id` belongs in each stitch request, not the env file.
 
 The example publishes to host loopback only. For external clients, front it with an
@@ -227,8 +232,9 @@ python -m venv .venv
   after the cache root); use a short `IFWI_MCP_CACHE_DIR` or enable Windows long paths.
 - The low-level `run_stitch` MCP tool stays disabled in server mode; use `stitch_execute_plan` or
   `POST /stitching`.
-- Keep the loopback bind and publish through an HTTPS reverse proxy. Run one server process; job
-  status is in memory, so a restart loses the status of jobs that were still running.
+- Keep the loopback bind and publish through an HTTPS reverse proxy. Run one server process. Job
+  records survive a restart (`<cache>/jobs.db`), but a local run cannot be resumed: a job that was
+  running when the server stopped ends as `JOB_INTERRUPTED`.
 
 `IFWI_MCP_EXEC_MODE` is separate from the serve mode. Both stdio and server mode support
 local or remote execution; remote needs `IFWI_MCP_EXEC_ENDPOINT`, and server mode with local
@@ -273,7 +279,31 @@ exposes independent authenticated REST JSON interfaces:
   swimlanes or binaries match, choose one from the returned candidates. For
   stitching, multiple stitch configs without a unique match also return HTTP 409
   with config candidates; no config is guessed.
-- Query and real stitching default to synchronous JSON results. Set `"async": true` to get HTTP 202 with `data.job_id`, `data.status_url`, and `data.instance_id`; `GET /jobs/{job_id}` returns `data.state` (`running`, `succeeded`, `failed`), `data.instance_id`, and the complete unified `data.result` when done. Stitching dry runs always return directly. Jobs are process-local, limited to 256 and retained for one hour after completion; a process restart or polling another instance loses job status (`JOB_NOT_FOUND`, HTTP 404, with the current `detail.instance_id` to compare against the submitted instance). Saved plans and run directories do not restore job IDs. Failed operations still return their detailed error under `data.result`.
+- Query and real stitching default to synchronous JSON results. Set `"async": true` to get HTTP 202
+  (headers `Location` and `Retry-After`) with the job: `data.job_id`, `status_url`, `cancel_url`,
+  `state`, `stage`, `terminal`, `poll_after_seconds` and `instance_id`. A synchronous call is a job
+  too: its id is in the `X-Job-Id` header and in `data.task_job_id` (success) or `detail.job_id`
+  (failure). Stitching dry runs always return directly and create no job.
+- Optional `client_request_id` (1–128 characters of `[A-Za-z0-9_.:-]`) makes a submission
+  idempotent: resending the same request with the same id returns the existing job (HTTP 200)
+  instead of starting another stitch; reusing the id for a different request is HTTP 409
+  `IDEMPOTENCY_CONFLICT`. Generate a fresh id per logical request and reuse it only on retries.
+- `GET /jobs/{job_id}` always answers HTTP 200 for a known job. Stop polling when `data.terminal`
+  is true; `data.state` is `running`, `succeeded`, `failed` or `cancelled` (`queued` is reserved).
+  `data.stage` is informational (`resolving`, `submitting`, `submit_unknown`, `pending`, `running`,
+  `finalizing`, `done`; remote runs only expose the pod's state). `data.result` holds the unified
+  envelope once terminal, and `data.result_source` says where it came from (`callback`,
+  `result_json`, `inferred` or `server`). While a remote job runs, each query checks the pod live
+  (at most every 5 s per job). Wait `poll_after_seconds` between polls.
+- In server mode jobs are stored in `<cache>/jobs.db` and kept for `IFWI_MCP_JOB_RETENTION_HOURS`
+  (7 days) after they finish; HTTP 404 `JOB_NOT_FOUND` means the job never existed or is past
+  retention. At most `IFWI_MCP_MAX_ACTIVE_JOBS` (64) jobs run at once; beyond that a submission
+  gets HTTP 503 `JOB_QUEUE_FULL` with `Retry-After`.
+- `GET /jobs?state=running,failed&kind=stitch&plan_id=...&limit=20&before=<created_at>` lists jobs
+  (newest first, without `result`); `data.next_before` pages further.
+- `POST /jobs/{job_id}/cancel` ends an unfinished job at once as `cancelled` and deletes its pod
+  (`data.cleanup.pod_delete`). A finished job answers HTTP 409 `JOB_ALREADY_FINISHED`; a local
+  stitch that is already running cannot be interrupted (HTTP 409 `JOB_NOT_CANCELLABLE`).
 
 Example JSON bodies (one request per example; omit optional fields when not needed):
 
@@ -358,9 +388,11 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 | `stitch_runner.py` | extract archive + build venv + render and run `cli.py` / `muppet.py` | the **only** module using subprocess / venv |
 | `prepare.py` | find → download → extract, for IFWI / ingredient / stitch tool | orchestration of the layers above |
 | `plan.py` | confirmed answers → validated plan + rendered command line | no network, no subprocess |
-| `executor.py` | prepare the environment, then run the plan locally or on a remote runner | reads the execution switch |
+| `executor.py` | prepare the environment, run the plan locally, and the remote primitives (create/poll/delete the pod, read `result.json`, build the wrapper spec) | reads the execution switch |
+| `job_store.py` | job records: `SqliteJobStore` (server mode) and `MemoryJobStore` (stdio), conditional writes | SQLite only |
+| `jobs.py` | `JobManager`: submit, callback, refresh-on-query, finalize, cancel, restart recovery, retention | no background polling thread |
 | `interfaces.py` | validate Query and Stitching REST payloads and call existing workflow | request-level project ID for remote dispatch |
-| `http_api.py` | authenticated REST routes and in-process asynchronous jobs | mounted alongside FastMCP `/mcp` |
+| `http_api.py` | authenticated REST routes (`/query`, `/stitching`, `/jobs`) and the pod callback route | mounted alongside FastMCP `/mcp` |
 | `deliverables.py` | collect results + artifacts into one dir with a manifest | pure I/O + downloads |
 | `cli.py` | standalone CLI (`ifwi-cli`) with subcommands for all MCP capabilities | CLI entry point |
 | `server.py` | FastMCP app: registers tools as thin pass-through wrappers | orchestration only |
@@ -372,17 +404,18 @@ Focused, single-responsibility modules sit behind a thin FastMCP tool layer.
 A JSON config file holds the **execution switch** and optional `serve` settings. It lives at `IFWI_MCP_CONFIG`, or next to the cache dir
 (`~/.ifwi-stitching-mcp/config.json`) by default. A missing file means "all defaults", i.e. local execution.
 
-`execution.mode = "remote"` creates a Windows pod through the FIV Job API (the same API
-`AUTO_INTEGRATION_SERVICE` uses, but without its database). The pod clones this repo and runs
-`python -m ifwi_mcp.worker`, reusing the exact local-execution codepath, and reports back only through
-Artifactory. See [Remote runner contract](#remote-runner-contract) below.
+`execution.mode = "remote"` creates a Linux pod through the FIV Job API. The pod runs the image's
+`/app/stitch_wrapper.py`, which installs this repo, runs `python -m ifwi_mcp.worker` (the exact
+local-execution codepath) and calls the server back once with the result; `result.json` on
+Artifactory is the fallback channel. See [Remote runner contract](#remote-runner-contract) below.
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
+    "endpoint": "http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
     "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
+    "report_base_url": "https://ifwi-mcp.example.intel.com",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
   },
@@ -398,21 +431,31 @@ Artifactory. See [Remote runner contract](#remote-runner-contract) below.
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `execution.mode` | `local` | `local` runs the stitch command as a subprocess here, in a private per-run copy of the tool and inputs; `remote` runs it in a pod created through the Job API. |
-| `execution.endpoint` | — | **Required when `mode` is `remote`.** Job API URL (`.../v1/fivportal/job`). |
+| `execution.endpoint` | — | **Required when `mode` is `remote`.** Linux Job API URL (`http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job`). |
 | `execution.artifactory_repo` | — | **Required when `mode` is `remote`, or `local` in server mode.** Each run publishes under `<artifactory_repo>/<plan_id>-<random>/`. |
-| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod image; must provide `git`, `python` and the Artifactory token env var. |
-| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | Repo the pod clones to get `ifwi_mcp.worker`. |
-| `execution.repo_ref` | `main` | Branch or tag the pod checks out. |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0` | Linux pod image; must ship `/app/stitch_wrapper.py` (v1.1.0 or later — startup rejects older `vX.Y.Z` tags) and the Artifactory token. |
+| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | Repo the wrapper installs `ifwi_mcp.worker` from. |
+| `execution.repo_ref` | `main` | Branch, tag or 40-hex commit the wrapper checks out (pin a commit in production). |
+| `execution.wrapper_path` | `/app/stitch_wrapper.py` | Wrapper path inside the image. |
+| `execution.report_base_url` | — | Server mode: address the pods can reach; each pod POSTs its result to `<report_base_url>/internal/jobs/<job_id>/result`. Unset → no callback; jobs end when queried (Job API + `result.json`). |
 | `execution.token` | — | Optional Bearer token sent to the Job API (it takes none today). |
-| `execution.timeout_seconds` | `3600` | Kills a local run; for remote it is the pod's `activedeadlineseconds` and the polling limit (covers clone, pip install and stitch). |
-| `execution.poll_interval_seconds` | `5` | How often the pod's job status is polled. |
+| `execution.timeout_seconds` | `3600` | Kills a local run; for remote it is the pod's `activedeadlineseconds` and the wrapper's budget. Must exceed 465 s in remote mode. |
+| `execution.poll_interval_seconds` | `5` | Synchronous waits (`async: false`, `stitch_execute_plan`) re-check the job this often; there is no background polling. |
+| `execution.pending_timeout_seconds` | `900` | A pod the Job API still reports as pending after this long fails with `REMOTE_SCHEDULE_TIMEOUT` (must be below `timeout_seconds`). |
+| `execution.finalize_grace_seconds` | `120` | After a pod ends without a callback, how long to wait for a late callback or `result.json`. |
+| `execution.refresh_min_interval_seconds` | `5` | Minimum gap between two Job API checks of one job. |
+| `execution.refresh_workers` | `16` | Threads for query-time refreshes, separate from the synchronous-request pool. |
+| `execution.max_inline_spec_bytes` | `4096` | Larger wrapper specs are uploaded to `<run>/spec.json` and passed with `--spec-url`. |
+| `execution.max_active_jobs` | `64` | Active-job limit (`JOB_QUEUE_FULL` beyond it). |
+| `execution.job_retention_hours` | `168` | How long finished job records are kept. |
 | `execution.run_retention_hours` | `0` | Server mode with local execution: hours to keep each finished `work/<run_id>/` for debugging; `0` deletes it right after upload. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
 | `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
 
 `IFWI_MCP_EXEC_MODE`, `IFWI_MCP_EXEC_ENDPOINT`, `IFWI_MCP_EXEC_IMAGE`, `IFWI_MCP_EXEC_REPO`,
-`IFWI_MCP_EXEC_REF`, `IFWI_MCP_EXEC_TOKEN` and `IFWI_MCP_STITCH_FALLBACK_DEPS` (comma-separated) override the file. An invalid
-execution section fails startup, so a misconfigured remote endpoint is caught before any work is done.
+`IFWI_MCP_EXEC_REF`, `IFWI_MCP_EXEC_TOKEN`, the job settings listed below and `IFWI_MCP_STITCH_FALLBACK_DEPS`
+(comma-separated) override the file. An invalid execution section fails startup, so a misconfigured
+remote endpoint is caught before any work is done.
 
 #### Dependency install when the tool ships no `requirements.txt`
 
@@ -443,6 +486,16 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
+| `IFWI_MCP_REPORT_BASE_URL` | `execution.report_base_url` |
+| `IFWI_MCP_WRAPPER_PATH` | `execution.wrapper_path` |
+| `IFWI_MCP_EXEC_PENDING_TIMEOUT` | `execution.pending_timeout_seconds` |
+| `IFWI_MCP_EXEC_FINALIZE_GRACE` | `execution.finalize_grace_seconds` |
+| `IFWI_MCP_REFRESH_MIN_INTERVAL` | `execution.refresh_min_interval_seconds` |
+| `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
+| `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
+| `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
+| `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
+| `IFWI_MCP_JOBS_DB` | server-mode job database path (default `<cache>/jobs.db`; never on a network share) |
 | `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive` (`0`/`false`/`no`/`off` → off) |
 | `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps` (comma-separated) |
@@ -453,26 +506,37 @@ just the mode.
 
 #### Remote runner contract
 
-When `mode` is `remote`, the server talks to the FIV Job API directly — no `AUTO_INTEGRATION_SERVICE`
-task, no database. Artifactory is the only channel back from the pod:
+When `mode` is `remote`, the server talks to the Linux FIV Job API directly. The pod side is
+`stitch_wrapper.py` in the pod image (contract: cloud-dockerfile `docs/stitch_wrapper_contract.md`,
+protocol 1); the full design is `docs/superpowers/specs/2026-10-28-remote-execution-status-design.md`.
 
-1. `POST <endpoint>` with `{"image", "command", "os": "windows", "activedeadlineseconds",
-   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`. `command` clones
-   `execution.repo_url@repo_ref`, `pip install`s it and runs
-   `python -m ifwi_mcp.worker --plan-b64 <zlib+base64url plan> --upload-url <artifactory_repo>/<run_id>`.
-   No credential is ever placed on the command line.
-2. The worker runs `executor._execute_local`, uploads every deliverable to
-   `<run_id>/deliverables/<name>` and finally writes its `{"ok": ..., "data"|"detail": ...}` envelope to
-   `<run_id>/result.json` — on success, failure and crash alike. On failure the stitch log is still
-   uploaded and linked from `detail.deliverables`.
-3. The server polls `GET <endpoint>/<jobid>` until `Data.status` is `succeeded`/`failed`, reads
-   `result.json`, requires an uploaded `stitched_bin` on success, and downloads the deliverables into
-   the local deliverables dir. The result carries `job_id`, `artifactory_url`, `result_url`,
-   `stitched_bin_url` and `artifacts` (`[{"name", "url", "kind"}]`). A pod that ends without
-   `result.json` (clone/pip failure) is reported as `REMOTE_EXEC_FAILED` with its `job_id`.
+1. The job is recorded first: `run_id = <plan_id>-<8 hex>` and `run_url = <artifactory_repo>/<run_id>`
+   are stored before the pod exists, so a result can always be found under `run_url`.
+2. `POST <endpoint>` with `{"image", "command", "os": "linux", "activedeadlineseconds",
+   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`. `command` is
+   `python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>` (no `sh -c`,
+   so the wrapper is PID 1 and receives SIGTERM). The spec (`zlib+base64url` JSON, or
+   `--spec-url <run_url>/spec.json` when long) holds `run_id`, `run_url`, `report_url`, the worker repo,
+   `timeouts.budget_seconds` and `timeouts.deadline_epoch`, and the plan — never a credential. The
+   one-job report token is stored only as a sha256 hash. A create request that certainly never reached
+   the Job API is retried with the same `run_id`; an uncertain one is never retried (`submit_unknown`).
+3. The wrapper installs `repo_url@repo_ref`, runs `python -m ifwi_mcp.worker --plan-b64 ... --upload-url
+   <run_url>`, uploads `pod.log`, writes `result.json` if the worker did not, and POSTs the final
+   envelope once to `<report_base_url>/internal/jobs/<job_id>/result` (`Authorization: Bearer
+   <report token>`). The worker uploads every deliverable to `<run_url>/deliverables/<name>` and writes
+   its envelope (stamped with `schema_version`, `run_id`, `finished_at`) to `result.json`, to
+   `IFWI_STITCH_RESULT_FILE` and to stdout — on success, failure, crash and SIGTERM alike.
+4. The server ends the job on the callback. Without one, a status query checks the pod; once the
+   pod has ended (or is gone, or the deadline passed) the job enters `finalizing` and reads
+   `result.json`, inferring `REMOTE_RESULT_MISSING` / `REMOTE_TIMEOUT` only after
+   `finalize_grace_seconds`. An inferred failure is replaced if the real result shows up later.
+5. In server mode the result is links only: `stitched_bin` (`url`, `sha256`, `bytes`), `log_url`,
+   `artifacts`, `artifactory_url`, `result_url`, `pod_job_id`, `pod_log_url`, plus the v1 aliases
+   `job_id` (= `pod_job_id`), `stitched_bin_url`, `command_line`, `exit_code`, `environment`. In stdio
+   mode the deliverables are also downloaded into the local deliverables dir.
 
-The pod reads `ARTIFACTORY_TOKEN` (or `IFWI_ARTIFACTORY_TOKEN`) from its own environment, plus
-`FIV_TOKEN` (or `IFWI_FIVPORTAL_TOKEN`) only for plans whose sources are not pinned to URLs.
+The pod image provides `IFWI_ARTIFACTORY_TOKEN` (and optionally `IFWI_FIVPORTAL_TOKEN`, needed only
+for plans whose sources are not pinned to URLs); the wrapper passes them to the worker.
 
 ### Tools
 
@@ -506,8 +570,12 @@ All tools return the unified result shape described above.
 | `stitch_build_plan` | `(project, phase, ingredients, config_ini, version=None, swimlane=None, ifwi_binary=None, ifwi_path=None, ifwi_from_build_targets=False, stitch_version=None, stitch_path=None, soft_strap=None, fiv_project_id=None)` | Turn confirmed answers into a saved plan + command line; `ingredients` is a JSON-array string of `{"name": str, "version": str}` or `{"name": str, "path": str}`. Remote execution requires the caller to provide `fiv_project_id` when building the plan. |
 | `stitch_get_plan` / `stitch_list_plans` | `(plan_id)` / `()` | Re-read a saved plan, or list them. |
 | `stitch_prepare_environment` | `(plan_id)` | Fetch and unpack everything the plan needs, without running it. |
-| `stitch_execute_plan` | `(plan_id)` | Prepare, run (local or remote), and collect the deliverables. |
-| `stitch_get_deliverables` | `(plan_id)` | Re-read the deliverables manifest of a finished plan. |
+| `stitch_execute_plan` | `(plan_id)` | Prepare, run (local or remote), and collect the deliverables; blocks until the run ends. Prefer `stitch_submit_plan`. |
+| `stitch_submit_plan` | `(plan_id, client_request_id=None)` | Start a run and return at once with its `job_id` (same view as `GET /jobs/{id}`). |
+| `stitch_get_job` | `(job_id)` | Job status; checks a running remote pod live. Poll every `poll_after_seconds` until `terminal`. |
+| `stitch_cancel_job` | `(job_id)` | Cancel an unfinished job (deletes its pod). |
+| `stitch_list_jobs` | `(state=None, limit=20)` | Recent jobs, newest first. |
+| `stitch_get_deliverables` | `(plan_id)` | stdio: re-read the local deliverables manifest. Server mode: the links of the plan's latest succeeded job. |
 | `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | Generate or update a UP (Unified Patch) Muppet config ini file. |
 | `cache_cleanup` | `(max_age_days=14, categories=None, dry_run=True)` | Delete cached downloads, extractions, workspaces and deliverables older than N days. Defaults to a dry run. |
 
@@ -522,7 +590,13 @@ Every failure carries a stable `error_code`, one of:
 `IFWI_BINARY_AMBIGUOUS`, `OEM_REGION_NOT_FOUND`, `OEM_PARSE_FAILED`, `OEM_MATCH_AMBIGUOUS`,
 `OEM_MATCH_NONE`, `DOWNLOAD_FAILED`, `EXTRACT_FAILED`, `VENV_SETUP_FAILED`, `STITCH_RUN_FAILED`,
 `CONFIG_INVALID`, `PLAN_INVALID`, `PLAN_NOT_FOUND`, `ENV_PREPARE_FAILED`, `REMOTE_EXEC_FAILED`,
-`REMOTE_TIMEOUT`, `DELIVERABLE_MISSING`, `INTERNAL_ERROR`.
+`REMOTE_TIMEOUT`, `DELIVERABLE_MISSING`, `INTERNAL_ERROR`, and for jobs and remote runs
+`REMOTE_SUBMIT_FAILED`, `REMOTE_SUBMIT_UNKNOWN`, `REMOTE_SCHEDULE_TIMEOUT`, `REMOTE_TERMINATED`,
+`REMOTE_BOOTSTRAP_FAILED`, `REMOTE_WORKER_CRASHED`, `REMOTE_RESULT_MISSING`, `REMOTE_RESULT_INVALID`,
+`REMOTE_RESULT_UNREADABLE`, `WRAPPER_SPEC_INVALID`, `WRAPPER_INTERNAL_ERROR`, `JOB_NOT_FOUND`,
+`JOB_CANCELLED`, `JOB_INTERRUPTED`, `JOB_ALREADY_FINISHED`, `JOB_NOT_CANCELLABLE`, `JOB_QUEUE_FULL`,
+`IDEMPOTENCY_CONFLICT`. Job errors carry `detail.job_id`, `run_id`, `artifactory_url` (remote:
+`pod_job_id`, `pod_status`) and `detail.retryable`.
 
 ### Tool call sequences
 

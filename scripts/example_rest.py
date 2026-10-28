@@ -7,8 +7,8 @@ This client does not read server-side .env or deploy.env files. Then run:
     python scripts/example_rest.py query
     python scripts/example_rest.py stitching
 
-The stitching action submits a REAL stitching job and polls for its result.
-Deliverables come back as Artifactory links.
+The stitching action submits a REAL stitching job and polls it until `terminal` is true,
+waiting `poll_after_seconds` between polls. Deliverables come back as Artifactory links.
 """
 
 import argparse
@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import uuid
 
 import requests
 
@@ -61,14 +62,14 @@ def call(method, path, headers, *, base_url, payload=None, timeout=30, expected_
             current_instance = body.get("detail", {}).get("instance_id")
             if expected_instance and current_instance and current_instance != expected_instance:
                 raise RuntimeError(
-                    "Job was submitted to instance {} but {}{} is now served by instance {}. "
-                    "The server restarted or the request reached another process; the job's in-memory status "
-                    "cannot be recovered. Check existing plan/run artifacts before submitting another stitch."
+                    "Job was submitted to instance {} but {}{} is now served by instance {}, which "
+                    "does not know it. Check that both use the same job database (jobs.db on the /data "
+                    "volume) and inspect existing run artifacts before submitting another stitch."
                     .format(expected_instance, base_url, path, current_instance))
             raise RuntimeError(
                 "Job status unavailable at {}{} (submitted instance: {}; current instance: {}). "
-                "If these match, check whether the job expired; otherwise check for a restart or another "
-                "server process. Inspect existing plan/run artifacts before retrying."
+                "The job never existed or is past the retention period. Inspect existing run "
+                "artifacts before retrying."
                 .format(base_url, path, expected_instance or "unknown", current_instance or "unknown"))
         raise RuntimeError("Request failed; for HTTP 409, select a swimlane or binary_name from detail.candidates")
     return body["data"]
@@ -76,19 +77,20 @@ def call(method, path, headers, *, base_url, payload=None, timeout=30, expected_
 
 def wait_for_result(status_url, headers, *, base_url, expected_instance=None):
     """Poll a real stitch without blocking on one long POST."""
-    deadline = time.monotonic() + 3600
-    print("Job accepted. Polling {} (up to 1 hour)...".format(status_url), flush=True)
+    deadline = time.monotonic() + 2 * 3600
+    print("Job accepted. Polling {} ...".format(status_url), flush=True)
     while True:
         status = call("GET", status_url, headers, base_url=base_url,
-                  expected_instance=expected_instance)
-        if status["state"] == "succeeded":
-            return status["result"]["data"]
-        if status["state"] == "failed":
-            raise RuntimeError("Job failed: {}".format(
-                json.dumps(status["result"], ensure_ascii=False)))
+                      expected_instance=expected_instance)
+        # terminal is the stable end-of-job signal (state may also be "cancelled").
+        if status.get("terminal"):
+            if status["state"] == "succeeded":
+                return status["result"]["data"]
+            raise RuntimeError("Job {}: {}".format(
+                status["state"], json.dumps(status["result"], ensure_ascii=False)))
         if time.monotonic() >= deadline:
             raise RuntimeError("Job still running; check {} later with the same bearer token".format(status_url))
-        time.sleep(5)
+        time.sleep(status.get("poll_after_seconds") or 5)
 
 
 def main():
@@ -109,7 +111,9 @@ def main():
             call("POST", "/query", headers, base_url=base_url, payload=QUERY_PAYLOAD)
             return 0
 
-        payload = {**STITCH_PAYLOAD, "async": True}
+        # A fresh idempotency key per run: resending this same POST after a network
+        # error returns the job it already created instead of starting a second stitch.
+        payload = {**STITCH_PAYLOAD, "async": True, "client_request_id": uuid.uuid4().hex}
         job = call("POST", "/stitching", headers, base_url=base_url, payload=payload)
         result = wait_for_result(job["status_url"], headers, base_url=base_url,
                                  expected_instance=job.get("instance_id"))

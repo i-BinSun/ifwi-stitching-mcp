@@ -118,7 +118,8 @@ Windows 上。
 stdio 模式；设为 `server` 则通过 Streamable HTTP 在 `/mcp` 提供服务。可在服务器的环境中设置
 `IFWI_MCP_SERVER_MODE=server`、`IFWI_MCP_SERVER_HOST=127.0.0.1`、`IFWI_MCP_SERVER_PORT=8000`、
 `IFWI_MCP_SERVER_TOKEN=<高强度随机令牌>`，并配置 `IFWI_MCP_EXEC_MODE=remote`、
-`IFWI_MCP_EXEC_ENDPOINT=<Job API 地址>`、`IFWI_MCP_ARTIFACTORY_REPO=<pod 发布结果的 Artifactory 目录>`，
+`IFWI_MCP_EXEC_ENDPOINT=<Linux Job API 地址>`、`IFWI_MCP_ARTIFACTORY_REPO=<pod 发布结果的 Artifactory 目录>`、
+`IFWI_MCP_REPORT_BASE_URL=<pod 能访问到的服务器地址，pod 结束时回调>`，
 然后运行 `python -m ifwi_mcp.server`。令牌必填，
 客户端需发送 Bearer 认证；对外访问建议使用 TLS 反向代理，默认仅监听服务器本机回环地址。
 这些设置也可以放入 JSON 配置文件的 `serve` 段（`mode`、`host`、`port`、`token`），环境变量优先。
@@ -150,11 +151,14 @@ docker run --name ifwi-stitching-mcp --restart unless-stopped \
 ```
 
 环境文件需包含 `IFWI_MCP_SERVER_TOKEN`（高强度随机令牌）、
-`IFWI_MCP_EXEC_ENDPOINT`（FIV Job API 地址）、`IFWI_MCP_ARTIFACTORY_REPO`（pod 发布结果的位置）；查询需要 `FIV_TOKEN`，
-下载产物需要 `ARTIFACTORY_TOKEN`。镜像已设置 `IFWI_MCP_SERVER_MODE=server`、
-`IFWI_MCP_SERVER_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
-`IFWI_MCP_CACHE_DIR=/data/cache`。数据卷保存计划、缓存和产物；异步任务状态仍在内存中，
-重启后丢失，因此轮询时应运行单个服务进程。`fiv_project_id` 由每次拼接请求携带。
+`IFWI_MCP_EXEC_ENDPOINT`（Linux FIV Job API 地址）、`IFWI_MCP_ARTIFACTORY_REPO`（pod 发布结果的位置）；查询需要 `FIV_TOKEN`，
+下载产物需要 `ARTIFACTORY_TOKEN`。`IFWI_MCP_REPORT_BASE_URL` 设为 pod 能访问到的地址（通常是 HTTPS 反向代理），
+并让反向代理放行 `/internal/jobs/*/result`：每个 pod 结束时会调用一次这个接口回报结果。镜像已设置
+`IFWI_MCP_SERVER_MODE=server`、`IFWI_MCP_SERVER_HOST=0.0.0.0`、`IFWI_MCP_EXEC_MODE=remote` 和
+`IFWI_MCP_CACHE_DIR=/data/cache`。数据卷保存计划、缓存、产物以及**任务记录**（`/data/cache/jobs.db`），
+因此重启或重新构建镜像后 `GET /jobs/{id}` 仍然可用。**不要用 `docker compose down -v`（或
+`docker volume rm`）做常规重新部署**，它会删除任务数据库。只运行一个服务进程（SQLite 只允许一个写入进程）。
+`fiv_project_id` 由每次拼接请求携带。
 
 示例仅绑定宿主机回环地址；对外提供服务应部署 HTTPS 反向代理。若代理不在同一宿主机，
 需有意识地调整宿主机监听地址并限制防火墙访问。MCP 工具能访问容器内的文件路径，
@@ -191,8 +195,8 @@ python -m venv .venv
   而不是上传后立即删除；过期目录在后续任务结束时清理，从不清理运行中的任务。每个保留的运行可能占用数百 MB。
 - **路径尽量短。** 工具文件在 `<cache>/work/<run_id>/tool/...` 下运行（缓存根目录后约 50 个字符）；请使用较短的 `IFWI_MCP_CACHE_DIR` 或开启 Windows 长路径支持。
 - server 模式下低层 MCP 工具 `run_stitch` 仍被禁用，请使用 `stitch_execute_plan` 或 `POST /stitching`。
-- 保持回环地址监听，通过 HTTPS 反向代理对外提供服务。只运行一个服务进程；任务状态保存在内存中，
-  重启会丢失仍在运行的任务状态。
+- 保持回环地址监听，通过 HTTPS 反向代理对外提供服务。只运行一个服务进程。任务记录在重启后仍然保留
+  （`<cache>/jobs.db`），但本地执行无法续跑：服务停止时仍在运行的任务会以 `JOB_INTERRUPTED` 结束。
 
 `IFWI_MCP_EXEC_MODE` 与 serve 模式相互独立：stdio 与 server 模式都支持本地或远程执行。
 远程执行需要 `IFWI_MCP_EXEC_ENDPOINT`；server 模式下本地执行需要 `IFWI_MCP_ARTIFACTORY_REPO`，
@@ -203,7 +207,13 @@ python -m venv .venv
 - `POST /stitching`：必填 `fiv_project_id`（FIV 项目 ID）、`phase`、`version`（传 `ifwi_url` 时可省略） 以及非空的 `ingredients` 名称到版本映射。服务端只查 FIV 元数据，获取 IFWI、ingredient 和 stitch 工具的下载链接并保存命令模板；实际提交时，按 `IFWI_MCP_EXEC_MODE` 在本机隔离目录或远程 runner 中执行同一份含链接的 plan，执行时才下载、解压、确认配置并拼接，结果返回产物的 Artifactory 链接。`ingredients` 的值也可以直接写 `http(s)://` 下载链接而不是版本号：此时原样使用并跳过 FIV 查询（不会与 FIV 校验）。可选传 `ifwi_url`（`http(s)://` 链接），以定制 IFWI 代替 release binary 作为 baseline，此时 `version` 可省略：服务端只读取该文件 `0xF00` 处的 OEM 区（HTTP Range，不支持时读满即断开），由 `ifwi_version`（如 `ap.post-silicon.2026.41.3.01`）推出 `version` 和 `swimlane`，官方 build 再由 product + flavor 推出 `binary_name`；release 仍用于确定 stitch 工具和配置，只替换底包的下载。显式传入但与 OEM 推断结果不一致的 `version`、`swimlane`、`binary_name` 返回 HTTP 400；OEM 区无法给出版本且未传 `version` 时返回 400（不会回退到其他 release 的 stitch 工具）；定制 flavor 推不出 `binary_name`，多个候选时返回 409。dry_run 结果中的 `oem` 字段为解析出的 OEM 信息。用户直传的链接（`ifwi_url` 和写成链接的 `ingredients`）按 URL 单独下载和解压缓存，不会误用同名的 release 文件或其他同名链接的文件。不需要客户端提供 `config_ini`、`stitch_version` 或 `soft_strap`。
 - 拼接请求可设置 `"dry_run":true`：直接返回 HTTP 200，包含 `source_urls`、`command_template`（含执行时才确定的路径占位符）和推断的 `config_ini`，不下载文件、不执行拼接。`config_ini` 只是根据 binary 名称推断的提示，最终在执行时解压工具后验证或选取唯一配置。预览仍会请求 FIV 元数据；即使传了 `"async":true`，预览也直接返回最终结果，不产生 `job_id`。
 - 两个接口均可选传 `swimlane`、`binary_name`。多 swimlane/binary 时返回候选列表，须指定后重试；无法唯一匹配多个 stitch 配置时返回 HTTP 409 和配置候选，不自动猜测。
-- 查询和实际拼接默认同步；`"async":true` 时立即返回 HTTP 202、`job_id`、`status_url` 和 `instance_id`；用 `GET /jobs/{job_id}` 查询 `running`、`succeeded`、`failed`、`instance_id` 以及完整结果。拼接 `dry_run` 始终同步直接返回。任务状态仅在当前进程内保存，完成后保留一小时，最多 256 条；重启或轮询到另一服务进程后返回 HTTP 404 / `JOB_NOT_FOUND`，其 `detail.instance_id` 可与提交时的实例 ID 对比。已有计划和保留的运行目录不能恢复 job ID。HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
+- 查询和实际拼接默认同步。`"async":true` 时返回 HTTP 202（响应头带 `Location` 和 `Retry-After`）以及任务信息：`job_id`、`status_url`、`cancel_url`、`state`、`stage`、`terminal`、`poll_after_seconds`、`instance_id`。同步调用同样会创建任务，任务 ID 在响应头 `X-Job-Id` 中，成功时也在 `data.task_job_id`，失败时在 `detail.job_id`。拼接 `dry_run` 始终直接返回，不创建任务。
+- 可选字段 `client_request_id`（1–128 个 `[A-Za-z0-9_.:-]` 字符）用于幂等提交：同一请求用同一个值重发时返回已有任务（HTTP 200），不会再拼接一次；同一个值用在不同请求上返回 HTTP 409 `IDEMPOTENCY_CONFLICT`。每个新的逻辑请求生成一个新值，只在重试时复用。
+- `GET /jobs/{job_id}` 对存在的任务一律返回 HTTP 200。`data.terminal` 为 true 时停止轮询；`data.state` 取值为 `running`、`succeeded`、`failed`、`cancelled`（另保留 `queued`）。`data.stage` 仅用于展示（`resolving`、`submitting`、`submit_unknown`、`pending`、`running`、`finalizing`、`done`；远程任务只能看到 pod 级状态）。任务结束后 `data.result` 为完整的统一结果，`data.result_source` 说明结果来源（`callback`、`result_json`、`inferred`、`server`）。远程任务运行中，每次查询都会实时查一次 pod（同一任务 5 秒内最多一次）。两次轮询之间等待 `poll_after_seconds`。
+- server 模式下任务保存在 `<cache>/jobs.db`，结束后保留 `IFWI_MCP_JOB_RETENTION_HOURS`（7 天）；HTTP 404 `JOB_NOT_FOUND` 表示任务从未存在或已超过保留期。同时运行的任务最多 `IFWI_MCP_MAX_ACTIVE_JOBS`（64）个，超过时返回 HTTP 503 `JOB_QUEUE_FULL` 并带 `Retry-After`。
+- `GET /jobs?state=running,failed&kind=stitch&plan_id=...&limit=20&before=<created_at>` 按创建时间倒序列出任务（不含 `result`），用 `data.next_before` 翻页。
+- `POST /jobs/{job_id}/cancel` 立即把未结束的任务置为 `cancelled` 并删除其 pod（见 `data.cleanup.pod_delete`）。已结束的任务返回 HTTP 409 `JOB_ALREADY_FINISHED`；已经开始运行的本地拼接无法中断，返回 HTTP 409 `JOB_NOT_CANCELLABLE`。
+- HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
 
 示例请求体（每个示例是一次独立请求）：
 
@@ -298,7 +308,10 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `stitch_runner.py` | 解压归档 + 建 venv + 渲染并执行 `cli.py` / `muppet.py` 命令 | **唯一**使用 subprocess / venv 的模块 |
 | `prepare.py` | 查找 → 下载 → 解压，覆盖 IFWI / ingredient / stitch 工具 | 编排上面几层 |
 | `plan.py` | 已确认的答案 → 校验过的 plan + 渲染出的命令行 | 不联网，不起子进程 |
-| `executor.py` | 准备环境，然后在本地或远程 runner 上执行 plan | 读取执行开关 |
+| `executor.py` | 准备环境、本地执行 plan，以及远程执行的基本操作（创建/查询/删除 pod、读取 `result.json`、构造 wrapper spec） | 读取执行开关 |
+| `job_store.py` | 任务记录：`SqliteJobStore`（server 模式）和 `MemoryJobStore`（stdio），带条件的写 | 只用 SQLite |
+| `jobs.py` | `JobManager`：提交、回调、查询时刷新、收尾判定、取消、重启恢复、保留期清理 | 没有后台轮询线程 |
+| `http_api.py` | 带鉴权的 REST 接口（`/query`、`/stitching`、`/jobs`）和 pod 回调接口 | 与 FastMCP `/mcp` 挂在同一个应用上 |
 | `deliverables.py` | 把结果与产物收集到同一目录并生成清单 | 纯 I/O + 下载 |
 | `cli.py` | 独立命令行终端（`ifwi-cli`），提供与所有 MCP 工具对齐的子命令 | CLI 交互入口 |
 | `server.py` | FastMCP 应用：把上述能力注册成薄封装工具 | 只做编排 |
@@ -310,16 +323,17 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 一个 JSON 配置文件持有**执行开关**。路径取 `IFWI_MCP_CONFIG`，默认位于缓存目录旁边
 （`~/.ifwi-stitching-mcp/config.json`）。文件不存在即表示"全部用默认值"，也就是本地执行。
 
-`execution.mode = "remote"` 会直接通过 FIV Job API 创建一个 Windows pod（与 `AUTO_INTEGRATION_SERVICE`
-使用的是同一个 API，但不需要它的数据库）。pod 克隆本仓库并运行 `python -m ifwi_mcp.worker`，复用完全相同的
-本地执行逻辑，并且只通过 Artifactory 回传结果。详见下文的[远程 runner 协议](#远程-runner-协议)。
+`execution.mode = "remote"` 会通过 FIV Job API 创建一个 Linux pod。pod 运行镜像内置的
+`/app/stitch_wrapper.py`：它安装本仓库、运行 `python -m ifwi_mcp.worker`（复用完全相同的本地执行逻辑），
+结束时回调服务器一次报告结果；Artifactory 上的 `result.json` 作为兜底通道。详见下文的[远程 runner 协议](#远程-runner-协议)。
 
 ```json
 {
   "execution": {
     "mode": "remote",
-    "endpoint": "http://infra-api-fiv.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
+    "endpoint": "http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job",
     "artifactory_repo": "https://af01p-sc.devtools.intel.com/artifactory/DEG-IFWI-LOCAL/FIV_Portal/RemoteStitch",
+    "report_base_url": "https://ifwi-mcp.example.intel.com",
     "timeout_seconds": 3600,
     "poll_interval_seconds": 5
   },
@@ -335,20 +349,29 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | 键 | 默认值 | 用途 |
 |----|--------|------|
 | `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令，每次运行使用独立的工具与输入副本；`remote` 通过 Job API 创建 pod 执行。 |
-| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，Job API 地址（`.../v1/fivportal/job`）。 |
+| `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，Linux Job API 地址（`http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job`）。 |
 | `execution.artifactory_repo` | — | **`mode` 为 `remote`，或 server 模式下为 `local` 时必填**。每次运行发布到 `<artifactory_repo>/<plan_id>-<随机串>/`。 |
-| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6` | Windows pod 镜像，需要有 `git`、`python` 以及 Artifactory token 环境变量。 |
-| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | pod 克隆以获取 `ifwi_mcp.worker` 的仓库。 |
-| `execution.repo_ref` | `main` | pod 检出的分支或 tag。 |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0` | Linux pod 镜像，必须包含 `/app/stitch_wrapper.py`（v1.1.0 及以上；`vX.Y.Z` 形式的旧 tag 会导致启动失败）和 Artifactory token。 |
+| `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | wrapper 安装 `ifwi_mcp.worker` 的仓库。 |
+| `execution.repo_ref` | `main` | wrapper 检出的分支、tag 或 40 位 commit（生产环境建议固定为 commit）。 |
+| `execution.wrapper_path` | `/app/stitch_wrapper.py` | 镜像中 wrapper 的路径。 |
+| `execution.report_base_url` | — | server 模式下 pod 能访问到的服务器地址；pod 把结果 POST 到 `<report_base_url>/internal/jobs/<job_id>/result`。不配置时不回调，任务在被查询时通过 Job API 和 `result.json` 结束。 |
 | `execution.token` | — | 可选，发给 Job API 的 Bearer 令牌（目前它不需要）。 |
-| `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程时作为 pod 的 `activedeadlineseconds` 和轮询上限（含 clone、pip 安装和拼接）。 |
-| `execution.poll_interval_seconds` | `5` | pod 任务状态的轮询间隔。 |
+| `execution.timeout_seconds` | `3600` | 本地执行超时即终止；远程时作为 pod 的 `activedeadlineseconds` 和 wrapper 的时间预算。远程模式下必须大于 465 秒。 |
+| `execution.poll_interval_seconds` | `5` | 同步等待（`async: false`、`stitch_execute_plan`）时重新检查任务的间隔；没有后台轮询。 |
+| `execution.pending_timeout_seconds` | `900` | Job API 报告 pod 仍在 pending 超过这个时间，判 `REMOTE_SCHEDULE_TIMEOUT`（必须小于 `timeout_seconds`）。 |
+| `execution.finalize_grace_seconds` | `120` | pod 结束但没有回调时，等待迟到的回调或 `result.json` 的时长。 |
+| `execution.refresh_min_interval_seconds` | `5` | 同一任务两次查询 Job API 的最小间隔。 |
+| `execution.refresh_workers` | `16` | 查询时刷新专用的线程数，与同步请求的线程池分开。 |
+| `execution.max_inline_spec_bytes` | `4096` | wrapper spec 超过这个长度时上传到 `<run>/spec.json`，改用 `--spec-url` 传递。 |
+| `execution.max_active_jobs` | `64` | 活跃任务上限（超过返回 `JOB_QUEUE_FULL`）。 |
+| `execution.job_retention_hours` | `168` | 已结束任务记录的保留时长。 |
 | `execution.run_retention_hours` | `0` | server 模式本地执行时，任务结束后保留 `work/<run_id>/` 的小时数；`0` 表示上传后立即删除。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
 
 `IFWI_MCP_EXEC_MODE`、`IFWI_MCP_EXEC_ENDPOINT`、`IFWI_MCP_EXEC_IMAGE`、`IFWI_MCP_EXEC_REPO`、
-`IFWI_MCP_EXEC_REF`、`IFWI_MCP_EXEC_TOKEN` 和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
+`IFWI_MCP_EXEC_REF`、`IFWI_MCP_EXEC_TOKEN`、下表列出的任务相关变量和 `IFWI_MCP_STITCH_FALLBACK_DEPS`
 （逗号分隔）会覆盖文件里的值。无效的 execution 段会导致**启动失败**，因此配错的远程端点会在任何实际工作
 开始前就被拦下。
 
@@ -380,6 +403,16 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_EXEC_TOKEN` | `execution.token` |
 | `IFWI_MCP_EXEC_TIMEOUT` | `execution.timeout_seconds` |
 | `IFWI_MCP_EXEC_POLL_INTERVAL` | `execution.poll_interval_seconds` |
+| `IFWI_MCP_REPORT_BASE_URL` | `execution.report_base_url` |
+| `IFWI_MCP_WRAPPER_PATH` | `execution.wrapper_path` |
+| `IFWI_MCP_EXEC_PENDING_TIMEOUT` | `execution.pending_timeout_seconds` |
+| `IFWI_MCP_EXEC_FINALIZE_GRACE` | `execution.finalize_grace_seconds` |
+| `IFWI_MCP_REFRESH_MIN_INTERVAL` | `execution.refresh_min_interval_seconds` |
+| `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
+| `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
+| `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
+| `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
+| `IFWI_MCP_JOBS_DB` | server 模式任务数据库路径（默认 `<cache>/jobs.db`；不要放在网络共享盘上） |
 | `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive`（`0`/`false`/`no`/`off` 表示关闭） |
 | `IFWI_MCP_STITCH_FALLBACK_DEPS` | `stitch.fallback_deps`（逗号分隔） |
@@ -389,24 +422,33 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 
 #### 远程 runner 协议
 
-当 `mode` 为 `remote` 时，服务器直接调用 FIV Job API——不经过 `AUTO_INTEGRATION_SERVICE` 任务，也不需要
-数据库。pod 回传结果的唯一通道是 Artifactory：
+当 `mode` 为 `remote` 时，服务器直接调用 Linux FIV Job API。pod 侧是镜像中的 `stitch_wrapper.py`
+（契约见 cloud-dockerfile 仓库的 `docs/stitch_wrapper_contract.md`，protocol 1）；完整设计见
+`docs/superpowers/specs/2026-10-28-remote-execution-status-design.md`。
 
-1. `POST <endpoint>`，body 为 `{"image", "command", "os": "windows", "activedeadlineseconds",
-   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`。`command` 会克隆
-   `execution.repo_url@repo_ref`、`pip install` 之后运行
-   `python -m ifwi_mcp.worker --plan-b64 <zlib+base64url 编码的 plan> --upload-url <artifactory_repo>/<run_id>`。
-   命令行里不会出现任何凭据。
-2. worker 运行 `executor._execute_local`，把每个产物上传到 `<run_id>/deliverables/<name>`，最后把
-   `{"ok": ..., "data"|"detail": ...}` 结果信封写到 `<run_id>/result.json`——成功、失败、崩溃都会写。
-   失败时仍会上传 stitch 日志，并在 `detail.deliverables` 中给出链接。
-3. 服务器轮询 `GET <endpoint>/<jobid>`，直到 `Data.status` 为 `succeeded`/`failed`，然后读取
-   `result.json`；成功时必须存在已上传的 `stitched_bin`，并把产物下载到本地 deliverables 目录。返回结果包含
-   `job_id`、`artifactory_url`、`result_url`、`stitched_bin_url` 和 `artifacts`（`[{"name", "url", "kind"}]`）。
-   pod 结束却没有 `result.json`（clone/pip 失败）时返回 `REMOTE_EXEC_FAILED`，并附带 `job_id`。
+1. 先落库：`run_id = <plan_id>-<8 位 hex>`、`run_url = <artifactory_repo>/<run_id>` 在创建 pod 之前写入任务记录，
+   所以结果总能在 `run_url` 下找到。
+2. `POST <endpoint>`，body 为 `{"image", "command", "os": "linux", "activedeadlineseconds",
+   "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`。`command` 为
+   `python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>`（不套 `sh -c`，wrapper
+   作为 1 号进程才能收到 SIGTERM）。spec（`zlib+base64url` 编码的 JSON；太长时改用 `--spec-url <run_url>/spec.json`）
+   包含 `run_id`、`run_url`、`report_url`、worker 仓库、`timeouts.budget_seconds`、`timeouts.deadline_epoch` 和 plan，
+   不含任何凭据。回调 token 只对这一个任务有效，数据库里只存它的 sha256。确定没有送达的创建请求会用同一个
+   `run_id` 重试；结果不确定的请求一律不重试（`submit_unknown`）。
+3. wrapper 安装 `repo_url@repo_ref`，运行 `python -m ifwi_mcp.worker --plan-b64 ... --upload-url <run_url>`，
+   上传 `pod.log`，worker 没写 `result.json` 时补写，然后把最终结果 POST 一次到
+   `<report_base_url>/internal/jobs/<job_id>/result`（`Authorization: Bearer <回调 token>`）。worker 把每个产物
+   上传到 `<run_url>/deliverables/<name>`，并把结果信封（带 `schema_version`、`run_id`、`finished_at`）写到
+   `result.json`、`IFWI_STITCH_RESULT_FILE` 和 stdout——成功、失败、崩溃、收到 SIGTERM 都会写。
+4. 服务器收到回调即结束任务。没有回调时，查询会检查 pod；pod 已结束（或已不存在、或已过截止时间）后任务进入
+   `finalizing` 并读取 `result.json`，超过 `finalize_grace_seconds` 仍没有结果才推断为 `REMOTE_RESULT_MISSING` /
+   `REMOTE_TIMEOUT`。推断出的失败在真实结果之后出现时会被覆盖。
+5. server 模式下结果只有链接：`stitched_bin`（`url`、`sha256`、`bytes`）、`log_url`、`artifacts`、`artifactory_url`、
+   `result_url`、`pod_job_id`、`pod_log_url`，以及兼容旧版本的别名 `job_id`（即 `pod_job_id`）、`stitched_bin_url`、
+   `command_line`、`exit_code`、`environment`。stdio 模式下还会把产物下载到本地 deliverables 目录。
 
-pod 从自身环境读取 `ARTIFACTORY_TOKEN`（或 `IFWI_ARTIFACTORY_TOKEN`）；只有当 plan 的来源没有固定为 URL 时，
-才需要 `FIV_TOKEN`（或 `IFWI_FIVPORTAL_TOKEN`）。
+pod 镜像提供 `IFWI_ARTIFACTORY_TOKEN`（以及可选的 `IFWI_FIVPORTAL_TOKEN`，只有 plan 的来源没有固定为 URL 时才需要），
+由 wrapper 传给 worker。
 
 ### 工具
 
@@ -440,8 +482,12 @@ pod 从自身环境读取 `ARTIFACTORY_TOKEN`（或 `IFWI_ARTIFACTORY_TOKEN`）�
 | `stitch_build_plan` | `(project, phase, ingredients, config_ini, version=None, swimlane=None, ifwi_binary=None, ifwi_path=None, ifwi_from_build_targets=False, stitch_version=None, stitch_path=None, soft_strap=None)` | 把与用户确认好的答案变成一份保存下来的 plan + 命令行。不下载任何东西。`ingredients` 是 JSON 数组字符串，每个 ingredient 一条：`{"name": str, "version": str}`（从 FIV 取）或 `{"name": str, "path": str}`（已有的本地目录/文件）。 |
 | `stitch_get_plan` / `stitch_list_plans` | `(plan_id)` / `()` | 重新读取某份 plan，或列出全部。 |
 | `stitch_prepare_environment` | `(plan_id)` | 只准备环境（下载并解压），不执行。 |
-| `stitch_execute_plan` | `(plan_id)` | 准备环境 → 本地或远程执行 → 收集产物。 |
-| `stitch_get_deliverables` | `(plan_id)` | 重新读取某份已完成 plan 的产物清单。 |
+| `stitch_execute_plan` | `(plan_id)` | 准备环境 → 本地或远程执行 → 收集产物；阻塞到运行结束。建议改用 `stitch_submit_plan`。 |
+| `stitch_submit_plan` | `(plan_id, client_request_id=None)` | 开始执行并立即返回 `job_id`（内容与 `GET /jobs/{id}` 相同）。 |
+| `stitch_get_job` | `(job_id)` | 查询任务状态；远程任务运行中会实时查询 pod。按 `poll_after_seconds` 轮询，直到 `terminal` 为 true。 |
+| `stitch_cancel_job` | `(job_id)` | 取消未结束的任务（会删除其 pod）。 |
+| `stitch_list_jobs` | `(state=None, limit=20)` | 按时间倒序列出最近的任务。 |
+| `stitch_get_deliverables` | `(plan_id)` | stdio 模式：重新读取本地产物清单。server 模式：返回该 plan 最近一次成功任务的产物链接。 |
 | `create_up_config` | `(output_path, default_params=None, ingredients=None, template_path=None, fit1_params=None, soc_params=None)` | 生成或更新 UP (Unified Patch) Muppet 的 config ini 文件。 |
 | `cache_cleanup` | `(max_age_days=14, categories=None, dry_run=True)` | 清理超过 N 天未使用的缓存（下载、解压、工作区、产物）。默认只做 dry run。 |
 
@@ -456,7 +502,13 @@ pod 从自身环境读取 `ARTIFACTORY_TOKEN`（或 `IFWI_ARTIFACTORY_TOKEN`）�
 `IFWI_BINARY_AMBIGUOUS`、`OEM_REGION_NOT_FOUND`、`OEM_PARSE_FAILED`、`OEM_MATCH_AMBIGUOUS`、
 `OEM_MATCH_NONE`、`DOWNLOAD_FAILED`、`EXTRACT_FAILED`、`VENV_SETUP_FAILED`、`STITCH_RUN_FAILED`、
 `CONFIG_INVALID`、`PLAN_INVALID`、`PLAN_NOT_FOUND`、`ENV_PREPARE_FAILED`、`REMOTE_EXEC_FAILED`、
-`REMOTE_TIMEOUT`、`DELIVERABLE_MISSING`、`INTERNAL_ERROR`。
+`REMOTE_TIMEOUT`、`DELIVERABLE_MISSING`、`INTERNAL_ERROR`，以及任务和远程执行相关的
+`REMOTE_SUBMIT_FAILED`、`REMOTE_SUBMIT_UNKNOWN`、`REMOTE_SCHEDULE_TIMEOUT`、`REMOTE_TERMINATED`、
+`REMOTE_BOOTSTRAP_FAILED`、`REMOTE_WORKER_CRASHED`、`REMOTE_RESULT_MISSING`、`REMOTE_RESULT_INVALID`、
+`REMOTE_RESULT_UNREADABLE`、`WRAPPER_SPEC_INVALID`、`WRAPPER_INTERNAL_ERROR`、`JOB_NOT_FOUND`、
+`JOB_CANCELLED`、`JOB_INTERRUPTED`、`JOB_ALREADY_FINISHED`、`JOB_NOT_CANCELLABLE`、`JOB_QUEUE_FULL`、
+`IDEMPOTENCY_CONFLICT`。任务的错误都带 `detail.job_id`、`run_id`、`artifactory_url`（远程任务另带
+`pod_job_id`、`pod_status`）以及 `detail.retryable`。
 
 ### 工具调用顺序
 

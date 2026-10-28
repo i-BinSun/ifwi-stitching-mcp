@@ -7,9 +7,9 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import (archive, artifactory, cache, config, deliverables, executor, fiv_portal,
+from . import (archive, artifactory, cache, config, deliverables, executor, fiv_portal, jobs,
                oem_parser, plan as plan_mod, prepare, stitch_runner, up_config)
-from .result import err, ErrorCode
+from .result import err, ok, ErrorCode
 
 mcp = FastMCP("ifwi-stitching-mcp")
 
@@ -348,9 +348,66 @@ def stitch_execute_plan(plan_id: str) -> dict:
     """Prepare the environment, run the plan locally or remotely, return deliverables.
 
     Where it runs is decided by the execution.mode config switch - see get_execution_config.
-    Returns the command line that actually ran, the exit code, and a deliverables manifest.
+    Blocks until the run ends (a remote run can take many minutes); prefer
+    stitch_submit_plan + stitch_get_job. Returns the command line that actually ran, the
+    exit code and the deliverables; data.task_job_id (or detail.job_id on failure) names
+    the tracked job.
     """
-    return executor.execute_plan_id(plan_id)
+    manager = jobs.get_manager()
+    status, job = manager.submit_plan(plan_id)
+    if status == "error":
+        return job
+    return manager.sync_result(manager.wait(job["job_id"]))
+
+
+@_guard
+def stitch_submit_plan(plan_id: str, client_request_id: Optional[str] = None) -> dict:
+    """Start running a saved plan and return at once with its job_id.
+
+    Preferred over stitch_execute_plan. Tell the user the job_id, then call stitch_get_job
+    every poll_after_seconds until terminal is true. client_request_id is optional: pass
+    the same value again only to retry a submission whose answer was lost.
+    """
+    bad = jobs.check_client_request_id(client_request_id)
+    if bad:
+        return bad
+    manager = jobs.get_manager()
+    status, job = manager.submit_plan(plan_id, client_request_id)
+    if status == "error":
+        return job
+    return ok(manager.view(job, include_result=status == "existing"))
+
+
+@_guard
+def stitch_get_job(job_id: str) -> dict:
+    """Status of a job: state, stage, terminal, poll_after_seconds and, once terminal, result.
+
+    While a remote job runs this checks the pod live. Stop polling when terminal is true.
+    If the job failed, do not submit it again without the user's confirmation. On
+    REMOTE_SUBMIT_UNKNOWN, warn the user that a pod may still be running.
+    """
+    manager = jobs.get_manager()
+    row = manager.get(job_id)
+    if row is None:
+        return jobs.not_found(job_id)
+    return ok(manager.view(row))
+
+
+@_guard
+def stitch_cancel_job(job_id: str) -> dict:
+    """Cancel a job that has not finished; a remote job's pod is deleted."""
+    _status, body = jobs.get_manager().cancel(job_id)
+    return body
+
+
+@_guard
+def stitch_list_jobs(state: Optional[str] = None, limit: int = 20) -> dict:
+    """Recent jobs, newest first. state may be a comma-separated list, e.g. 'running'."""
+    if not 1 <= limit <= 100:
+        return err(ErrorCode.INVALID_ARGUMENT, "limit must be between 1 and 100", {"param": "limit"})
+    states = tuple(s for s in (state or "").split(",") if s) or None
+    items = jobs.get_manager().list_jobs(states=states, limit=limit)
+    return ok({"jobs": items, "count": len(items)})
 
 
 @_guard
@@ -386,8 +443,24 @@ def create_up_config(output_path: str,
 
 @_guard
 def stitch_get_deliverables(plan_id: str) -> dict:
-    """Re-read the deliverables manifest of a finished plan: artifacts, sizes and sha256."""
-    return deliverables.load_manifest(plan_id)
+    """Re-read the deliverables of a plan's latest successful run.
+
+    stdio mode: the local manifest (artifacts, sizes and sha256). Server mode: the
+    Artifactory links of the most recent succeeded job for this plan.
+    """
+    if not jobs.get_manager().server_mode:
+        return deliverables.load_manifest(plan_id)
+    if not plan_id or not plan_mod.PLAN_ID_RE.match(plan_id):
+        return err(ErrorCode.INVALID_ARGUMENT, "plan_id is missing or unsafe",
+                   {"param": "plan_id", "expected": "[A-Za-z0-9_.-]+"})
+    row = jobs.get_manager().latest_succeeded(plan_id)
+    if row is None:
+        return err(ErrorCode.DELIVERABLE_MISSING, "no successful job for this plan",
+                   {"plan_id": plan_id, "hint": "check the job with stitch_get_job or stitch_list_jobs"})
+    data = (row["result"] or {}).get("data") or {}
+    return ok({"plan_id": plan_id, "job_id": row["job_id"], "run_id": row["run_id"],
+               **{key: data.get(key) for key in ("stitched_bin", "log_url", "artifacts",
+                                                 "artifactory_url")}})
 
 
 @_guard
@@ -423,7 +496,8 @@ for _fn in (fiv_list_projects, fiv_get_project, fiv_list_swimlanes, fiv_list_rel
             parse_ifwi_oem, download,
             list_local_files, extract_archive, extract_stitch_tool, run_stitch,
             get_execution_config, stitch_build_plan, stitch_get_plan, stitch_list_plans,
-            stitch_prepare_environment, stitch_execute_plan, stitch_get_deliverables,
+            stitch_prepare_environment, stitch_execute_plan, stitch_submit_plan, stitch_get_job,
+            stitch_cancel_job, stitch_list_jobs, stitch_get_deliverables,
             create_up_config, cache_cleanup):
     mcp.tool(_fn)
 
@@ -434,15 +508,28 @@ def main() -> None:
         print(json.dumps(startup), file=sys.stderr)
         sys.exit(1)
     serving = config.get_serve_config()["data"]
+    execution = config.get_execution_config()["data"]
+    if execution["mode"] == "remote" and config.image_tag_version(execution["image"]) is None:
+        print(f"WARNING: cannot tell whether execution.image {execution['image']} ships "
+              "stitch_wrapper.py (v1.1.0 or later is required)", file=sys.stderr)
     if serving["mode"] == "server":
         from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
         # Auth is attached to the network-facing instance before it starts serving.
         mcp.auth = StaticTokenVerifier({config.get_serve_token(): {"client_id": "ifwi-mcp-client",
                                                            "scopes": []}})
+        import threading
+
         import uvicorn
         from .http_api import create_app
 
+        # Settle jobs the previous process left behind before serving, then catch up
+        # on callbacks lost while it was down without delaying startup.
+        manager = jobs.get_manager()
+        recovered = manager.recover_on_startup()
+        print(f"job store {config.get_jobs_db_path()}: {json.dumps(recovered)}", file=sys.stderr)
+        threading.Thread(target=manager.startup_sweep, name="ifwi-startup-sweep",
+                         daemon=True).start()
         uvicorn.run(create_app(mcp), host=serving["host"], port=serving["port"])
     else:
         mcp.run()

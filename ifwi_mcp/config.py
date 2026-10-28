@@ -26,9 +26,25 @@ _EXEC_MODES = ("local", "remote")
 _SERVE_MODES = ("local", "server")
 _DEFAULT_TIMEOUT = 3600
 _DEFAULT_POLL = 5
-_DEFAULT_POD_IMAGE = "amr-registry.caas.intel.com/fia-cloud/fiv_auto_service:v3.2.9.6"
+# First image tag that ships /app/stitch_wrapper.py (Linux stitch pods).
+_DEFAULT_POD_IMAGE = "amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0"
+_MIN_WRAPPER_IMAGE = (1, 1, 0)
 _DEFAULT_WORKER_REPO = "https://github.com/i-BinSun/ifwi-stitching-mcp.git"
 _DEFAULT_WORKER_REF = "main"
+_DEFAULT_WRAPPER_PATH = "/app/stitch_wrapper.py"
+# Sum of the wrapper's default reserves (upload 300 + min worker 120 + reserve 45).
+_WRAPPER_RESERVES = 465
+# (key, env var, default, minimum) of the integer job-tracking settings.
+_JOB_SETTINGS = (
+    ("pending_timeout_seconds", "IFWI_MCP_EXEC_PENDING_TIMEOUT", 900, 1),
+    ("finalize_grace_seconds", "IFWI_MCP_EXEC_FINALIZE_GRACE", 120, 0),
+    ("refresh_min_interval_seconds", "IFWI_MCP_REFRESH_MIN_INTERVAL", 5, 0),
+    ("refresh_workers", "IFWI_MCP_REFRESH_WORKERS", 16, 1),
+    ("max_inline_spec_bytes", "IFWI_MCP_MAX_INLINE_SPEC", 4096, 256),
+    ("max_active_jobs", "IFWI_MCP_MAX_ACTIVE_JOBS", 64, 1),
+    ("job_retention_hours", "IFWI_MCP_JOB_RETENTION_HOURS", 168, 1),
+)
+_IMAGE_TAG_RE = re.compile(r":v(\d+)\.(\d+)\.(\d+)$")
 # These values are spliced into the pod's shell command line.
 _SHELL_SAFE_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]+$")
 
@@ -221,17 +237,35 @@ def get_execution_config() -> dict:
     pod = {}
     for key, env, default in (("image", "IFWI_MCP_EXEC_IMAGE", _DEFAULT_POD_IMAGE),
                               ("repo_url", "IFWI_MCP_EXEC_REPO", _DEFAULT_WORKER_REPO),
-                              ("repo_ref", "IFWI_MCP_EXEC_REF", _DEFAULT_WORKER_REF)):
+                              ("repo_ref", "IFWI_MCP_EXEC_REF", _DEFAULT_WORKER_REF),
+                              ("wrapper_path", "IFWI_MCP_WRAPPER_PATH", _DEFAULT_WRAPPER_PATH)):
         value = _shell_safe(str(os.environ.get(env) or section.get(key) or default).strip(),
                             f"execution.{key}", path)
         if isinstance(value, dict):
             return value
         pod[key] = value
 
+    jobs = {}
+    for key, env, default, minimum in _JOB_SETTINGS:
+        value = _positive_int(os.environ.get(env) or section.get(key), default,
+                              f"execution.{key}", path, minimum=minimum)
+        if isinstance(value, dict):
+            return value
+        jobs[key] = value
+
+    report_base_url = str(os.environ.get("IFWI_MCP_REPORT_BASE_URL")
+                          or section.get("report_base_url") or "").strip().rstrip("/")
+    if report_base_url:
+        parsed = urlparse(report_base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return err(ErrorCode.CONFIG_INVALID, "execution.report_base_url must be a valid http(s) URL",
+                       {"path": path, "param": "execution.report_base_url", "got": report_base_url})
+
     return ok({"mode": mode, "endpoint": endpoint, "config_path": path,
                "has_token": bool(_token_from(section)),
                "timeout_seconds": timeout, "poll_interval_seconds": poll,
-               "run_retention_hours": retention, **pod})
+               "run_retention_hours": retention, "report_base_url": report_base_url,
+               **pod, **jobs})
 
 
 def _token_from(section: dict) -> str:
@@ -322,6 +356,18 @@ def get_deliverables_config() -> dict:
     return ok({"archive": archive, "config_path": loaded["data"]["path"]})
 
 
+def get_jobs_db_path() -> Path:
+    """SQLite job store used in server mode (IFWI_MCP_JOBS_DB, else <cache>/jobs.db)."""
+    raw = os.environ.get("IFWI_MCP_JOBS_DB")
+    return Path(raw).expanduser() if raw else get_cache_dir() / "jobs.db"
+
+
+def image_tag_version(image: str):
+    """(major, minor, patch) of a vX.Y.Z image tag, or None for any other tag."""
+    match = _IMAGE_TAG_RE.search(image)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
 def validate_startup() -> dict:
     base = get_base_url()
     if not base:
@@ -347,4 +393,37 @@ def validate_startup() -> dict:
         upload = get_artifactory_upload_base()
         if not upload["ok"]:
             return upload
+    if execution["data"]["mode"] == "remote":
+        checked = _validate_remote(execution["data"])
+        if not checked["ok"]:
+            return checked
+    if serving["data"]["mode"] == "server":
+        db_path = get_jobs_db_path()
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(db_path, "ab"):
+                pass
+        except OSError as exc:
+            return err(ErrorCode.CONFIG_INVALID, "job database is not writable",
+                       {"param": "IFWI_MCP_JOBS_DB", "path": str(db_path), "reason": str(exc)})
+    return ok({})
+
+
+def _validate_remote(execution: dict) -> dict:
+    path = execution["config_path"]
+    timeout = execution["timeout_seconds"]
+    if execution["pending_timeout_seconds"] >= timeout:
+        return err(ErrorCode.CONFIG_INVALID,
+                   "execution.pending_timeout_seconds must be smaller than timeout_seconds",
+                   {"path": path, "param": "execution.pending_timeout_seconds",
+                    "timeout_seconds": timeout})
+    if timeout <= _WRAPPER_RESERVES:
+        return err(ErrorCode.CONFIG_INVALID,
+                   f"execution.timeout_seconds must exceed the stitch wrapper's reserves ({_WRAPPER_RESERVES}s)",
+                   {"path": path, "param": "execution.timeout_seconds", "got": timeout})
+    version = image_tag_version(execution["image"])
+    if version is not None and version < _MIN_WRAPPER_IMAGE:
+        return err(ErrorCode.CONFIG_INVALID,
+                   "execution.image predates stitch_wrapper.py; use v{}.{}.{} or later".format(*_MIN_WRAPPER_IMAGE),
+                   {"path": path, "param": "execution.image", "got": execution["image"]})
     return ok({})

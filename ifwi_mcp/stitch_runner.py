@@ -563,6 +563,20 @@ def _augmented_env(cwd: Path, temp_dir: Optional[Path] = None) -> dict:
     return env
 
 
+def _child_dir(parent: Path, name: str) -> Path:
+    """parent/name, matched case-insensitively when the exact name does not exist."""
+    exact = parent / name
+    if exact.is_dir():
+        return exact
+    try:
+        for entry in sorted(parent.iterdir()):
+            if entry.name.casefold() == name.casefold() and entry.is_dir():
+                return entry
+    except OSError:
+        pass
+    return exact
+
+
 def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                     timeout: Optional[int] = None, run_root: Optional[str] = None) -> dict:
     """Run a prepared stitch command, capture its log, and locate the output deliverables.
@@ -599,16 +613,17 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                    {"exit_code": proc.returncode, "log_tail": combined[-2000:],
                     "full_log_path": str(log_path), "command_line": _quote_argv(argv)})
 
-    # Search for output deliverables in output/ and release/ directories
-    output_dir = sdir / "output"
+    # Search for output deliverables in output/ and release/ directories. Linux file
+    # systems are case-sensitive and vendor tools write Output/ there.
+    output_dir = _child_dir(sdir, "output")
     bins = []
 
     candidate_output_dirs = [
         output_dir,
-        sdir / "release",
-        sdir.parent / "release",
-        Path(cwd) / "release",
-        Path(cwd).parent / "release",
+        _child_dir(sdir, "release"),
+        _child_dir(sdir.parent, "release"),
+        _child_dir(Path(cwd), "release"),
+        _child_dir(Path(cwd).parent, "release"),
     ]
 
     for candidate_dir in candidate_output_dirs:
