@@ -267,7 +267,7 @@ class JobManager:
             result["data"]["warnings"] = list(warnings) + list(result["data"].get("warnings") or [])
         self._finish(job_id, result, "server")
 
-    # ---- remote submission (design Â§4.6) ------------------------------------------------
+    # ---- remote submission (design §4.6) ------------------------------------------------
     def _submit_remote(self, job_id, plan, warnings, cfg):
         plan_id = plan.get("plan_id", "")
         if not plan_id or not plan_mod.PLAN_ID_RE.match(plan_id):
@@ -421,7 +421,7 @@ class JobManager:
         return updated
 
     def _decorate(self, row, result, source):
-        """Every error carries the locating fields (design Â§8.1)."""
+        """Every error carries the locating fields (design §8.1)."""
         if result.get("ok"):
             return result
         detail = dict(result.get("detail") or {})
@@ -452,7 +452,7 @@ class JobManager:
                 "endpoint": row["remote"].get("endpoint")}
 
     def _normalize(self, row, envelope, *, wrapper_version=None, finished_at=None) -> dict:
-        """Envelope from the callback or result.json -> the stored result (design Â§6.1)."""
+        """Envelope from the callback or result.json -> the stored result (design §6.1)."""
         where = self._where(row)
         if envelope["ok"]:
             shaped = executor.shape_remote_success(envelope, where)
@@ -497,7 +497,7 @@ class JobManager:
                        {"result_url": read["url"], "result_run_id": envelope.get("run_id")})
         return self._normalize(row, envelope, finished_at=_parse_iso(envelope.get("finished_at")))
 
-    # ---- callback (design Â§6.1) ---------------------------------------------------------
+    # ---- callback (design §6.1) ---------------------------------------------------------
     def handle_callback(self, job_id: str, authorization: str, body: bytes):
         """Returns (http_status, envelope)."""
         token = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
@@ -558,7 +558,7 @@ class JobManager:
             grace = 120
         return (row["deadline_at"] or 0) + grace + TOKEN_EXTRA_SECONDS
 
-    # ---- refresh on query (design Â§6.2) -------------------------------------------------
+    # ---- refresh on query (design §6.2) -------------------------------------------------
     @contextlib.contextmanager
     def _single_flight(self, job_id):
         with self._flight_lock:
@@ -608,15 +608,16 @@ class JobManager:
             return row
         if kind in ("ended", "gone"):
             return self._start_finalize(row, "pod_ended" if kind == "ended" else "pod_gone", cfg)
-        if kind == "pending" and now - row["submitted_at"] > cfg["pending_timeout_seconds"]:
+        if kind == "pending" and now - (row["submitted_at"] or now) > cfg["pending_timeout_seconds"]:
             return self._pending_timeout(row, cfg)
-        if kind in ("pending", "running") and now > row["deadline_at"]:
+        deadline_at = row["deadline_at"] or float("inf")
+        if kind in ("pending", "running") and now > deadline_at:
             if not row["deadline_extended"]:
-                # The Job API says the pod still runs: trust it once (design Â§8.5).
+                # The Job API says the pod still runs: trust it once (design §8.5).
                 return self.store.mutate(row["job_id"], _active(
                     deadline_at=now + cfg["timeout_seconds"], deadline_extended=1))
             return self._start_finalize(row, "deadline", cfg)
-        if now > row["deadline_at"]:
+        if now > deadline_at:
             reason = "submit_unknown" if row["stage"] == "submit_unknown" else "deadline"
             return self._start_finalize(row, reason, cfg)
         if row["stage"] == "submit_unknown":
@@ -685,7 +686,7 @@ class JobManager:
         return self._finalize_step(updated, cfg, recheck=False)
 
     def _finalize_step(self, row, cfg, *, recheck=True):
-        """Design Â§6.3: decide from result.json, or after the grace period by inference."""
+        """Design §6.3: decide from result.json, or after the grace period by inference."""
         now = _now()
         if recheck and row["finalize_reason"] == "pod_gone" and row["pod_job_id"]:
             pod = executor.job_api_get(cfg["endpoint"], row["pod_job_id"])
@@ -819,7 +820,7 @@ class JobManager:
             return
         self._delete_pod(row, cfg)
 
-    # ---- cancel (design Â§8.3) -----------------------------------------------------------
+    # ---- cancel (design §8.3) -----------------------------------------------------------
     def cancel(self, job_id: str):
         """Returns (http_status, envelope)."""
         row = self.store.get(job_id)
@@ -898,7 +899,7 @@ class JobManager:
 
     @staticmethod
     def sync_result(row) -> dict:
-        """A synchronous caller's envelope, carrying the task id (design Â§7.1)."""
+        """A synchronous caller's envelope, carrying the task id (design §7.1)."""
         if row is None:
             return err(ErrorCode.JOB_NOT_FOUND, "job not found")
         result = row["result"] or err(ErrorCode.INTERNAL_ERROR, "job ended without a result")
@@ -974,7 +975,7 @@ class JobManager:
 
     # ---- startup and retention ----------------------------------------------------------
     def recover_on_startup(self) -> dict:
-        """Before serving: settle jobs whose owner thread died with the old process (Â§8.4)."""
+        """Before serving: settle jobs whose owner thread died with the old process (§8.4)."""
         counts = {"interrupted": 0, "pending": 0, "submit_unknown": 0}
         for row in self.store.select(states=ACTIVE_STATES):
             stage = row["stage"]
@@ -986,6 +987,12 @@ class JobManager:
                 if self._finish(row["job_id"], err(ErrorCode.JOB_INTERRUPTED,
                                                    "the server restarted while the job was running",
                                                    detail), "server"):
+                    counts["interrupted"] += 1
+            elif stage == "submitting" and row["run_id"] is None:
+                # Died before the run was recorded, so no pod can exist yet.
+                if self._finish(row["job_id"], err(ErrorCode.JOB_INTERRUPTED,
+                                                   "the server restarted before the pod was submitted",
+                                                   {"stage": stage, "retryable": True}), "server"):
                     counts["interrupted"] += 1
             elif stage == "submitting":
                 target = "pending" if row["pod_job_id"] else "submit_unknown"

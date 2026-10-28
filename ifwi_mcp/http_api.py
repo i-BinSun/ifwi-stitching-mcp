@@ -16,6 +16,9 @@ from .result import ErrorCode, err, ok
 
 _LOG = logging.getLogger(__name__)
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ifwi-api")
+# Short control work (submissions, callbacks, cancels) never queues behind the
+# hour-long synchronous waits that occupy _POOL.
+_CONTROL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ifwi-control")
 # Kept for diagnostics: lets a client tell a restarted server from a lost job.
 _INSTANCE_ID = jobs.INSTANCE_ID
 _CALLBACK_MAX_BYTES = 1024 * 1024
@@ -68,6 +71,10 @@ async def _in_pool(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(_POOL, fn, *args)
 
 
+async def _in_control(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_CONTROL_POOL, fn, *args)
+
+
 def _job_headers(view: dict) -> dict:
     headers = {"Location": view["status_url"], "X-Job-Id": view["job_id"]}
     if view["poll_after_seconds"]:
@@ -106,7 +113,7 @@ async def query(request):
     if not payload.get("async"):
         return _response(await _in_pool(_run, interfaces.query, payload))
     manager = jobs.get_manager()
-    status, job = manager.submit_query(payload, payload.get("client_request_id"))
+    status, job = await _in_control(manager.submit_query, payload, payload.get("client_request_id"))
     return _submitted(status, job)
 
 
@@ -124,7 +131,7 @@ async def stitching(request):
     if payload.get("dry_run") is True:
         return _response(await _in_pool(_run, interfaces.stitching, payload))
     manager = jobs.get_manager()
-    status, job = manager.submit_stitching(payload, payload.get("client_request_id"))
+    status, job = await _in_control(manager.submit_stitching, payload, payload.get("client_request_id"))
     if status == "error" or payload.get("async"):
         return _submitted(status, job)
     row = await _in_pool(_wait_sync, job["job_id"])
@@ -191,8 +198,7 @@ async def cancel_job(request):
         return _unauthorized()
     job_id = request.path_params["job_id"]
     manager = jobs.get_manager()
-    pool, _ = manager.refresh_pool()
-    status, body = await asyncio.get_running_loop().run_in_executor(pool, manager.cancel, job_id)
+    status, body = await _in_control(manager.cancel, job_id)
     return JSONResponse(body, status_code=status)
 
 
@@ -206,8 +212,8 @@ async def job_callback(request):
         return JSONResponse(err(ErrorCode.INVALID_ARGUMENT, "callback body too large"), status_code=413)
     manager = jobs.get_manager()
     try:
-        status, result = await _in_pool(manager.handle_callback, request.path_params["job_id"],
-                                        request.headers.get("Authorization", ""), body)
+        status, result = await _in_control(manager.handle_callback, request.path_params["job_id"],
+                                           request.headers.get("Authorization", ""), body)
     except Exception:  # noqa: BLE001 - e.g. the database is locked: the wrapper retries 5xx
         _LOG.exception("callback handling failed")
         return JSONResponse(err(ErrorCode.INTERNAL_ERROR, "callback could not be recorded"),

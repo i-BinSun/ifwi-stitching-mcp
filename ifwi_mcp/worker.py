@@ -32,7 +32,9 @@ def run(plan: dict, upload_url: str) -> dict:
     exec_cfg = config.get_execution_config()
     if not exec_cfg["ok"]:
         return exec_cfg
-    result = executor._execute_local(plan, exec_cfg["data"])
+    # Name the local run after the server's run_id so log and run names match the job.
+    run_id = os.environ.get("IFWI_STITCH_RUN_ID", "")
+    result = executor._execute_local(plan, exec_cfg["data"], **({"run_id": run_id} if run_id else {}))
     if not result["ok"]:
         # Publish whatever was kept (usually the stitch log) so the failure is debuggable.
         items = ((result["detail"].get("deliverables") or {}).get("items")) or []
