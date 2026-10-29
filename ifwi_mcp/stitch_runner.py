@@ -563,18 +563,27 @@ def _augmented_env(cwd: Path, temp_dir: Optional[Path] = None) -> dict:
     return env
 
 
-def _child_dir(parent: Path, name: str) -> Path:
-    """parent/name, matched case-insensitively when the exact name does not exist."""
+def _child_dirs(parent: Path, name: str) -> list:
+    """Every directory under parent whose name matches case-insensitively, exact name first.
+
+    On a case-sensitive file system (Linux pods) older tools write Output/ and newer ones
+    output/, and both can exist side by side; on Windows there is at most one.
+    """
     exact = parent / name
-    if exact.is_dir():
-        return exact
+    found = [exact] if exact.is_dir() else []
     try:
         for entry in sorted(parent.iterdir()):
-            if entry.name.casefold() == name.casefold() and entry.is_dir():
-                return entry
+            if (entry.name != name and entry.name.casefold() == name.casefold()
+                    and entry.is_dir() and entry not in found):
+                found.append(entry)
     except OSError:
         pass
-    return exact
+    return found or [exact]
+
+
+def _child_dir(parent: Path, name: str) -> Path:
+    """parent/name, matched case-insensitively when the exact name does not exist."""
+    return _child_dirs(parent, name)[0]
 
 
 def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
@@ -613,17 +622,18 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                    {"exit_code": proc.returncode, "log_tail": combined[-2000:],
                     "full_log_path": str(log_path), "command_line": _quote_argv(argv)})
 
-    # Search for output deliverables in output/ and release/ directories. Linux file
-    # systems are case-sensitive and vendor tools write Output/ there.
-    output_dir = _child_dir(sdir, "output")
+    # Search for output deliverables in output/ and release/ directories, in any letter
+    # case: older vendor tools write Output/, newer ones output/ (Linux is case-sensitive).
+    output_dirs = _child_dirs(sdir, "output")
+    output_dir = output_dirs[0]
     bins = []
 
     candidate_output_dirs = [
-        output_dir,
-        _child_dir(sdir, "release"),
-        _child_dir(sdir.parent, "release"),
-        _child_dir(Path(cwd), "release"),
-        _child_dir(Path(cwd).parent, "release"),
+        *output_dirs,
+        *_child_dirs(sdir, "release"),
+        *_child_dirs(sdir.parent, "release"),
+        *_child_dirs(Path(cwd), "release"),
+        *_child_dirs(Path(cwd).parent, "release"),
     ]
 
     for candidate_dir in candidate_output_dirs:
@@ -644,15 +654,15 @@ def execute_command(argv: list, cwd: str, log_name: Optional[str] = None,
                 bins = found_patches
                 break
 
-    if not bins and output_dir.is_dir():
-        bins = sorted(output_dir.glob("*.bin"), key=lambda p: p.stat().st_mtime)
-
     if not bins:
-        # Check if there are any output files in the output directory
-        if output_dir.is_dir():
-            files = [p for p in output_dir.iterdir() if p.is_file()]
-            if files:
-                bins = sorted(files, key=lambda p: p.stat().st_mtime)
+        # Any file left in an output directory (e.g. a tool that writes no .bin)
+        for candidate_dir in output_dirs:
+            if candidate_dir.is_dir():
+                files = [p for p in candidate_dir.iterdir() if p.is_file()]
+                if files:
+                    output_dir = candidate_dir
+                    bins = sorted(files, key=lambda p: p.stat().st_mtime)
+                    break
 
     if not bins:
         return err(ErrorCode.STITCH_NO_OUTPUT,
