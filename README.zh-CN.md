@@ -366,6 +366,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `execution.max_inline_spec_bytes` | `4096` | wrapper spec 超过这个长度时上传到 `<run>/spec.json`，改用 `--spec-url` 传递。 |
 | `execution.max_active_jobs` | `64` | 活跃任务上限（超过返回 `JOB_QUEUE_FULL`）。 |
 | `execution.job_retention_hours` | `168` | 已结束任务记录的保留时长。 |
+| `execution.pod_cleanup_delay_seconds` | `30` | 远程任务正常结束后，过多少秒删除它的 pod（给 wrapper 留出最后上传的时间）；`0` 表示立即删除。取消和超时时立即删除。 |
 | `execution.run_retention_hours` | `0` | server 模式本地执行时，任务结束后保留 `work/<run_id>/` 的小时数；`0` 表示上传后立即删除。 |
 | `deliverables.archive` | `true` | 是否额外把收集到的产物打包成 zip。 |
 | `stitch.fallback_deps` | `[]` | 当工具目录里既没有 `requirements.txt`，也没有平台相关的 `requirements_windows.txt`/`requirements_linux.txt`（见下文）时，安装到工具 venv 里的 pip 包列表。默认为空——不配置就不会安装任何东西。 |
@@ -412,6 +413,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
 | `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
 | `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
+| `IFWI_MCP_POD_CLEANUP_DELAY` | `execution.pod_cleanup_delay_seconds` |
 | `IFWI_MCP_JOBS_DB` | server 模式任务数据库路径（默认 `<cache>/jobs.db`；不要放在网络共享盘上） |
 | `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive`（`0`/`false`/`no`/`off` 表示关闭） |
@@ -447,6 +449,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 5. server 模式下结果只有链接：`stitched_bin`（`url`、`sha256`、`bytes`）、`log_url`、`artifacts`、`artifactory_url`、
    `result_url`、`pod_job_id`、`pod_log_url`，以及兼容旧版本的别名 `job_id`（即 `pod_job_id`）、`stitched_bin_url`、
    `command_line`、`exit_code`、`environment`。stdio 模式下还会把产物下载到本地 deliverables 目录。
+6. 任务结束后删除 pod：正常结束时过 `pod_cleanup_delay_seconds`（30 秒）删除，取消或超时时立即删除。删除失败会在之后的查询和启动时重试，Job API 的 `ttlsecondsafterfinished`（12 小时）是最后的兜底。进度见 `data.cleanup.pod_delete`。
 
 pod 镜像提供 `IFWI_ARTIFACTORY_TOKEN`（以及可选的 `IFWI_FIVPORTAL_TOKEN`，只有 plan 的来源没有固定为 URL 时才需要），
 由 wrapper 传给 worker。

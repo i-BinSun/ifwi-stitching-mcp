@@ -131,6 +131,9 @@ class JobManager:
         self.server_mode = server_mode
         self._events = {}
         self._events_lock = threading.Lock()
+        self._timers = set()
+        self._timers_lock = threading.Lock()
+        self._closed = False
         self._flights = set()
         self._flight_lock = threading.Lock()
         self._pool = None
@@ -420,6 +423,7 @@ class JobManager:
         updated = self.store.mutate(job_id, apply)
         if updated is not None:
             self._notify(job_id)
+            self._schedule_pod_cleanup(updated)
         return updated
 
     def _decorate(self, row, result, source):
@@ -796,6 +800,60 @@ class JobManager:
         self._finish(row["job_id"], concluded, "result_json", allow_override=True)
 
     # ---- pod cleanup --------------------------------------------------------------------
+    def _schedule_pod_cleanup(self, row):
+        """Delete a finished job's pod instead of leaving it to ttlsecondsafterfinished.
+
+        Paths that delete at once (timeouts, cancel) set cleanup themselves; this covers a
+        job that ended on its own (callback, result.json, inferred). The delay lets the
+        wrapper finish its last uploads after calling back; a missed timer is retried by the
+        startup sweep and by queries.
+        """
+        if row["executor"] != "remote" or not row["pod_job_id"] or row["cleanup"] is not None:
+            return
+        try:
+            delay = self._cfg()["pod_cleanup_delay_seconds"]
+        except _ConfigProblem:
+            delay = 30
+        due = _now() + delay
+
+        def mark(current):
+            if current["cleanup"] is not None or not current["pod_job_id"]:
+                return False
+            current["cleanup_pending"] = 1
+            current["cleanup"] = {"pod_delete": "pending", "attempts": 0, "not_before": due}
+            note(current, f"pod delete scheduled in {delay}s")
+            return True
+        if self.store.mutate(row["job_id"], mark) is None:
+            return
+        timer = threading.Timer(delay, self._cleanup_due, args=(row["job_id"],))
+        timer.daemon = True
+        with self._timers_lock:
+            if self._closed:
+                return
+            self._timers.add(timer)
+        timer.start()
+
+    def _cleanup_due(self, job_id):
+        with self._timers_lock:
+            self._timers = {t for t in self._timers if t.is_alive() and t is not threading.current_thread()}
+            if self._closed:
+                return
+        try:
+            row = self.store.get(job_id)
+            cleanup = (row or {}).get("cleanup") or {}
+            if row and row["cleanup_pending"] and cleanup.get("pod_delete") == "pending":
+                self._delete_pod(row, self._cfg())
+        except Exception:  # noqa: BLE001 - a later query or the startup sweep retries
+            _LOG.exception("job %s: scheduled pod delete failed", job_id)
+
+    def close(self):
+        """Stop pending cleanup timers (tests, shutdown); their pods expire via the TTL."""
+        with self._timers_lock:
+            self._closed = True
+            timers, self._timers = self._timers, set()
+        for timer in timers:
+            timer.cancel()
+
     def _record_cleanup(self, job_id, outcome, *, warning=None):
         def apply(row):
             cleanup = dict(row["cleanup"] or {})
@@ -843,7 +901,10 @@ class JobManager:
         cleanup = row["cleanup"] or {}
         if not row["cleanup_pending"] or cleanup.get("pod_delete") != "pending" or not row["pod_job_id"]:
             return
-        if _now() - (cleanup.get("last_attempt_at") or 0) < CLEANUP_RETRY_SECONDS:
+        now = _now()
+        if now < (cleanup.get("not_before") or 0):
+            return
+        if now - (cleanup.get("last_attempt_at") or 0) < CLEANUP_RETRY_SECONDS:
             return
         self._delete_pod(row, cfg)
 
@@ -1037,7 +1098,19 @@ class JobManager:
         with contextlib.suppress(Exception):
             cfg = self._cfg()
             for row in self.store.select(cleanup_pending=True, limit=STARTUP_SWEEP_LIMIT):
-                if row["state"] in TERMINAL_STATES and row["pod_job_id"]:
+                if row["state"] not in TERMINAL_STATES or not row["pod_job_id"]:
+                    continue
+                wait = ((row["cleanup"] or {}).get("not_before") or 0) - _now()
+                if wait > 0:
+                    # Its timer died with the previous process: arm a new one.
+                    timer = threading.Timer(wait, self._cleanup_due, args=(row["job_id"],))
+                    timer.daemon = True
+                    with self._timers_lock:
+                        if self._closed:
+                            break
+                        self._timers.add(timer)
+                    timer.start()
+                else:
                     self._delete_pod(row, cfg)
         self.maybe_purge(force=True)
 
@@ -1147,6 +1220,7 @@ def reset_manager() -> None:
     with _manager_lock:
         manager, _manager = _manager, None
     if manager is not None:
+        manager.close()
         if manager._pool is not None:
             manager._pool.shutdown(wait=False)
         close = getattr(manager.store, "close", None)

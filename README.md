@@ -449,6 +449,7 @@ Artifactory is the fallback channel. See [Remote runner contract](#remote-runner
 | `execution.max_inline_spec_bytes` | `4096` | Larger wrapper specs are uploaded to `<run>/spec.json` and passed with `--spec-url`. |
 | `execution.max_active_jobs` | `64` | Active-job limit (`JOB_QUEUE_FULL` beyond it). |
 | `execution.job_retention_hours` | `168` | How long finished job records are kept. |
+| `execution.pod_cleanup_delay_seconds` | `30` | After a remote job ends on its own, delete its pod this many seconds later (gives the wrapper time for its last uploads). `0` deletes at once. Cancel and timeouts delete immediately. |
 | `execution.run_retention_hours` | `0` | Server mode with local execution: hours to keep each finished `work/<run_id>/` for debugging; `0` deletes it right after upload. |
 | `deliverables.archive` | `true` | Also zip the collected deliverables. |
 | `stitch.fallback_deps` | `[]` | pip packages installed into the tool's venv when neither a `requirements.txt` nor a platform-specific `requirements_windows.txt`/`requirements_linux.txt` is found anywhere in it (see below). Empty by default — nothing installs unless set. |
@@ -496,6 +497,7 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
 | `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
 | `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
+| `IFWI_MCP_POD_CLEANUP_DELAY` | `execution.pod_cleanup_delay_seconds` |
 | `IFWI_MCP_JOBS_DB` | server-mode job database path (default `<cache>/jobs.db`; never on a network share) |
 | `IFWI_MCP_RUN_RETENTION_HOURS` | `execution.run_retention_hours` |
 | `IFWI_MCP_DELIVERABLES_ARCHIVE` | `deliverables.archive` (`0`/`false`/`no`/`off` → off) |
@@ -536,6 +538,9 @@ protocol 1); the full design is `docs/superpowers/specs/2026-10-28-remote-execut
    `artifacts`, `artifactory_url`, `result_url`, `pod_job_id`, `pod_log_url`, plus the v1 aliases
    `job_id` (= `pod_job_id`), `stitched_bin_url`, `command_line`, `exit_code`, `environment`. In stdio
    mode the deliverables are also downloaded into the local deliverables dir.
+6. The pod is deleted once the job is over: `pod_cleanup_delay_seconds` (30 s) after it ends on its own, at
+   once on cancel or timeout. A failed delete is retried on later queries and at startup; the Job API's
+   `ttlsecondsafterfinished` (12 h) is the last resort. Progress shows in `data.cleanup.pod_delete`.
 
 The pod image provides `IFWI_ARTIFACTORY_TOKEN` (and optionally `IFWI_FIVPORTAL_TOKEN`, needed only
 for plans whose sources are not pinned to URLs); the wrapper passes them to the worker.
