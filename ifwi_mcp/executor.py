@@ -50,6 +50,7 @@ _JOB_PENDING = ("pending", "waiting", "created", "")
 _JOB_RUNNING = ("running", "active")
 _JOB_SUCCEEDED = ("succeeded", "complete", "completed")
 _JOB_FAILED = ("failed", "error")
+_POD_FINISHED = ("failed", "succeeded")
 _ACTIVE_RUNS = set()
 _ACTIVE_LOCK = threading.Lock()
 
@@ -566,16 +567,26 @@ def job_api_get(endpoint: str, pod_job_id: str) -> dict:
         return {"kind": "error", "status": None, "auth": False,
                 "error": err(ErrorCode.REMOTE_EXEC_FAILED, "Job API returned an error code",
                              {"code": body.get("Code"), "message": message[:500]})}
-    status = str((body.get("Data") or {}).get("status") or "").strip().lower()
-    if status in _JOB_PENDING:
+    data = body.get("Data") or {}
+    status = str(data.get("status") or "").strip().lower()
+    pods = data.get("pods") if isinstance(data.get("pods"), list) else []
+    pod_states = [str((p or {}).get("status") or "").strip().lower() for p in pods]
+    if status in _JOB_SUCCEEDED or status in _JOB_FAILED:
+        kind = "ended"
+    elif pod_states and all(s in _POD_FINISHED for s in pod_states):
+        # The Linux Job API keeps a job whose only pod failed "active" (backoffLimit=0, so
+        # nothing will retry it); the pod list is the reliable signal that it is over.
+        kind, status = "ended", f"{status or 'unknown'}/pod-{pod_states[-1]}"
+    elif status in _JOB_PENDING:
         kind = "pending"
     elif status in _JOB_RUNNING:
         kind = "running"
-    elif status in _JOB_SUCCEEDED or status in _JOB_FAILED:
-        kind = "ended"
     else:
         kind = "unknown"
-    return {"kind": kind, "status": status, "auth": False}
+    # It later reports such a job as "pending" with no pods at all; jobs.py treats that as
+    # ended once the pod should exist (see JobManager._classify).
+    return {"kind": kind, "status": status, "auth": False,
+            "no_pods": kind == "pending" and not pods}
 
 
 def job_api_delete(endpoint: str, pod_job_id: str) -> dict:
@@ -639,10 +650,14 @@ def build_spec(*, job_id: str, run_id: str, run_url: str, report_url, plan: dict
 
 def wrapper_command(exec_cfg: dict, job_id: str, *, spec_token: str = "", spec_url: str = "",
                     report_token: str = "") -> str:
-    """`python3 /app/stitch_wrapper.py ...` with values limited to [A-Za-z0-9_.:/=-], so it
-    needs no quoting whether or not the Job API runs it through a shell. No `sh -c`: the
-    wrapper must be PID 1 to receive SIGTERM."""
-    parts = ["python3", exec_cfg["wrapper_path"], "--job-id", job_id]
+    """`exec python3 /app/stitch_wrapper.py ...` with values limited to [A-Za-z0-9_.:/=-], so
+    nothing needs quoting.
+
+    The Linux Job API runs the command as `sh -c "<command>"` with that sh as PID 1. A PID 1
+    sh does not handle SIGTERM, so without `exec` a pod delete or deadline would never reach
+    the wrapper and it could not report. `exec` makes the wrapper itself PID 1.
+    """
+    parts = ["exec", "python3", exec_cfg["wrapper_path"], "--job-id", job_id]
     parts += ["--spec-url", spec_url] if spec_url else ["--spec", spec_token]
     if report_token:
         parts += ["--report-token", report_token]

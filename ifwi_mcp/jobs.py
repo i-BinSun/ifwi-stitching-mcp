@@ -635,9 +635,14 @@ class JobManager:
     def _classify(row, pod, now):
         if pod is None:
             return None
+        early = now - (row["submitted_at"] or now) < GONE_GRACE_SECONDS
+        if pod.get("no_pods") and not early:
+            # The Linux Job API reports a job whose pod already finished (and failed) as
+            # "pending" with no pods; an unscheduled pod would still be listed.
+            return "ended"
         if pod["kind"] != "not_found":
             return pod["kind"]
-        if now - (row["submitted_at"] or now) < GONE_GRACE_SECONDS:
+        if early:
             return "pending"
         seen = row["remote"].get("gone_seen_at")
         if seen and now - seen >= GONE_CONFIRM_SECONDS:
@@ -660,6 +665,9 @@ class JobManager:
                     if pod["status"] != row["pod_status"] and kind == "unknown":
                         note(row, f"unexpected Job API status {pod['status']!r}")
                     row["pod_status"] = pod["status"]
+                if kind == "ended" and pod.get("no_pods"):
+                    row["pod_status"] = "pending/no-pods"
+                    note(row, "Job API reports the job pending with no pods left: the pod has finished")
             if kind in ("pending", "running", "ended", "unknown"):
                 remote.pop("gone_seen_at", None)
             if kind in ("pending", "running"):
@@ -706,7 +714,7 @@ class JobManager:
         now = _now()
         if recheck and row["finalize_reason"] == "pod_gone" and row["pod_job_id"]:
             pod = executor.job_api_get(cfg["endpoint"], row["pod_job_id"])
-            if pod["kind"] in ("pending", "running"):
+            if pod["kind"] in ("pending", "running") and not pod.get("no_pods"):
                 def revert(current):
                     if current["state"] not in ACTIVE_STATES or current["stage"] != "finalizing":
                         return False
