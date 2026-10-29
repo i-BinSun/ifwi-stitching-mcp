@@ -1,6 +1,6 @@
 import pytest
 
-from ifwi_mcp import config, fiv_portal
+from ifwi_mcp import config, fiv_portal, jobs
 
 
 @pytest.fixture(autouse=True)
@@ -8,7 +8,9 @@ def _reset_caches():
     """Module-level memoization must not leak between tests."""
     fiv_portal.reset_cache()
     config.reset_cache()
+    jobs.reset_manager()
     yield
+    jobs.reset_manager()
     fiv_portal.reset_cache()
     config.reset_cache()
 
@@ -24,7 +26,13 @@ def clean_env(monkeypatch, tmp_path):
                 "IFWI_MCP_SERVER_HOST", "IFWI_MCP_SERVER_PORT", "IFWI_MCP_SERVER_TOKEN",
                 "IFWI_MCP_RUN_RETENTION_HOURS",
                 "IFWI_MCP_ARTIFACTORY_REPO", "IFWI_MCP_EXEC_IMAGE", "IFWI_MCP_EXEC_REPO",
-                "IFWI_MCP_EXEC_REF", "IFWI_ARTIFACTORY_TOKEN", "IFWI_FIVPORTAL_TOKEN"):
+                "IFWI_MCP_EXEC_REF", "IFWI_ARTIFACTORY_TOKEN", "IFWI_FIVPORTAL_TOKEN",
+                "IFWI_MCP_REPORT_BASE_URL", "IFWI_MCP_WRAPPER_PATH",
+                "IFWI_MCP_EXEC_PENDING_TIMEOUT", "IFWI_MCP_EXEC_FINALIZE_GRACE",
+                "IFWI_MCP_REFRESH_MIN_INTERVAL", "IFWI_MCP_REFRESH_WORKERS",
+                "IFWI_MCP_MAX_INLINE_SPEC", "IFWI_MCP_MAX_ACTIVE_JOBS",
+                "IFWI_MCP_JOB_RETENTION_HOURS", "IFWI_MCP_JOBS_DB",
+                "IFWI_STITCH_RESULT_FILE", "IFWI_STITCH_RUN_ID", "IFWI_STITCH_DEADLINE_EPOCH"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("IFWI_MCP_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("IFWI_MCP_CONFIG", str(tmp_path / "config.json"))

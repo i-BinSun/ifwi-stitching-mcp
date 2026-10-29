@@ -146,3 +146,29 @@ def test_upload_file_success(clean_env, tmp_path, monkeypatch):
 def test_upload_file_missing_local(clean_env):
     res = artifactory.upload_file("/nonexistent/file.bin", "https://artifactory/repo/out.bin")
     assert res["error_code"] == ErrorCode.INVALID_ARGUMENT
+
+
+@responses.activate
+def test_read_range_partial_content(clean_env, monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "tok")
+    responses.add(responses.GET, "https://artifactory/i.bin", body=b"OEM!", status=206)
+    res = artifactory.read_range("https://artifactory/i.bin", 0xF00, 4)
+    assert res["data"]["content"] == b"OEM!"
+    assert responses.calls[0].request.headers["Range"] == "bytes=3840-3843"
+
+
+@responses.activate
+def test_read_range_without_server_support_slices_full_body(clean_env, monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "tok")
+    responses.add(responses.GET, "https://artifactory/i.bin", body=b"0123456789", status=200)
+    res = artifactory.read_range("https://artifactory/i.bin", 3, 4)
+    assert res["data"]["content"] == b"3456"
+
+
+@responses.activate
+def test_read_range_short_file_and_auth(clean_env, monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "tok")
+    responses.add(responses.GET, "https://artifactory/short.bin", status=416)
+    responses.add(responses.GET, "https://artifactory/denied.bin", status=401)
+    assert artifactory.read_range("https://artifactory/short.bin", 0xF00, 256)["data"]["content"] == b""
+    assert artifactory.read_range("https://artifactory/denied.bin", 0xF00, 256)["error_code"] == ErrorCode.AUTH_FAILED

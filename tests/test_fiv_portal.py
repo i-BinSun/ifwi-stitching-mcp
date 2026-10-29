@@ -510,6 +510,45 @@ def test_match_build_by_oem_single(fiv_env):
 
 
 @responses.activate
+def test_match_build_by_oem_uses_swimlane_prefix(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release/"), json=[
+        {"version": "2026.41.3.01", "swimlane_branch": "release/ap.post-silicon"},
+        {"version": "2026.41.3.01", "swimlane_branch": "release/sp.post-silicon"}], status=200)
+    # Real layout: one build target ships the base binary and its _2S sibling.
+    responses.add(responses.GET, _url("get_ifwi_release_package_info/"), json={
+        "swimlane_branch": "release/ap.post-silicon",
+        "build_target": [
+            {"package_name": "OakStreamRp_DMR_FSP_Glue_IP_Clean_External_Debug_Linux", "binary_list": [
+                {"full_binary_name": "OKSDCRB1_86B_2026.41.3.01_IPCleanExternal_Trace_DebugSigned.bin"},
+                {"full_binary_name": "OKSDCRB1_86B_2026.41.3.01_IPCleanExternal_Trace_DebugSigned_2S.bin"}]},
+            {"package_name": "OakStreamRp_DMR_1P0_FSP_Glue_Debug_Linux", "binary_list": [
+                {"full_binary_name": "OKSDCRB1_86B_2026.41.3.01_NonIPClean_Trace_DebugSigned.bin"}]},
+        ],
+    }, status=200)
+    r = fiv_portal.match_build_by_oem(
+        "OakStreamAP", "OKSDCRB1", "ap.post-silicon.2026.41.3.01",
+        "_IPCleanExternal_Trace_DebugSigned", "Orange")
+    assert r["data"]["matched_package"] == "OakStreamRp_DMR_FSP_Glue_IP_Clean_External_Debug_Linux"
+    package_calls = [c for c in responses.calls if "package_info" in c.request.url]
+    assert len(package_calls) == 1
+    assert "swimlane=release%2Fap.post-silicon" in package_calls[0].request.url
+
+
+@responses.activate
+def test_resolve_swimlane_hint(fiv_env):
+    responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
+    responses.add(responses.GET, _url("get_ifwi_release/"), json=[
+        {"version": "2026.41.3.01", "swimlane_branch": "release/ap.post-silicon"},
+        {"version": "2026.41.3.01", "swimlane_branch": "main"}], status=200)
+    r = fiv_portal.resolve_swimlane_hint("OakStreamAP", "Orange", "2026.41.3.01", "ap.post-silicon")
+    assert r["data"]["swimlane"] == "release/ap.post-silicon"
+    r = fiv_portal.resolve_swimlane_hint("OakStreamAP", "Orange", "2026.41.3.01", "post-silicon")
+    assert r["error_code"] == ErrorCode.RELEASE_NOT_FOUND
+    assert r["detail"]["candidates"] == ["main", "release/ap.post-silicon"]
+
+
+@responses.activate
 def test_match_build_by_oem_none(fiv_env):
     responses.add(responses.GET, _url("get_project_info/"), json=PROJECTS, status=200)
     responses.add(responses.GET, _url("get_ifwi_release/"),
