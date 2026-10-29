@@ -351,7 +351,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `execution.mode` | `local` | `local` 在本机以子进程执行 stitch 命令，每次运行使用独立的工具与输入副本；`remote` 通过 Job API 创建 pod 执行。 |
 | `execution.endpoint` | — | **`mode` 为 `remote` 时必填**，Linux Job API 地址（`http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job`）。 |
 | `execution.artifactory_repo` | — | **`mode` 为 `remote`，或 server 模式下为 `local` 时必填**。每次运行发布到 `<artifactory_repo>/<plan_id>-<随机串>/`。 |
-| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0` | Linux pod 镜像，必须包含 `/app/stitch_wrapper.py`（v1.1.0 及以上；`vX.Y.Z` 形式的旧 tag 会导致启动失败）和 Artifactory token。 |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.1` | Linux pod 镜像，必须包含 `/app/stitch_wrapper.py`（v1.1.1 及以上，其 wrapper 支持 `deadline_epoch`；`vX.Y.Z` 形式的旧 tag 会导致启动失败）和 Artifactory token。 |
 | `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | wrapper 安装 `ifwi_mcp.worker` 的仓库。 |
 | `execution.repo_ref` | `main` | wrapper 检出的分支、tag 或 40 位 commit（生产环境建议固定为 commit）。 |
 | `execution.wrapper_path` | `/app/stitch_wrapper.py` | 镜像中 wrapper 的路径。 |
@@ -430,8 +430,9 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
    所以结果总能在 `run_url` 下找到。
 2. `POST <endpoint>`，body 为 `{"image", "command", "os": "linux", "activedeadlineseconds",
    "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`。`command` 为
-   `python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>`（不套 `sh -c`，wrapper
-   作为 1 号进程才能收到 SIGTERM）。spec（`zlib+base64url` 编码的 JSON；太长时改用 `--spec-url <run_url>/spec.json`）
+   `exec python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>`。Job API 以
+   `sh -c "<command>"` 运行它，这个 `sh` 是 1 号进程，会忽略 SIGTERM；加 `exec` 后 wrapper 自己成为 1 号进程，删除 pod
+   或到达截止时间时才能收到 SIGTERM 并回报结果。spec（`zlib+base64url` 编码的 JSON；太长时改用 `--spec-url <run_url>/spec.json`）
    包含 `run_id`、`run_url`、`report_url`、worker 仓库、`timeouts.budget_seconds`、`timeouts.deadline_epoch` 和 plan，
    不含任何凭据。回调 token 只对这一个任务有效，数据库里只存它的 sha256。确定没有送达的创建请求会用同一个
    `run_id` 重试；结果不确定的请求一律不重试（`submit_unknown`）。

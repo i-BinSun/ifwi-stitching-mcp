@@ -27,8 +27,9 @@ _SERVE_MODES = ("local", "server")
 _DEFAULT_TIMEOUT = 3600
 _DEFAULT_POLL = 5
 # First image tag that ships /app/stitch_wrapper.py (Linux stitch pods).
-_DEFAULT_POD_IMAGE = "amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0"
-_MIN_WRAPPER_IMAGE = (1, 1, 0)
+_DEFAULT_POD_IMAGE = "amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.1"
+# First tag whose stitch_wrapper honours spec.timeouts.deadline_epoch (wrapper 1.1.1).
+_MIN_WRAPPER_IMAGE = (1, 1, 1)
 _DEFAULT_WORKER_REPO = "https://github.com/i-BinSun/ifwi-stitching-mcp.git"
 _DEFAULT_WORKER_REF = "main"
 _DEFAULT_WRAPPER_PATH = "/app/stitch_wrapper.py"
@@ -424,6 +425,7 @@ def _validate_remote(execution: dict) -> dict:
     version = image_tag_version(execution["image"])
     if version is not None and version < _MIN_WRAPPER_IMAGE:
         return err(ErrorCode.CONFIG_INVALID,
-                   "execution.image predates stitch_wrapper.py; use v{}.{}.{} or later".format(*_MIN_WRAPPER_IMAGE),
+                   "execution.image predates the stitch_wrapper this server needs (deadline_epoch); "
+                   "use v{}.{}.{} or later".format(*_MIN_WRAPPER_IMAGE),
                    {"path": path, "param": "execution.image", "got": execution["image"]})
     return ok({})

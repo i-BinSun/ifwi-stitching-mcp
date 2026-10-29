@@ -434,7 +434,7 @@ Artifactory is the fallback channel. See [Remote runner contract](#remote-runner
 | `execution.mode` | `local` | `local` runs the stitch command as a subprocess here, in a private per-run copy of the tool and inputs; `remote` runs it in a pod created through the Job API. |
 | `execution.endpoint` | — | **Required when `mode` is `remote`.** Linux Job API URL (`http://infra-api-fiv-linux.bios-dev-sh-cloud.intel.com/v1/fivportal/job`). |
 | `execution.artifactory_repo` | — | **Required when `mode` is `remote`, or `local` in server mode.** Each run publishes under `<artifactory_repo>/<plan_id>-<random>/`. |
-| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.0` | Linux pod image; must ship `/app/stitch_wrapper.py` (v1.1.0 or later — startup rejects older `vX.Y.Z` tags) and the Artifactory token. |
+| `execution.image` | `amr-registry.caas.intel.com/fia-cloud/fiv-ubuntu24.04-python3.13:v1.1.1` | Linux pod image; must ship `/app/stitch_wrapper.py` (v1.1.1 or later, whose wrapper honours `deadline_epoch` — startup rejects older `vX.Y.Z` tags) and the Artifactory token. |
 | `execution.repo_url` | `https://github.com/i-BinSun/ifwi-stitching-mcp.git` | Repo the wrapper installs `ifwi_mcp.worker` from. |
 | `execution.repo_ref` | `main` | Branch, tag or 40-hex commit the wrapper checks out (pin a commit in production). |
 | `execution.wrapper_path` | `/app/stitch_wrapper.py` | Wrapper path inside the image. |
@@ -515,8 +515,9 @@ protocol 1); the full design is `docs/superpowers/specs/2026-10-28-remote-execut
    are stored before the pod exists, so a result can always be found under `run_url`.
 2. `POST <endpoint>` with `{"image", "command", "os": "linux", "activedeadlineseconds",
    "ttlsecondsafterfinished"}` → `{"Code": 0, "Data": {"jobid": "fivportal-xxxxx"}}`. `command` is
-   `python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>` (no `sh -c`,
-   so the wrapper is PID 1 and receives SIGTERM). The spec (`zlib+base64url` JSON, or
+   `exec python3 /app/stitch_wrapper.py --job-id <job_id> --spec <spec> --report-token <token>`. The Job
+   API runs it as `sh -c "<command>"` with that `sh` as PID 1, which ignores SIGTERM; `exec` makes the
+   wrapper PID 1 so a pod delete or deadline reaches it and it can still report. The spec (`zlib+base64url` JSON, or
    `--spec-url <run_url>/spec.json` when long) holds `run_id`, `run_url`, `report_url`, the worker repo,
    `timeouts.budget_seconds` and `timeouts.deadline_epoch`, and the plan — never a credential. The
    one-job report token is stored only as a sha256 hash. A create request that certainly never reached
