@@ -43,6 +43,8 @@ _JOB_SETTINGS = (
     ("refresh_workers", "IFWI_MCP_REFRESH_WORKERS", 16, 1),
     ("max_inline_spec_bytes", "IFWI_MCP_MAX_INLINE_SPEC", 4096, 256),
     ("max_active_jobs", "IFWI_MCP_MAX_ACTIVE_JOBS", 64, 1),
+    # Remote jobs beyond this many live pods wait in state "queued"; 0 means no limit.
+    ("max_running_pods", "IFWI_MCP_MAX_RUNNING_PODS", 5, 0),
     ("job_retention_hours", "IFWI_MCP_JOB_RETENTION_HOURS", 168, 1),
     ("pod_cleanup_delay_seconds", "IFWI_MCP_POD_CLEANUP_DELAY", 30, 0),
 )

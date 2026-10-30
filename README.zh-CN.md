@@ -209,8 +209,8 @@ python -m venv .venv
 - 两个接口均可选传 `swimlane`、`binary_name`。多 swimlane/binary 时返回候选列表，须指定后重试；无法唯一匹配多个 stitch 配置时返回 HTTP 409 和配置候选，不自动猜测。
 - 查询和实际拼接默认同步。`"async":true` 时返回 HTTP 202（响应头带 `Location` 和 `Retry-After`）以及任务信息：`job_id`、`status_url`、`cancel_url`、`state`、`stage`、`terminal`、`poll_after_seconds`、`instance_id`。同步调用同样会创建任务，任务 ID 在响应头 `X-Job-Id` 中，成功时也在 `data.task_job_id`，失败时在 `detail.job_id`。拼接 `dry_run` 始终直接返回，不创建任务。
 - 可选字段 `client_request_id`（1–128 个 `[A-Za-z0-9_.:-]` 字符）用于幂等提交：同一请求用同一个值重发时返回已有任务（HTTP 200），不会再拼接一次；同一个值用在不同请求上返回 HTTP 409 `IDEMPOTENCY_CONFLICT`。每个新的逻辑请求生成一个新值，只在重试时复用。
-- `GET /jobs/{job_id}` 对存在的任务一律返回 HTTP 200。`data.terminal` 为 true 时停止轮询；`data.state` 取值为 `running`、`succeeded`、`failed`、`cancelled`（另保留 `queued`）。`data.stage` 仅用于展示（`resolving`、`submitting`、`submit_unknown`、`pending`、`running`、`finalizing`、`done`；远程任务只能看到 pod 级状态）。任务结束后 `data.result` 为完整的统一结果，`data.result_source` 说明结果来源（`callback`、`result_json`、`inferred`、`server`）。远程任务运行中，每次查询都会实时查一次 pod（同一任务 5 秒内最多一次）。两次轮询之间等待 `poll_after_seconds`。加上 `?events=true` 时还会返回 `data.events`，即该任务的事件日志（状态变化、回调、Job API 异常、删除 pod 等）。
-- server 模式下任务保存在 `<cache>/jobs.db`，结束后保留 `IFWI_MCP_JOB_RETENTION_HOURS`（7 天）；HTTP 404 `JOB_NOT_FOUND` 表示任务从未存在或已超过保留期。同时运行的任务最多 `IFWI_MCP_MAX_ACTIVE_JOBS`（64）个，超过时返回 HTTP 503 `JOB_QUEUE_FULL` 并带 `Retry-After`。
+- `GET /jobs/{job_id}` 对存在的任务一律返回 HTTP 200。`data.terminal` 为 true 时停止轮询；`data.state` 取值为 `queued`、`running`、`succeeded`、`failed`、`cancelled`。`data.stage` 仅用于展示（`resolving`、`queued`、`submitting`、`submit_unknown`、`pending`、`running`、`finalizing`、`done`；远程任务只能看到 pod 级状态）。任务结束后 `data.result` 为完整的统一结果，`data.result_source` 说明结果来源（`callback`、`result_json`、`inferred`、`server`）。远程任务运行中，每次查询都会实时查一次 pod（同一任务 5 秒内最多一次）。两次轮询之间等待 `poll_after_seconds`。加上 `?events=true` 时还会返回 `data.events`，即该任务的事件日志（状态变化、回调、Job API 异常、删除 pod 等）。
+- server 模式下任务保存在 `<cache>/jobs.db`，结束后保留 `IFWI_MCP_JOB_RETENTION_HOURS`（7 天）；HTTP 404 `JOB_NOT_FOUND` 表示任务从未存在或已超过保留期。同时运行的任务最多 `IFWI_MCP_MAX_ACTIVE_JOBS`（64）个，超过时返回 HTTP 503 `JOB_QUEUE_FULL` 并带 `Retry-After`。远程任务另外受 `IFWI_MCP_MAX_RUNNING_PODS`（5）限制：同时存在的 pod 达到上限后，新任务以 `queued` 状态排队（还没有 pod，也没有 `run_id`），有 pod 结束就按先来先到提交下一个。pending 超时和运行超时从真正提交时才开始计算。取消排队中的任务不会创建 pod；server 重启时排队中的任务以可重试的 `JOB_INTERRUPTED` 结束。
 - `GET /jobs?state=running,failed&kind=stitch&plan_id=...&limit=20&before=<created_at>` 按创建时间倒序列出任务（不含 `result`），用 `data.next_before` 翻页。
 - `POST /jobs/{job_id}/cancel` 立即把未结束的任务置为 `cancelled` 并删除其 pod（见 `data.cleanup.pod_delete`）。已结束的任务返回 HTTP 409 `JOB_ALREADY_FINISHED`；已经开始运行的本地拼接无法中断，返回 HTTP 409 `JOB_NOT_CANCELLABLE`。
 - HTTP 400 表示输入不合法，409 表示候选歧义，401 表示认证失败。
@@ -365,6 +365,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `execution.refresh_workers` | `16` | 查询时刷新专用的线程数，与同步请求的线程池分开。 |
 | `execution.max_inline_spec_bytes` | `4096` | wrapper spec 超过这个长度时上传到 `<run>/spec.json`，改用 `--spec-url` 传递。 |
 | `execution.max_active_jobs` | `64` | 活跃任务上限（超过返回 `JOB_QUEUE_FULL`）。 |
+| `execution.max_running_pods` | `5` | 同时存在的远程 pod 上限，超出的远程任务以 `queued` 排队。`0` 表示不限制。 |
 | `execution.job_retention_hours` | `168` | 已结束任务记录的保留时长。 |
 | `execution.pod_cleanup_delay_seconds` | `30` | 远程任务正常结束后，过多少秒删除它的 pod（给 wrapper 留出最后上传的时间）；`0` 表示立即删除。取消和超时时立即删除。 |
 | `execution.run_retention_hours` | `0` | server 模式本地执行时，任务结束后保留 `work/<run_id>/` 的小时数；`0` 表示上传后立即删除。 |
@@ -412,6 +413,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
 | `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
+| `IFWI_MCP_MAX_RUNNING_PODS` | `execution.max_running_pods` |
 | `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
 | `IFWI_MCP_POD_CLEANUP_DELAY` | `execution.pod_cleanup_delay_seconds` |
 | `IFWI_MCP_JOBS_DB` | server 模式任务数据库路径（默认 `<cache>/jobs.db`；不要放在网络共享盘上） |

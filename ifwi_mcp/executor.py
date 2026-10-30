@@ -583,10 +583,11 @@ def job_api_get(endpoint: str, pod_job_id: str) -> dict:
         kind = "running"
     else:
         kind = "unknown"
-    # It later reports such a job as "pending" with no pods at all; jobs.py treats that as
-    # ended once the pod should exist (see JobManager._classify).
+    # It later reports such a job as "pending" with no pods at all. A job whose pod could
+    # not be created yet (namespace quota full) looks the same, so jobs.py only treats it
+    # as ended once a pod was listed earlier (see JobManager._classify).
     return {"kind": kind, "status": status, "auth": False,
-            "no_pods": kind == "pending" and not pods}
+            "no_pods": kind == "pending" and not pods, "has_pods": bool(pods)}
 
 
 def job_api_delete(endpoint: str, pod_job_id: str) -> dict:

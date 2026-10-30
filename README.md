@@ -289,8 +289,8 @@ exposes independent authenticated REST JSON interfaces:
   instead of starting another stitch; reusing the id for a different request is HTTP 409
   `IDEMPOTENCY_CONFLICT`. Generate a fresh id per logical request and reuse it only on retries.
 - `GET /jobs/{job_id}` always answers HTTP 200 for a known job. Stop polling when `data.terminal`
-  is true; `data.state` is `running`, `succeeded`, `failed` or `cancelled` (`queued` is reserved).
-  `data.stage` is informational (`resolving`, `submitting`, `submit_unknown`, `pending`, `running`,
+  is true; `data.state` is `queued`, `running`, `succeeded`, `failed` or `cancelled`.
+  `data.stage` is informational (`resolving`, `queued`, `submitting`, `submit_unknown`, `pending`, `running`,
   `finalizing`, `done`; remote runs only expose the pod's state). `data.result` holds the unified
   envelope once terminal, and `data.result_source` says where it came from (`callback`,
   `result_json`, `inferred` or `server`). While a remote job runs, each query checks the pod live
@@ -299,7 +299,11 @@ exposes independent authenticated REST JSON interfaces:
 - In server mode jobs are stored in `<cache>/jobs.db` and kept for `IFWI_MCP_JOB_RETENTION_HOURS`
   (7 days) after they finish; HTTP 404 `JOB_NOT_FOUND` means the job never existed or is past
   retention. At most `IFWI_MCP_MAX_ACTIVE_JOBS` (64) jobs run at once; beyond that a submission
-  gets HTTP 503 `JOB_QUEUE_FULL` with `Retry-After`.
+  gets HTTP 503 `JOB_QUEUE_FULL` with `Retry-After`. Remote jobs are also limited to
+  `IFWI_MCP_MAX_RUNNING_PODS` (5) live pods: a job beyond that waits in state `queued` (no pod,
+  no `run_id` yet) and is submitted first-come first-served as soon as a pod finishes. Its
+  pending and run timeouts start only when it is submitted. Cancelling a queued job never
+  creates a pod; a server restart fails queued jobs with retryable `JOB_INTERRUPTED`.
 - `GET /jobs?state=running,failed&kind=stitch&plan_id=...&limit=20&before=<created_at>` lists jobs
   (newest first, without `result`); `data.next_before` pages further.
 - `POST /jobs/{job_id}/cancel` ends an unfinished job at once as `cancelled` and deletes its pod
@@ -448,6 +452,7 @@ Artifactory is the fallback channel. See [Remote runner contract](#remote-runner
 | `execution.refresh_workers` | `16` | Threads for query-time refreshes, separate from the synchronous-request pool. |
 | `execution.max_inline_spec_bytes` | `4096` | Larger wrapper specs are uploaded to `<run>/spec.json` and passed with `--spec-url`. |
 | `execution.max_active_jobs` | `64` | Active-job limit (`JOB_QUEUE_FULL` beyond it). |
+| `execution.max_running_pods` | `5` | Live remote pods at once; further remote jobs wait in state `queued`. `0` = no limit. |
 | `execution.job_retention_hours` | `168` | How long finished job records are kept. |
 | `execution.pod_cleanup_delay_seconds` | `30` | After a remote job ends on its own, delete its pod this many seconds later (gives the wrapper time for its last uploads). `0` deletes at once. Cancel and timeouts delete immediately. |
 | `execution.run_retention_hours` | `0` | Server mode with local execution: hours to keep each finished `work/<run_id>/` for debugging; `0` deletes it right after upload. |
@@ -496,6 +501,7 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
 | `IFWI_MCP_MAX_ACTIVE_JOBS` | `execution.max_active_jobs` |
+| `IFWI_MCP_MAX_RUNNING_PODS` | `execution.max_running_pods` |
 | `IFWI_MCP_JOB_RETENTION_HOURS` | `execution.job_retention_hours` |
 | `IFWI_MCP_POD_CLEANUP_DELAY` | `execution.pod_cleanup_delay_seconds` |
 | `IFWI_MCP_JOBS_DB` | server-mode job database path (default `<cache>/jobs.db`; never on a network share) |

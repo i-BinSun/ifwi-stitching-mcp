@@ -10,6 +10,7 @@ Design: docs/superpowers/specs/2026-10-28-remote-execution-status-design.md. In 
 * terminal states are written with conditional updates, first writer wins; the only
   exception is that an inferred failure can be replaced by a later authoritative result.
 """
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -47,6 +48,12 @@ STARTUP_SWEEP_LIMIT = 100
 PURGE_INTERVAL = 3600
 SUBMIT_RETRY_DELAYS = (2, 4, 8)
 POD_ID_WRITE_SECONDS = 60
+# A job waiting for a pod slot re-checks this often even without a wake-up, refreshing the
+# running jobs so one whose callback was lost still frees its slot.
+SLOT_RECHECK_SECONDS = 15
+# Stages in which a submitted remote job may hold a live pod (finalizing counts unless the
+# pod ended). A row reaches "submitting" before it claims a slot, so submitted_at decides.
+POD_STAGES = ("submitting", "submit_unknown", "pending", "running", "finalizing")
 DEGRADED_AFTER_ERRORS = 2
 LEGACY_TERMINATED_WINDOW = 120
 # stitch_wrapper versions from this one on honour spec.timeouts.deadline_epoch.
@@ -142,6 +149,8 @@ class JobManager:
         self._pool_slots = None
         self._pool_lock = threading.Lock()
         self._last_purge = 0.0
+        self._slot_cond = threading.Condition()
+        self._slot_queue = collections.deque()
 
     # ---- configuration ------------------------------------------------------------------
     @staticmethod
@@ -290,27 +299,32 @@ class JobManager:
         if self.server_mode and cfg["report_base_url"]:
             report_url = f"{cfg['report_base_url']}/internal/jobs/{job_id}/result"
         report_token = secrets.token_urlsafe(32) if report_url else ""
-        submitted_at = _now()
-        deadline_at = submitted_at + cfg["pending_timeout_seconds"] + cfg["timeout_seconds"]
+        times = {}
 
         def to_submitting(row):
             if row["state"] not in ACTIVE_STATES:
                 return False
-            row.update(stage="submitting", plan_id=plan_id, run_id=run_id, run_url=run_url,
+            # The pending/deadline clocks start here, after any wait for a pod slot.
+            times["submitted_at"] = _now()
+            row.update(state="running", stage="submitting", plan_id=plan_id, run_id=run_id,
+                       run_url=run_url,
                        report_token_hash=_sha256(report_token) if report_token else None,
-                       submitted_at=submitted_at, deadline_at=deadline_at, updated_at=_now())
+                       submitted_at=times["submitted_at"],
+                       deadline_at=times["submitted_at"] + cfg["pending_timeout_seconds"]
+                       + cfg["timeout_seconds"], updated_at=times["submitted_at"])
             row["remote"]["endpoint"] = cfg["endpoint"]
             if warnings:
                 row["remote"]["plan_warnings"] = list(warnings)
             return True
         try:
-            if not self.store.mutate(job_id, to_submitting):
+            if not self._claim_pod_slot(job_id, cfg, lambda: self.store.mutate(job_id, to_submitting)):
                 return                               # cancelled: never create the pod
         except Exception as exc:  # noqa: BLE001 - E3: no pod without a record
             _LOG.exception("job %s: could not record run_id before submitting", job_id)
             self._finish(job_id, err(ErrorCode.INTERNAL_ERROR, "could not record the run before submitting",
                                      {"reason": str(exc), "retryable": True}), "server")
             return
+        submitted_at = times["submitted_at"]
 
         spec = executor.build_spec(job_id=job_id, run_id=run_id, run_url=run_url,
                                    report_url=report_url, plan=plan, exec_cfg=cfg,
@@ -355,6 +369,60 @@ class JobManager:
                 return True
             if not self.store.mutate(job_id, to_unknown):
                 self._record_cleanup(job_id, "failed", warning=_ORPHAN_WARNING)
+
+    # ---- pod slots ----------------------------------------------------------------------
+    def _busy_pod_jobs(self) -> list:
+        """Remote jobs that may hold a live pod, i.e. count against max_running_pods."""
+        return [row for row in self.store.select(states=("running",), executor="remote")
+                if row["submitted_at"] is not None and row["stage"] in POD_STAGES
+                and not (row["stage"] == "finalizing"
+                         and row["finalize_reason"] in ("pod_ended", "pod_gone"))]
+
+    def _claim_pod_slot(self, job_id, cfg, claim):
+        """Run claim() (the move to "submitting") once a pod slot is free, first come first
+        served. Until then the job waits in state "queued". Returns claim()'s result, or None
+        if the job left the queue (cancelled) first."""
+        limit = cfg["max_running_pods"]
+        if not limit:
+            return claim()
+        with self._slot_cond:
+            self._slot_queue.append(job_id)
+        queued = False
+        try:
+            while True:
+                with self._slot_cond:
+                    busy = self._busy_pod_jobs()
+                    first = self._slot_queue[0] == job_id
+                    if first and len(busy) < limit:
+                        self._slot_queue.popleft()
+                        return claim()
+                    if not queued:
+                        queued = True
+                        if self.store.mutate(job_id, _active(
+                                f"waiting for a pod slot ({len(busy)}/{limit} in use, "
+                                f"{len(self._slot_queue) - 1} ahead)",
+                                state="queued", stage="queued")) is None:
+                            return None
+                    self._slot_cond.wait(SLOT_RECHECK_SECONDS)
+                if self._closed:
+                    return None                      # shutdown; startup recovery settles it
+                row = self.store.get(job_id)
+                if row is None or row["state"] not in ACTIVE_STATES:
+                    return None
+                if first:
+                    # Nothing else watches a job whose callback was lost; find out here.
+                    for other in busy:
+                        with contextlib.suppress(Exception):
+                            self.refresh(other["job_id"])
+        finally:
+            with self._slot_cond:
+                with contextlib.suppress(ValueError):
+                    self._slot_queue.remove(job_id)
+                self._slot_cond.notify_all()
+
+    def _wake_slot_waiters(self):
+        with self._slot_cond:
+            self._slot_cond.notify_all()
 
     def _after_created(self, job_id, pod_job_id, cfg):
         if not self._write_pod_job_id(job_id, pod_job_id, cfg):
@@ -425,6 +493,7 @@ class JobManager:
         updated = self.store.mutate(job_id, apply)
         if updated is not None:
             self._notify(job_id)
+            self._wake_slot_waiters()
             self._schedule_pod_cleanup(updated)
         return updated
 
@@ -600,7 +669,7 @@ class JobManager:
             self._retry_cleanup(row, cfg)
             self._maybe_upgrade(row)
             return self.store.get(job_id)
-        if row["executor"] != "remote" or row["stage"] in ("resolving", "querying", "submitting"):
+        if row["executor"] != "remote" or row["stage"] in ("resolving", "querying", "queued", "submitting"):
             return row
         now = _now()
         if row["last_checked_at"] and now - row["last_checked_at"] < cfg["refresh_min_interval_seconds"]:
@@ -646,9 +715,10 @@ class JobManager:
         if pod is None:
             return None
         early = now - (row["submitted_at"] or now) < GONE_GRACE_SECONDS
-        if pod.get("no_pods") and not early:
+        if pod.get("no_pods") and not early and row["remote"].get("pods_seen"):
             # The Linux Job API reports a job whose pod already finished (and failed) as
-            # "pending" with no pods; an unscheduled pod would still be listed.
+            # "pending" with no pods. A job whose pod was never listed is still queued: when
+            # the namespace quota is full the Job controller cannot create the pod yet.
             return "ended"
         if pod["kind"] != "not_found":
             return pod["kind"]
@@ -675,9 +745,14 @@ class JobManager:
                     if pod["status"] != row["pod_status"] and kind == "unknown":
                         note(row, f"unexpected Job API status {pod['status']!r}")
                     row["pod_status"] = pod["status"]
+                if pod.get("has_pods"):
+                    remote["pods_seen"] = True
                 if kind == "ended" and pod.get("no_pods"):
                     row["pod_status"] = "pending/no-pods"
                     note(row, "Job API reports the job pending with no pods left: the pod has finished")
+                elif kind == "pending" and pod.get("no_pods") and not remote.get("queued_noted"):
+                    remote["queued_noted"] = True
+                    note(row, "Job API reports the job pending with no pod yet: waiting for cluster capacity")
             if kind in ("pending", "running", "ended", "unknown"):
                 remote.pop("gone_seen_at", None)
             if kind in ("pending", "running"):
@@ -717,6 +792,8 @@ class JobManager:
         updated = self.store.mutate(row["job_id"], apply)
         if updated is None:
             return self.store.get(row["job_id"])
+        if reason in ("pod_ended", "pod_gone"):
+            self._wake_slot_waiters()
         return self._finalize_step(updated, cfg, recheck=False)
 
     def _finalize_step(self, row, cfg, *, recheck=True):
@@ -859,6 +936,7 @@ class JobManager:
             timers, self._timers = self._timers, set()
         for timer in timers:
             timer.cancel()
+        self._wake_slot_waiters()
 
     def _record_cleanup(self, job_id, outcome, *, warning=None):
         def apply(row):
@@ -950,6 +1028,7 @@ class JobManager:
             return 409, err(ErrorCode.JOB_NOT_CANCELLABLE, NOT_CANCELLABLE_LOCAL,
                             {"job_id": job_id, "stage": current["stage"]})
         self._notify(job_id)
+        self._wake_slot_waiters()
         if updated["cleanup_pending"]:
             stage = stage_at_cancel["stage"]
             if updated["pod_job_id"]:
@@ -1088,7 +1167,7 @@ class JobManager:
                                                    "the server restarted while the job was running",
                                                    detail), "server"):
                     counts["interrupted"] += 1
-            elif stage == "submitting" and row["run_id"] is None:
+            elif stage == "queued" or (stage == "submitting" and row["run_id"] is None):
                 # Died before the run was recorded, so no pod can exist yet.
                 if self._finish(row["job_id"], err(ErrorCode.JOB_INTERRUPTED,
                                                    "the server restarted before the pod was submitted",
@@ -1167,6 +1246,8 @@ def poll_after(row) -> Optional[int]:
         return 10
     if row["stage"] in ("querying", "resolving", "submitting"):
         return 5
+    if row["stage"] == "queued":
+        return 15
     return 30
 
 

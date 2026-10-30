@@ -251,10 +251,12 @@ def test_callback_success_finishes_the_job(setup):
     assert done["state"] == "succeeded" and done["result_source"] == "callback"
     data = done["result"]["data"]
     assert data["stitched_bin"] == {"url": f"{RUN_BASE}/r/deliverables/out.bin", "sha256": "abc", "bytes": 3}
-    assert data["job_id"] == "fivportal-abc" and data["pod_job_id"] == "fivportal-abc"
-    assert data["environment"] == {"fetched": [{"source": "ifwi"}]}
-    assert data["result_url"] == f"{row['run_url']}/result.json"
+    assert set(data) == set(jobs.SERVER_RESULT_KEYS)
+    assert data["artifactory_url"] == row["run_url"]
     assert done["remote"]["worker_commit"] == "c0ffee"
+    view = manager.view(done)
+    assert "pod_status" not in view["remote"] and view["remote"]["worker_commit"] == "c0ffee"
+    assert set(view["result"]["data"]) == {"stitched_bin", "log_url", "warnings"}
     again = _callback(manager, row, remote.token, _success())
     assert again[1]["data"]["accepted"] is False
 
@@ -538,7 +540,7 @@ def test_wait_returns_when_the_callback_arrives(setup):
     assert done["state"] == "succeeded"
     synced = manager.sync_result(done)
     assert synced["data"]["task_job_id"] == row["job_id"]
-    assert synced["data"]["job_id"] == "fivportal-abc"
+    assert "job_id" not in synced["data"]
 
 
 def test_stdio_mode_downloads_remote_deliverables(remote_cfg, clock, monkeypatch):
@@ -595,6 +597,15 @@ def test_recover_on_startup(store, clock):
     assert store.get("f")["result"]["error_code"] == ErrorCode.JOB_INTERRUPTED
 
 
+def test_recover_on_startup_interrupts_a_job_waiting_for_a_pod_slot(store, clock):
+    store.create(jobs.new_row(job_id="q", kind="stitch", executor="remote", state="queued",
+                              stage="queued", created_at=clock["now"], updated_at=clock["now"]),
+                 max_active=10)
+    manager = jobs.JobManager(store, server_mode=True)
+    assert manager.recover_on_startup()["interrupted"] == 1
+    assert store.get("q")["result"]["error_code"] == ErrorCode.JOB_INTERRUPTED
+
+
 def test_retention_purges_old_jobs(setup, clock):
     manager, remote = setup
     row = _submit(manager)
@@ -623,7 +634,8 @@ def test_mcp_job_tools(clean_env, monkeypatch):
     gate.set()
     done = jobs.get_manager().wait(job_id, timeout=5)
     view = server.stitch_get_job(job_id)["data"]
-    assert done["state"] == view["state"] == "succeeded" and view["result"]["data"]["plan_id"] == "plan-mcp"
+    assert done["state"] == view["state"] == "succeeded" and view["plan_id"] == "plan-mcp"
+    assert "plan_id" not in view["result"]["data"]
     assert server.stitch_get_job("nope")["error_code"] == ErrorCode.JOB_NOT_FOUND
     assert server.stitch_submit_plan("plan-missing")["error_code"] == ErrorCode.PLAN_NOT_FOUND
 
@@ -730,9 +742,13 @@ def test_version_1_database_gains_the_event_table(tmp_path):
 def test_a_failed_pod_reported_pending_without_pods_ends_the_job(setup, clock):
     manager, remote = setup
     row = _submit(manager)
+    remote.pod = {"kind": "running", "status": "active", "auth": False, "no_pods": False,
+                  "has_pods": True}
+    clock["now"] += 10
+    assert manager.refresh(row["job_id"])["stage"] == "running"
     remote.pod = {"kind": "pending", "status": "pending", "auth": False, "no_pods": True}
-    clock["now"] += 30
-    assert manager.refresh(row["job_id"])["stage"] == "pending"      # pod may not exist yet
+    clock["now"] += 20
+    assert manager.refresh(row["job_id"])["stage"] == "pending"      # still inside the grace
     clock["now"] += 60
     ended = manager.refresh(row["job_id"])
     assert ended["stage"] == "finalizing" and ended["finalize_reason"] == "pod_ended"
@@ -746,6 +762,39 @@ def test_a_failed_pod_reported_pending_without_pods_ends_the_job(setup, clock):
     assert any(d.startswith("Job API reports the job pending with no pods left") for d in details)
 
 
+def test_a_job_whose_pod_was_never_listed_stays_queued(setup, clock):
+    # Namespace quota full: the Job controller has not created the pod yet (2026-10-30).
+    manager, remote = setup
+    row = _submit(manager)
+    remote.pod = {"kind": "pending", "status": "pending", "auth": False, "no_pods": True,
+                  "has_pods": False}
+    for _ in range(5):
+        clock["now"] += 60
+        queued = manager.refresh(row["job_id"])
+        assert queued["state"] == "running" and queued["stage"] == "pending"
+    details = [e["detail"] for e in manager.store.events(row["job_id"])]
+    assert details.count("Job API reports the job pending with no pod yet: "
+                         "waiting for cluster capacity") == 1
+    remote.pod = {"kind": "running", "status": "active", "auth": False, "no_pods": False,
+                  "has_pods": True}
+    clock["now"] += 10
+    assert manager.refresh(row["job_id"])["stage"] == "running"
+    remote.pod = {"kind": "pending", "status": "pending", "auth": False, "no_pods": True,
+                  "has_pods": False}
+    clock["now"] += 10
+    assert manager.refresh(row["job_id"])["finalize_reason"] == "pod_ended"
+
+
+def test_a_job_never_given_a_pod_hits_the_pending_timeout(setup, clock):
+    manager, remote = setup
+    row = _submit(manager)
+    remote.pod = {"kind": "pending", "status": "pending", "auth": False, "no_pods": True,
+                  "has_pods": False}
+    clock["now"] += 901
+    done = manager.refresh(row["job_id"])
+    assert done["state"] == "failed" and done["result"]["error_code"] == "REMOTE_SCHEDULE_TIMEOUT"
+
+
 def test_pending_without_pods_is_not_taken_as_the_pod_coming_back(setup, clock):
     manager, remote = setup
     row = _submit(manager)
@@ -756,6 +805,87 @@ def test_pending_without_pods_is_not_taken_as_the_pod_coming_back(setup, clock):
     assert manager.refresh(row["job_id"])["finalize_reason"] == "pod_gone"
     remote.pod = {"kind": "pending", "status": "pending", "auth": False, "no_pods": True}
     assert manager.refresh(row["job_id"])["stage"] == "finalizing"
+
+# ---- pod slots (max_running_pods) ------------------------------------------------------
+
+def _token_of(remote, job_id):
+    command = next(c["command"] for c in remote.created if f"--job-id {job_id} " in c["command"])
+    return command.split("--report-token ")[1].split()[0]
+
+
+def _submit_queued(manager):
+    status, job = manager.submit_plan_object(_plan(), {"plan_id": "plan-test"})
+    assert status == "created", job
+    assert _wait_for(lambda: manager.store.get(job["job_id"])["stage"] == "queued")
+    return manager.store.get(job["job_id"])
+
+
+def test_jobs_beyond_max_running_pods_wait_queued_then_submit_in_order(setup, remote_cfg, clock):
+    remote_cfg(max_running_pods=2)
+    manager, remote = setup
+    first, second = _submit(manager), _submit(manager)
+    third = _submit_queued(manager)
+    fourth = _submit_queued(manager)
+    assert len(remote.created) == 2
+    assert third["state"] == "queued" and third["run_id"] is None and third["submitted_at"] is None
+    view = manager.view(manager.refresh(third["job_id"]))
+    assert view["state"] == "queued" and not view["terminal"] and view["poll_after_seconds"] == 15
+    details = [e["detail"] for e in manager.store.events(fourth["job_id"])]
+    assert "waiting for a pod slot (2/2 in use, 1 ahead)" in details
+
+    clock["now"] += 600
+    _callback(manager, first, _token_of(remote, first["job_id"]), _success())
+    assert _wait_for(lambda: manager.store.get(third["job_id"])["stage"] == "pending")
+    assert manager.store.get(fourth["job_id"])["stage"] == "queued" and len(remote.created) == 3
+    started = manager.store.get(third["job_id"])
+    assert started["state"] == "running" and started["submitted_at"] == clock["now"]
+    assert started["deadline_at"] == clock["now"] + 900 + 3600
+
+    manager.cancel(second["job_id"])
+    assert _wait_for(lambda: manager.store.get(fourth["job_id"])["stage"] == "pending")
+    assert len(remote.created) == 4
+
+
+def test_a_cancelled_queued_job_never_creates_a_pod(setup, remote_cfg):
+    remote_cfg(max_running_pods=1)
+    manager, remote = setup
+    _submit(manager)
+    queued = _submit_queued(manager)
+    status, body = manager.cancel(queued["job_id"])
+    assert status == 200 and body["data"]["state"] == "cancelled"
+    assert _wait_for(lambda: not manager._slot_queue)
+    assert len(remote.created) == 1 and manager.store.get(queued["job_id"])["cleanup"] is None
+
+
+def test_the_queue_head_refreshes_running_jobs_whose_callback_was_lost(setup, remote_cfg,
+                                                                       monkeypatch):
+    monkeypatch.setattr(jobs, "SLOT_RECHECK_SECONDS", 0.05)
+    remote_cfg(max_running_pods=1)
+    manager, remote = setup
+    running = _submit(manager)
+    queued = _submit_queued(manager)
+    remote.result = {"kind": "found", "envelope": {**_success(), "run_id": running["run_id"]}}
+    remote.pod = {"kind": "ended", "status": "succeeded", "auth": False}
+    assert _wait_for(lambda: manager.store.get(queued["job_id"])["stage"] == "pending")
+    assert manager.store.get(running["job_id"])["state"] == "succeeded"
+
+
+def test_a_finalizing_job_whose_pod_ended_frees_its_slot(setup, remote_cfg, clock):
+    remote_cfg(max_running_pods=1)
+    manager, remote = setup
+    row = _submit(manager)
+    queued = _submit_queued(manager)
+    remote.pod = {"kind": "ended", "status": "succeeded", "auth": False}
+    assert manager.refresh(row["job_id"])["stage"] == "finalizing"
+    assert _wait_for(lambda: manager.store.get(queued["job_id"])["stage"] == "pending")
+
+
+def test_zero_max_running_pods_means_no_limit(setup, remote_cfg):
+    remote_cfg(max_running_pods=0)
+    manager, remote = setup
+    for _ in range(7):
+        _submit(manager)
+    assert len(remote.created) == 7
 
 # ---- pod cleanup after a normal end ----------------------------------------------------
 

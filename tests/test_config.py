@@ -309,13 +309,18 @@ def test_job_settings_defaults_and_overrides(clean_env, write_config, monkeypatc
     assert data["wrapper_path"] == "/app/stitch_wrapper.py"
     assert (data["pending_timeout_seconds"], data["finalize_grace_seconds"],
             data["refresh_min_interval_seconds"], data["refresh_workers"],
-            data["max_inline_spec_bytes"], data["max_active_jobs"],
-            data["job_retention_hours"]) == (900, 120, 5, 16, 4096, 64, 168)
+            data["max_inline_spec_bytes"], data["max_active_jobs"], data["max_running_pods"],
+            data["job_retention_hours"]) == (900, 120, 5, 16, 4096, 64, 5, 168)
     assert data["report_base_url"] == ""
-    write_config({"execution": {"max_active_jobs": 3, "report_base_url": "https://mcp.example.com/"}})
+    write_config({"execution": {"max_active_jobs": 3, "max_running_pods": 0,
+                                "report_base_url": "https://mcp.example.com/"}})
     monkeypatch.setenv("IFWI_MCP_EXEC_FINALIZE_GRACE", "200")
     data = config.get_execution_config()["data"]
     assert data["max_active_jobs"] == 3 and data["finalize_grace_seconds"] == 200
+    assert data["max_running_pods"] == 0
+    monkeypatch.setenv("IFWI_MCP_MAX_RUNNING_PODS", "8")
+    assert config.get_execution_config()["data"]["max_running_pods"] == 8
+    monkeypatch.delenv("IFWI_MCP_MAX_RUNNING_PODS")
     assert data["report_base_url"] == "https://mcp.example.com"
     monkeypatch.setenv("IFWI_MCP_REPORT_BASE_URL", "mcp.example.com")
     assert config.get_execution_config()["detail"]["param"] == "execution.report_base_url"

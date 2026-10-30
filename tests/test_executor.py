@@ -629,7 +629,8 @@ def test_job_api_get_flags_a_job_left_without_pods(remote_env, monkeypatch):
     _post_returning(monkeypatch, _Resp({"Code": 0, "Message": "jobpending",
                                         "Data": {"status": "pending", "pods": None}}))
     polled = executor.job_api_get(remote_env["endpoint"], "fivportal-abc")
-    assert polled["kind"] == "pending" and polled["no_pods"] is True
+    assert polled["kind"] == "pending" and polled["no_pods"] is True and polled["has_pods"] is False
     _post_returning(monkeypatch, _Resp({"Code": 0, "Data": {"status": "pending",
                                                             "pods": [{"status": "Pending"}]}}))
-    assert executor.job_api_get(remote_env["endpoint"], "fivportal-abc")["no_pods"] is False
+    polled = executor.job_api_get(remote_env["endpoint"], "fivportal-abc")
+    assert polled["no_pods"] is False and polled["has_pods"] is True

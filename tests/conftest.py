@@ -30,7 +30,7 @@ def clean_env(monkeypatch, tmp_path):
                 "IFWI_MCP_REPORT_BASE_URL", "IFWI_MCP_WRAPPER_PATH",
                 "IFWI_MCP_EXEC_PENDING_TIMEOUT", "IFWI_MCP_EXEC_FINALIZE_GRACE",
                 "IFWI_MCP_REFRESH_MIN_INTERVAL", "IFWI_MCP_REFRESH_WORKERS",
-                "IFWI_MCP_MAX_INLINE_SPEC", "IFWI_MCP_MAX_ACTIVE_JOBS",
+                "IFWI_MCP_MAX_INLINE_SPEC", "IFWI_MCP_MAX_ACTIVE_JOBS", "IFWI_MCP_MAX_RUNNING_PODS",
                 "IFWI_MCP_JOB_RETENTION_HOURS", "IFWI_MCP_JOBS_DB",
                 "IFWI_STITCH_RESULT_FILE", "IFWI_STITCH_RUN_ID", "IFWI_STITCH_DEADLINE_EPOCH"):
         monkeypatch.delenv(var, raising=False)
