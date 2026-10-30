@@ -145,6 +145,36 @@ def test_worker_uses_pinned_urls_without_fiv_lookups(clean_env, monkeypatch, tmp
                      ("https://art/tool.7z", "stitch")]
 
 
+def test_custom_urls_get_their_own_cache_dirs(clean_env, monkeypatch, tmp_path):
+    p = _plan(tmp_path)
+    p["sources"]["ifwi"].update({"url": "https://art/dev/ifwi.bin", "custom": True})
+    p["sources"]["ingredients"][0].update({"url": "https://art/dev/mmc.7z", "custom": True})
+    p["sources"]["stitch_tool"] = {"kind": "local", "local_path": str(tmp_path / "tool.7z")}
+    (tmp_path / "tool.7z").write_bytes(b"t")
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"b")
+    ingredient = tmp_path / "mmc"; ingredient.mkdir()
+    categories, extract_names = [], []
+
+    def download(url, category):
+        categories.append(category)
+        return ok({"local_path": str(binary if category.startswith("ifwi") else tmp_path / "mmc.7z")})
+
+    def extract(path, dest_name=None):
+        extract_names.append(dest_name)
+        return ok({"extract_dir": str(ingredient)})
+
+    monkeypatch.setattr(executor.artifactory, "download", download)
+    monkeypatch.setattr(executor.archive, "extract_archive", extract)
+    monkeypatch.setattr(executor.stitch_runner, "extract_stitch_tool", lambda path: ok({
+        "stitch_dir": str(tmp_path), "tool_root": str(tmp_path),
+        "venv_python": "python", "config_targets": [], "warnings": []}))
+    assert executor.prepare_environment(p)["ok"] is True
+    assert categories[0].startswith("ifwi/custom-")
+    assert categories[1].startswith("ingredients/custom-")
+    # Extraction is keyed by URL too, or a same-named archive would reuse old contents.
+    assert extract_names[0].startswith("mmc-custom-")
+
+
 def test_worker_auto_config_uses_extracted_targets(clean_env, env_fakes, run_fakes,
                                                    monkeypatch, tmp_path):
     p = _plan(tmp_path)
@@ -343,23 +373,17 @@ def test_execute_plan_id_unknown(clean_env):
     assert executor.execute_plan_id("plan-nope")["error_code"] == ErrorCode.PLAN_NOT_FOUND
 
 
+
+
 class _Resp:
-    def __init__(self, payload, status_code=200):
-        self._payload, self.status_code, self.text = payload, status_code, str(payload)
+    def __init__(self, payload, status_code=200, text=None):
+        self._payload, self.status_code = payload, status_code
+        self.text = text if text is not None else str(payload)
 
     def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return self._payload
-
-
-class _Download:
-    """Streaming response used when a deliverable file is fetched."""
-    status_code = 200
-
-    def raise_for_status(self):
-        return None
-
-    def iter_content(self, chunk_size=0):
-        yield b"stitched"
 
 
 @pytest.fixture
@@ -367,141 +391,106 @@ def remote_env(clean_env, write_config, monkeypatch):
     write_config({"execution": {"mode": "remote", "token": "secret",
                                 "endpoint": "https://jobs.example.com/v1/fivportal/job",
                                 "artifactory_repo": "https://af.example.com/repo/RemoteStitch/",
-                                "timeout_seconds": 10, "poll_interval_seconds": 1}})
+                                "timeout_seconds": 3600}})
     monkeypatch.setenv("ARTIFACTORY_TOKEN", "af-secret")
-    state = {"jobs": [], "status": ["running", "succeeded"], "result": None,
-             "result_status": 200, "result_urls": [], "downloads": []}
+    return executor.config.get_execution_config()["data"]
 
-    def fake_request(method, url, json=None, headers=None, **kwargs):
-        state["jobs"].append((method, url, json, headers))
-        if method == "POST":
-            return _Resp({"Code": 0, "Message": "CreateSuccess",
-                          "Data": {"jobid": "fivportal-abc", "status": ""}})
-        status = state["status"].pop(0) if len(state["status"]) > 1 else state["status"][0]
-        return _Resp({"Code": 0, "Data": {"jobid": "fivportal-abc", "status": status}})
 
-    def fake_get(url, stream=False, headers=None, **kwargs):
-        if stream:                       # deliverable download
-            state["downloads"].append(url)
-            return _Download()
-        state["result_urls"].append((url, headers))
-        return _Resp(state["result"], status_code=state["result_status"])
+def _post_returning(monkeypatch, response=None, raises=None):
+    calls = []
 
+    def fake_request(method, url, json=None, headers=None, timeout=None, **kwargs):
+        calls.append({"method": method, "url": url, "json": json, "headers": headers,
+                      "timeout": timeout})
+        if raises is not None:
+            raise raises
+        return response
     monkeypatch.setattr(executor.requests, "request", fake_request)
-    monkeypatch.setattr(executor.requests, "get", fake_get)
-
-    # Virtual clock: sleeping advances time instead of blocking.
-    clock = {"now": 0.0}
-    monkeypatch.setattr(executor.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(executor.time, "sleep",
-                        lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
-    return state
+    return calls
 
 
-def _success_result():
-    return {"ok": True, "data": {
-        "exit_code": 0, "command_line": "python cli.py ...",
-        "deliverables": [
-            {"url": "https://af.example.com/repo/RemoteStitch/r/deliverables/out.bin",
-             "name": "out.bin", "kind": "stitched_bin"},
-            {"url": "https://af.example.com/repo/RemoteStitch/r/deliverables/plan-test.log",
-             "name": "plan-test.log", "kind": "log"}],
-        "warnings": ["remote warn"]}}
+def test_create_pod_posts_a_linux_job(remote_env, monkeypatch):
+    calls = _post_returning(monkeypatch, _Resp({"Code": 0, "Data": {"jobid": "fivportal-abc"}}))
+    created = executor.create_pod(remote_env["endpoint"], remote_env, "python3 /app/stitch_wrapper.py")
+    assert created == {"outcome": "created", "pod_job_id": "fivportal-abc"}
+    payload = calls[0]["json"]
+    assert payload["os"] == "linux" and payload["activedeadlineseconds"] == 3600
+    assert payload["ttlsecondsafterfinished"] == 43200
+    assert payload["image"].endswith("fiv-ubuntu24.04-python3.13:v1.1.1")
+    assert calls[0]["headers"]["Authorization"] == "Bearer secret"
 
 
-def test_execute_remote_creates_pod_polls_and_reads_result(remote_env, tmp_path):
-    remote_env["result"] = _success_result()
-    r = executor.execute(_plan(tmp_path))
-    assert r["ok"] is True, r
-
-    method, url, payload, headers = remote_env["jobs"][0]
-    assert (method, url) == ("POST", "https://jobs.example.com/v1/fivportal/job")
-    assert headers["Authorization"] == "Bearer secret"
-    assert payload["os"] == "windows" and payload["activedeadlineseconds"] == 10
-    assert payload["image"].startswith("amr-registry.caas.intel.com/")
-    command = payload["command"]
-    assert "git clone" in command and "python -m ifwi_mcp.worker" in command
-    assert "af-secret" not in command          # tokens never travel on the command line
-    encoded = command.split("--plan-b64 ")[1].split()[0]
-    assert plan.decode_plan(encoded)["plan_id"] == "plan-test"
-    run_url = command.split("--upload-url ")[1].split()[0]
-    assert run_url.startswith("https://af.example.com/repo/RemoteStitch/plan-test-")
-
-    assert [j[:2] for j in remote_env["jobs"][1:]] == [
-        ("GET", "https://jobs.example.com/v1/fivportal/job/fivportal-abc")] * 2
-    assert remote_env["result_urls"][0][0] == f"{run_url}/result.json"
-    assert remote_env["result_urls"][0][1]["Authorization"] == "Bearer af-secret"
-
-    data = r["data"]
-    assert data["mode"] == "remote" and data["job_id"] == "fivportal-abc"
-    assert data["artifactory_url"] == run_url
-    assert data["stitched_bin_url"].endswith("/deliverables/out.bin")
-    assert [a["kind"] for a in data["artifacts"]] == ["stitched_bin", "log"]
-    assert data["stitched_bin"].endswith("out.bin")
-    assert data["deliverables"]["item_count"] == 2
-    assert data["warnings"] == ["remote warn"]
+@pytest.mark.parametrize("response, outcome, code", [
+    (_Resp({"Code": 1, "Message": "CreateFail"}), "rejected", ErrorCode.REMOTE_SUBMIT_FAILED),
+    (_Resp({"error": "bad"}, status_code=400), "rejected", ErrorCode.REMOTE_SUBMIT_FAILED),
+    (_Resp({"error": "nope"}, status_code=401), "rejected", ErrorCode.AUTH_FAILED),
+    (_Resp({"Code": -1, "Message": "Unauthorized"}, status_code=500), "rejected", ErrorCode.AUTH_FAILED),
+    (_Resp({"Code": -1}, status_code=503), "unknown", ErrorCode.REMOTE_SUBMIT_UNKNOWN),
+    (_Resp(ValueError("html"), status_code=502, text="<html>"), "unknown", ErrorCode.REMOTE_SUBMIT_UNKNOWN),
+    (_Resp(ValueError("html"), status_code=200, text="<html>"), "unknown", ErrorCode.REMOTE_SUBMIT_UNKNOWN),
+    (_Resp({"Code": 0, "Data": {}}), "unknown", ErrorCode.REMOTE_SUBMIT_UNKNOWN),
+])
+def test_create_pod_classifies_answers(remote_env, monkeypatch, response, outcome, code):
+    _post_returning(monkeypatch, response)
+    created = executor.create_pod(remote_env["endpoint"], remote_env, "cmd")
+    assert created["outcome"] == outcome and created["result"]["error_code"] == code
+    assert "secret" not in json.dumps(created)
 
 
-def test_execute_remote_reports_worker_failure_with_log_links(remote_env, tmp_path):
-    remote_env["status"] = ["failed"]
-    remote_env["result"] = {"ok": False, "error_code": "STITCH_RUN_FAILED", "message": "boom",
-                            "detail": {"exit_code": 3, "deliverables": [
-                                {"url": "https://af/x.log", "name": "x.log", "kind": "log"}]}}
-    r = executor.execute(_plan(tmp_path))
-    assert r["error_code"] == ErrorCode.STITCH_RUN_FAILED
-    assert r["detail"]["exit_code"] == 3
-    assert r["detail"]["job_id"] == "fivportal-abc"
-    assert r["detail"]["deliverables"][0]["url"] == "https://af/x.log"
-    assert r["detail"]["result_url"].endswith("/result.json")
+def test_create_pod_distinguishes_unsent_from_uncertain(remote_env, monkeypatch):
+    import requests
+    import urllib3
+
+    refused = requests.exceptions.ConnectionError(urllib3.exceptions.MaxRetryError(
+        None, "/", urllib3.exceptions.NewConnectionError(None, "refused")))
+    for exc, outcome in ((requests.exceptions.ConnectTimeout("slow"), "not_sent"),
+                         (refused, "not_sent"),
+                         (requests.exceptions.ReadTimeout("no answer"), "unknown"),
+                         (requests.exceptions.ConnectionError("Connection aborted"), "unknown")):
+        _post_returning(monkeypatch, raises=exc)
+        assert executor.create_pod(remote_env["endpoint"], remote_env, "cmd")["outcome"] == outcome
 
 
-def test_execute_remote_pod_died_without_result(remote_env, tmp_path):
-    remote_env["status"] = ["failed"]
-    remote_env["result_status"] = 404
-    r = executor.execute(_plan(tmp_path))
-    assert r["error_code"] == ErrorCode.REMOTE_EXEC_FAILED
-    assert r["detail"]["job_status"] == "failed"
-    assert r["detail"]["job_id"] == "fivportal-abc"
+@pytest.mark.parametrize("body, kind", [
+    ({"Code": 0, "Data": {"status": "pending"}}, "pending"),
+    ({"Code": 0, "Data": {"status": ""}}, "pending"),
+    ({"Code": 0, "Data": {"status": "Running"}}, "running"),
+    ({"Code": 0, "Data": {"status": "succeeded"}}, "ended"),
+    ({"Code": 0, "Data": {"status": "failed"}}, "ended"),
+    ({"Code": 0, "Data": {"status": "evicted"}}, "unknown"),
+    # Shapes recorded from the real Linux Job API (2026-10-29).
+    ({"Code": 0, "Message": "jobpending", "Data": {"status": "pending",
+                                                   "pods": [{"name": "p", "status": "Pending"}]}}, "pending"),
+    ({"Code": 0, "Message": "jobactive", "Data": {"status": "active",
+                                                  "pods": [{"name": "p", "status": "Running"}]}}, "running"),
+    ({"Code": 0, "Message": "jobsucceeded", "Data": {"status": "succeeded",
+                                                     "pods": [{"name": "p", "status": "Succeeded"}]}}, "ended"),
+    ({"Code": 0, "Message": "jobactive", "Data": {"status": "active",
+                                                  "pods": [{"name": "p", "status": "Failed"}]}}, "ended"),
+    ({"Code": 0, "Message": "jobpending", "Data": {"status": "pending", "pods": None}}, "pending"),
+    ({"Code": -1, "Message": 'jobs.batch "fivportal-abc" not found'}, "not_found"),
+    ({"Code": -1, "Message": "internal"}, "error"),
+])
+def test_job_api_get_classifies_status(remote_env, monkeypatch, body, kind):
+    _post_returning(monkeypatch, _Resp(body))
+    assert executor.job_api_get(remote_env["endpoint"], "fivportal-abc")["kind"] == kind
 
 
-def test_execute_remote_success_requires_uploaded_stitched_bin(remote_env, tmp_path):
-    remote_env["result"] = {"ok": True, "data": {"deliverables": [
-        {"url": "https://af/x.log", "name": "x.log", "kind": "log"}]}}
-    r = executor.execute(_plan(tmp_path))
-    assert r["error_code"] == ErrorCode.DELIVERABLE_MISSING
-    assert remote_env["downloads"] == []
+def test_job_api_get_flags_auth_errors(remote_env, monkeypatch):
+    _post_returning(monkeypatch, _Resp({"error": "no"}, status_code=403))
+    polled = executor.job_api_get(remote_env["endpoint"], "fivportal-abc")
+    assert polled["kind"] == "error" and polled["auth"] is True
 
 
-def test_execute_remote_requires_artifactory_repo(remote_env, write_config, tmp_path):
-    write_config({"execution": {"mode": "remote", "endpoint": "https://jobs.example.com/job"}})
-    r = executor.execute(_plan(tmp_path))
-    assert r["detail"]["param"] == "execution.artifactory_repo"
-    assert remote_env["jobs"] == []
-
-
-def test_execute_remote_rejects_unsafe_plan_id(remote_env, tmp_path):
-    r = executor.execute(_plan(tmp_path, plan_id="x; whoami"))
-    assert r["error_code"] == ErrorCode.PLAN_INVALID
-    assert remote_env["jobs"] == []
-
-
-def test_execute_remote_job_api_refuses(remote_env, monkeypatch, tmp_path):
-    monkeypatch.setattr(executor.requests, "request",
-                        lambda *a, **kw: _Resp({"Code": 1, "Message": "CreateFail"}))
-    r = executor.execute(_plan(tmp_path))
-    assert r["error_code"] == ErrorCode.REMOTE_EXEC_FAILED
-
-
-def test_execute_remote_rejects_bad_credentials(remote_env, monkeypatch, tmp_path):
-    monkeypatch.setattr(executor.requests, "request",
-                        lambda *a, **kw: _Resp({"error": "nope"}, status_code=401))
-    assert executor.execute(_plan(tmp_path))["error_code"] == ErrorCode.AUTH_FAILED
+def test_job_api_delete_accepts_204(remote_env, monkeypatch):
+    calls = _post_returning(monkeypatch, _Resp(ValueError("empty"), status_code=204, text=""))
+    assert executor.job_api_delete(remote_env["endpoint"], "fivportal-abc")["ok"] is True
+    assert calls[0]["method"] == "DELETE" and calls[0]["url"].endswith("/fivportal-abc")
 
 
 def test_job_api_unauthorized_envelope_on_http_500(remote_env, monkeypatch):
-    monkeypatch.setattr(executor.requests, "request",
-                        lambda *a, **kw: _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
-                                              status_code=500))
+    _post_returning(monkeypatch, _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
+                                       status_code=500))
     result = executor._job_api("GET", "https://jobs.example.com/job/unknown")
     assert result["error_code"] == ErrorCode.AUTH_FAILED
     assert result["detail"]["status"] == 500
@@ -511,17 +500,136 @@ def test_job_api_unauthorized_envelope_on_http_500(remote_env, monkeypatch):
 
 
 def test_job_api_unauthorized_without_exec_token(clean_env, monkeypatch):
-    monkeypatch.setattr(executor.requests, "request",
-                        lambda *a, **kw: _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
-                                              status_code=500))
+    _post_returning(monkeypatch, _Resp({"Code": -1, "Message": "Unauthorized", "Data": None},
+                                       status_code=500))
     result = executor._job_api("GET", "https://jobs.example.com/job/unknown")
     assert result["error_code"] == ErrorCode.AUTH_FAILED
     assert result["detail"]["has_exec_token"] is False
 
 
-def test_execute_remote_times_out(remote_env, tmp_path):
-    remote_env["status"] = ["running"]
-    r = executor.execute(_plan(tmp_path))
-    assert r["error_code"] == ErrorCode.REMOTE_TIMEOUT
-    assert r["detail"]["timeout_seconds"] == 10
-    assert r["detail"]["job_id"] == "fivportal-abc"
+@pytest.mark.parametrize("response, kind", [
+    (_Resp({"ok": True, "data": {}}), "found"),
+    (_Resp({"ok": False, "error_code": "X", "run_id": "r", "schema_version": 1}), "found"),
+    (_Resp({"ok": "maybe"}), "invalid"),
+    (_Resp(ValueError("html"), text="<html>"), "invalid"),
+    (_Resp({}, status_code=404), "missing"),
+    (_Resp({}, status_code=403), "auth"),
+    (_Resp({}, status_code=500), "error"),
+])
+def test_read_result_json(remote_env, monkeypatch, response, kind):
+    seen = {}
+
+    def fake_get(url, headers=None, **kwargs):
+        seen.update(url=url, headers=headers)
+        return response
+    monkeypatch.setattr(executor.requests, "get", fake_get)
+    read = executor.read_result_json("https://af.example.com/repo/run")
+    assert read["kind"] == kind
+    assert seen["url"] == "https://af.example.com/repo/run/result.json"
+    assert seen["headers"]["Authorization"] == "Bearer af-secret"
+
+
+def test_spec_and_command_are_shell_safe_and_credential_free(remote_env, tmp_path):
+    spec = executor.build_spec(job_id="j1", run_id="plan-test-1a2b3c4d",
+                               run_url="https://af.example.com/repo/plan-test-1a2b3c4d",
+                               report_url="https://mcp.example.com/internal/jobs/j1/result",
+                               plan=_plan(tmp_path), exec_cfg=remote_env, submitted_at=1000.0)
+    assert spec["spec_version"] == 1 and spec["worker"]["repo_ref"] == "main"
+    assert spec["timeouts"] == {"budget_seconds": 3600, "deadline_epoch": 1000 + 3600 - 30}
+    token = plan.encode_plan(spec)
+    command = executor.wrapper_command(remote_env, "j1", spec_token=token, report_token="tok_-x")
+    assert command == f"exec python3 /app/stitch_wrapper.py --job-id j1 --spec {token} --report-token tok_-x"
+    import re
+    assert all(re.fullmatch(r"[A-Za-z0-9_.:/=-]+", part) for part in command.split(" "))
+    assert "secret" not in json.dumps(spec)
+    by_url = executor.wrapper_command(remote_env, "j1", spec_url="https://af/run/spec.json")
+    assert by_url.endswith("--spec-url https://af/run/spec.json")
+
+
+def test_shape_remote_success_keeps_v1_aliases():
+    where = {"plan_id": "p", "run_id": "p-1", "artifactory_url": "https://af/p-1",
+             "result_url": "https://af/p-1/result.json", "pod_job_id": "fivportal-abc",
+             "pod_log_url": "https://af/p-1/pod.log", "endpoint": "https://jobs"}
+    envelope = {"ok": True, "data": {
+        "exit_code": 0, "command_line": "py", "stitched_bin": "/pod/local/out.bin",
+        "deliverables": [{"url": "https://af/p-1/deliverables/out.bin", "name": "out.bin",
+                          "kind": "stitched_bin", "sha256": "abc", "bytes": 3, "path": "/pod"}],
+        "environment": {"stitch_dir": "/pod/tool", "fetched": [{"source": "ifwi"}]}}}
+    data = executor.shape_remote_success(envelope, where)["data"]
+    assert data["stitched_bin"] == {"url": "https://af/p-1/deliverables/out.bin", "sha256": "abc", "bytes": 3}
+    assert data["stitched_bin_url"] == data["stitched_bin"]["url"]
+    assert data["job_id"] == data["pod_job_id"] == "fivportal-abc"
+    assert data["artifacts"] == [{"name": "out.bin", "url": "https://af/p-1/deliverables/out.bin",
+                                  "kind": "stitched_bin"}]
+    assert data["environment"] == {"fetched": [{"source": "ifwi"}]}
+    assert "/pod/" not in json.dumps(data)
+    missing = executor.shape_remote_success({"ok": True, "data": {"deliverables": []}}, where)
+    assert missing["error_code"] == ErrorCode.DELIVERABLE_MISSING
+
+
+def test_execute_remote_goes_through_the_job_manager(remote_env, monkeypatch, tmp_path):
+    from ifwi_mcp import jobs
+    seen = {}
+
+    class FakeManager:
+        def run_plan(self, p):
+            seen["plan_id"] = p["plan_id"]
+            return ok({"task_job_id": "j"})
+    monkeypatch.setattr(jobs, "get_manager", lambda: FakeManager())
+    assert executor.execute(_plan(tmp_path))["data"]["task_job_id"] == "j"
+    assert seen["plan_id"] == "plan-test"
+
+
+def _case_sensitive(path):
+    probe = path / "case_probe"
+    probe.mkdir()
+    try:
+        return not (path / "CASE_PROBE").exists()
+    finally:
+        probe.rmdir()
+
+
+def _stitch_writing(tmp_path, *files):
+    """A fake stitch tool that writes each (relative path, bytes) and exits 0."""
+    import sys
+    body = "; ".join(f"os.makedirs(os.path.dirname({name!r}), exist_ok=True); "
+                     f"open({name!r}, 'wb').write({data!r})" for name, data in files)
+    return stitch_runner.execute_command([sys.executable, "-c", "import os; " + body], str(tmp_path))
+
+
+def test_output_dir_is_found_case_insensitively(tmp_path):
+    (tmp_path / "Output").mkdir()
+    found = stitch_runner._child_dir(tmp_path, "output")
+    assert found.is_dir() and found.name.casefold() == "output"
+    assert stitch_runner._child_dir(tmp_path, "release") == tmp_path / "release"
+    assert stitch_runner._child_dirs(tmp_path, "release") == [tmp_path / "release"]
+
+
+@pytest.mark.parametrize("folder", ["output", "Output"])
+def test_execute_command_finds_either_output_spelling(clean_env, tmp_path, folder):
+    run = _stitch_writing(tmp_path, (f"{folder}/out.bin", b"x"))
+    assert run["ok"] is True, run
+    assert run["data"]["stitched_bin"].endswith("out.bin")
+    assert run["data"]["output_dir"].casefold().endswith(folder.casefold())
+
+
+@pytest.mark.parametrize("with_bin, other", [("Output", "output"), ("output", "Output")])
+def test_execute_command_searches_both_spellings_when_both_exist(clean_env, tmp_path, with_bin, other):
+    if not _case_sensitive(tmp_path):
+        pytest.skip("output/ and Output/ cannot coexist on a case-insensitive file system")
+    run = _stitch_writing(tmp_path, (f"{other}/stitch.log", b"log"), (f"{with_bin}/out.bin", b"x"))
+    assert run["ok"] is True, run
+    assert run["data"]["stitched_bin"] == str(tmp_path / with_bin / "out.bin")
+    assert sorted(stitch_runner._child_dirs(tmp_path, "output")) == sorted(
+        [tmp_path / "output", tmp_path / "Output"])
+    assert stitch_runner._child_dirs(tmp_path, "output")[0] == tmp_path / "output"
+
+
+def test_job_api_get_flags_a_job_left_without_pods(remote_env, monkeypatch):
+    _post_returning(monkeypatch, _Resp({"Code": 0, "Message": "jobpending",
+                                        "Data": {"status": "pending", "pods": None}}))
+    polled = executor.job_api_get(remote_env["endpoint"], "fivportal-abc")
+    assert polled["kind"] == "pending" and polled["no_pods"] is True
+    _post_returning(monkeypatch, _Resp({"Code": 0, "Data": {"status": "pending",
+                                                            "pods": [{"status": "Pending"}]}}))
+    assert executor.job_api_get(remote_env["endpoint"], "fivportal-abc")["no_pods"] is False

@@ -1,5 +1,18 @@
+import struct
+
 from ifwi_mcp import interfaces
-from ifwi_mcp.result import ErrorCode, ok
+from ifwi_mcp.result import ErrorCode, err, ok
+
+
+def _oem_region(version="ap.post-silicon.2026.41.3.01",
+                flavor="_IPCleanExternal_Trace_DebugSigned", product="OKSDCRB1"):
+    return struct.pack("<16s 48s 128s 32s 32s", product.encode(), version.encode(),
+                       flavor.encode(), b"\x90" * 32, b"")
+
+
+def _serve_oem(monkeypatch, content):
+    monkeypatch.setattr(interfaces.artifactory, "read_range",
+                        lambda url, start, length: ok({"content": content}))
 
 
 def test_query_one_and_comparison(monkeypatch):
@@ -60,6 +73,127 @@ def test_stitching_builds_and_executes(monkeypatch):
     assert captured["source_urls"] == {"ifwi": "https://art/ifwi.bin",
                                         "stitch_tool": "https://art/tool.7z",
                                         "ingredients": ["https://art/mmc.7z"]}
+
+
+def test_stitching_uses_custom_ifwi_url(monkeypatch):
+    _serve_oem(monkeypatch, b"")  # no OEM region: explicit values are used as given
+    monkeypatch.setattr(interfaces.fiv_portal, "resolve_project_by_id",
+                        lambda pid: ok({"project_id": pid, "project": "P"}))
+    # The release binary still names the config even when it has no URL of its own.
+    monkeypatch.setattr(interfaces.fiv_portal, "list_release_binaries", lambda *a: ok({
+        "binaries": [{"binary_name": "only"}], "swimlane_branch": "lane"}))
+    monkeypatch.setattr(interfaces.fiv_portal, "find_stitch_tool", lambda *a: ok({"stitch_url": "https://art/tool.7z"}))
+    monkeypatch.setattr(interfaces.fiv_portal, "find_ingredient", lambda *a: ok({"ingredient_url": "https://art/mmc.7z"}))
+    captured = {}
+
+    def build(*args, **kwargs):
+        captured.update(kwargs)
+        assert args[3] == "Config_Stitch_only"
+        return ok({"plan": {"plan_id": "p"}})
+
+    monkeypatch.setattr(interfaces.plan, "build_plan", build)
+    monkeypatch.setattr(interfaces.executor, "execute", lambda p: ok(p))
+    result = interfaces.stitching({"fiv_project_id": "77", "phase": "Orange", "version": "v1",
+                                   "ingredients": {"MMC": "1", "PMC": "https://art/dev/pmc.7z"},
+                                   "ifwi_url": " https://art/dev/my_ifwi.bin "})
+    assert result["ok"] is True
+    assert captured["source_urls"]["ifwi"] == "https://art/dev/my_ifwi.bin"
+    assert captured["source_urls"]["ingredients"] == ["https://art/mmc.7z", "https://art/dev/pmc.7z"]
+    assert captured["custom_urls"] == {"https://art/dev/my_ifwi.bin", "https://art/dev/pmc.7z"}
+    assert captured["ifwi_binary"] == "only"
+    assert "no usable OEM region" in result["data"]["warnings"][0]
+
+
+def _oem_release(monkeypatch, binaries=("OKSDCRB1_IPCleanExternal_Trace_DebugSigned",
+                                        "OKSDCRB1_IPCleanExternal_Trace_DebugSigned_2S")):
+    monkeypatch.setattr(interfaces.fiv_portal, "resolve_project_by_id",
+                        lambda pid: ok({"project_id": pid, "project": "P"}))
+    monkeypatch.setattr(interfaces.fiv_portal, "resolve_swimlane_hint",
+                        lambda project, phase, version, hint: ok({"swimlane": "release/" + hint}))
+    calls = []
+
+    def release_binaries(project, phase, version, lane):
+        calls.append((version, lane))
+        return ok({"binaries": [{"binary_name": name} for name in binaries],
+                   "swimlane_branch": lane})
+
+    monkeypatch.setattr(interfaces.fiv_portal, "list_release_binaries", release_binaries)
+    monkeypatch.setattr(interfaces.fiv_portal, "find_stitch_tool",
+                        lambda *a: ok({"stitch_url": "https://art/tool.7z"}))
+    monkeypatch.setattr(interfaces.fiv_portal, "find_ingredient",
+                        lambda *a: ok({"ingredient_url": "https://art/mmc.7z"}))
+    monkeypatch.setattr(interfaces.plan, "build_plan", lambda *a, **k: ok({
+        "plan_id": "p", "command_line": "cmd"}))
+    return calls
+
+
+OEM_PAYLOAD = {"fiv_project_id": "232", "phase": "Orange", "ingredients": {"MMC": "1"},
+               "ifwi_url": "https://art/dev/custom.bin", "dry_run": True}
+
+
+def test_stitching_infers_release_from_ifwi_oem(monkeypatch):
+    _serve_oem(monkeypatch, _oem_region())
+    calls = _oem_release(monkeypatch)
+    result = interfaces.stitching(dict(OEM_PAYLOAD))
+    assert result["ok"] is True
+    data = result["data"]
+    assert (data["version"], data["swimlane"], data["binary_name"]) == (
+        "2026.41.3.01", "release/ap.post-silicon", "OKSDCRB1_IPCleanExternal_Trace_DebugSigned")
+    assert calls == [("2026.41.3.01", "release/ap.post-silicon")]
+    assert data["oem"]["product"] == "OKSDCRB1"
+    assert data["source_urls"]["ifwi"] == "https://art/dev/custom.bin"
+
+
+def test_stitching_rejects_explicit_values_that_conflict_with_oem(monkeypatch):
+    _serve_oem(monkeypatch, _oem_region())
+    _oem_release(monkeypatch)
+    result = interfaces.stitching({**OEM_PAYLOAD, "version": "2026.43.3.02"})
+    assert result["error_code"] == ErrorCode.INVALID_ARGUMENT
+    assert result["detail"]["oem_version"] == "2026.41.3.01"
+    result = interfaces.stitching({**OEM_PAYLOAD, "swimlane": "main"})
+    assert result["detail"]["param"] == "swimlane"
+    result = interfaces.stitching({**OEM_PAYLOAD,
+                                   "binary_name": "OKSDCRB1_IPCleanExternal_Trace_DebugSigned_2S"})
+    assert result["detail"]["param"] == "binary_name"
+    # Matching explicit values are accepted.
+    result = interfaces.stitching({**OEM_PAYLOAD, "version": "2026.41.3.01",
+                                   "swimlane": "release/ap.post-silicon"})
+    assert result["ok"] is True
+
+
+def test_stitching_requires_version_when_oem_names_no_release(monkeypatch):
+    _serve_oem(monkeypatch, _oem_region(version="", flavor=""))
+    _oem_release(monkeypatch)
+    result = interfaces.stitching(dict(OEM_PAYLOAD))
+    assert result["error_code"] == ErrorCode.INVALID_ARGUMENT
+    assert result["detail"]["param"] == "version"
+    _serve_oem(monkeypatch, b"\xff" * 16)
+    assert interfaces.stitching(dict(OEM_PAYLOAD))["detail"]["param"] == "version"
+
+
+def test_stitching_customized_oem_still_needs_binary_name(monkeypatch):
+    _serve_oem(monkeypatch, _oem_region(flavor="yyao7.20261020.130527"))
+    _oem_release(monkeypatch)
+    result = interfaces.stitching(dict(OEM_PAYLOAD))
+    assert result["error_code"] == ErrorCode.IFWI_BINARY_AMBIGUOUS
+    assert result["detail"]["oem"]["flavor_type"] == "customized"
+    result = interfaces.stitching({**OEM_PAYLOAD,
+                                   "binary_name": "OKSDCRB1_IPCleanExternal_Trace_DebugSigned_2S"})
+    assert result["data"]["version"] == "2026.41.3.01"
+
+
+def test_stitching_reports_ifwi_url_read_failure(monkeypatch):
+    monkeypatch.setattr(interfaces.fiv_portal, "resolve_project_by_id",
+                        lambda pid: ok({"project_id": pid, "project": "P"}))
+    monkeypatch.setattr(interfaces.artifactory, "read_range", lambda *a: err(
+        ErrorCode.AUTH_FAILED, "artifactory rejected credentials"))
+    assert interfaces.stitching(dict(OEM_PAYLOAD))["error_code"] == ErrorCode.AUTH_FAILED
+
+
+def test_stitching_rejects_non_http_ifwi_url():
+    result = interfaces.stitching({"fiv_project_id": "77", "phase": "Orange", "version": "v1",
+                                   "ingredients": {"MMC": "1"}, "ifwi_url": "C:/ifwi.bin"})
+    assert result["detail"]["param"] == "ifwi_url"
 
 
 def test_invalid_payloads():

@@ -74,6 +74,21 @@ def _custom_ifwi_oem(url: str) -> dict:
 
 def stitching(payload: dict) -> dict:
     """Resolve a release and plan it; execute it unless dry_run is true."""
+    resolved = resolve_stitching(payload)
+    if not resolved["ok"] or resolved["data"].get("dry_run"):
+        return resolved
+    result = executor.execute(resolved["data"]["plan"])
+    warnings = resolved["data"]["warnings"]
+    if warnings and result["ok"] and isinstance(result.get("data"), dict):
+        result["data"]["warnings"] = warnings + list(result["data"].get("warnings") or [])
+    return result
+
+
+def resolve_stitching(payload: dict) -> dict:
+    """Validate a /stitching payload and build its plan without executing it.
+
+    Returns the dry-run preview when dry_run is true, else {"plan", "plan_id", "warnings"}.
+    """
     bad = _common(payload)
     if bad:
         return bad
@@ -220,7 +235,7 @@ def stitching(payload: dict) -> dict:
                    "warnings": warnings + built["data"].get("warnings", []),
                    "note": "Preview only: FIV URLs resolved and plan saved; nothing downloaded or executed. "
                        "Execution validates the config and resolves command paths."})
-    result = executor.execute(built["data"]["plan"])
-    if warnings and result["ok"] and isinstance(result.get("data"), dict):
-        result["data"]["warnings"] = warnings + list(result["data"].get("warnings") or [])
-    return result
+    plan_data = built["data"]["plan"]
+    return ok({"plan": plan_data,
+               "plan_id": built["data"].get("plan_id") or plan_data.get("plan_id"),
+               "warnings": warnings})

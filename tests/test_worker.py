@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from ifwi_mcp import plan, worker
 from ifwi_mcp.result import ok, err, ErrorCode
 
@@ -85,3 +87,36 @@ def test_plan_encoding_round_trips_and_is_shell_safe():
     token = plan.encode_plan(p)
     assert all(ch.isalnum() or ch in "-_" for ch in token)
     assert plan.decode_plan(token) == p
+
+
+def test_worker_writes_the_result_file_and_stamps_the_run(clean_env, monkeypatch, tmp_path):
+    uploads = _capture_uploads(monkeypatch)
+    result_file = tmp_path / "out" / "result.json"
+    monkeypatch.setenv("IFWI_STITCH_RESULT_FILE", str(result_file))
+    monkeypatch.setenv("IFWI_STITCH_RUN_ID", "p-1")
+    seen = {}
+    monkeypatch.setattr(worker.executor, "_execute_local",
+                        lambda p, c, run_id="": seen.update(run_id=run_id) or err("X", "x"))
+    assert worker.main(["--plan-b64", plan.encode_plan({"plan_id": "p"}),
+                        "--upload-url", "https://af/run"]) == 1
+    assert seen["run_id"] == "p-1"
+    written = json.loads(result_file.read_text(encoding="utf-8"))
+    published = json.loads(uploads["https://af/run/result.json"])
+    assert written == published
+    assert written["schema_version"] == 1 and written["run_id"] == "p-1"
+    assert written["finished_at"].endswith("Z") and written["error_code"] == "X"
+
+
+@pytest.mark.parametrize("deadline_offset, code", [(-1, ErrorCode.REMOTE_TIMEOUT),
+                                                   (3600, ErrorCode.REMOTE_TERMINATED)])
+def test_worker_reports_sigterm(clean_env, monkeypatch, deadline_offset, code):
+    import time
+    uploads = _capture_uploads(monkeypatch)
+    monkeypatch.setenv("IFWI_STITCH_DEADLINE_EPOCH", str(int(time.time() + deadline_offset)))
+
+    def terminated(p, c):
+        raise worker._Terminated(15)
+    monkeypatch.setattr(worker.executor, "_execute_local", terminated)
+    assert worker.main(["--plan-b64", plan.encode_plan({"plan_id": "p"}),
+                        "--upload-url", "https://af/run"]) == 1
+    assert json.loads(uploads["https://af/run/result.json"])["error_code"] == code

@@ -82,4 +82,15 @@ def test_stitching_submits_real_job_and_polls(monkeypatch, capsys):
     assert observed["headers"] == {"Authorization": "Bearer test-token"}
     assert observed["payload"]["async"] is True
     assert observed["payload"].get("dry_run") is not True
+    assert len(observed["payload"]["client_request_id"]) == 32
     assert "https://example.com/result.bin" in capsys.readouterr().out
+
+def test_wait_for_result_stops_on_terminal_and_honours_poll_after(monkeypatch):
+    answers = [{"state": "running", "terminal": False, "poll_after_seconds": 30},
+               {"state": "cancelled", "terminal": True, "result": {"ok": False}}]
+    sleeps = []
+    monkeypatch.setattr(example_rest, "call", lambda *a, **kw: answers.pop(0))
+    monkeypatch.setattr(example_rest.time, "sleep", sleeps.append)
+    with pytest.raises(RuntimeError, match="Job cancelled"):
+        example_rest.wait_for_result("/jobs/1", {}, base_url="http://x")
+    assert sleeps == [30]

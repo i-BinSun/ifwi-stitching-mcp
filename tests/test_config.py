@@ -1,4 +1,7 @@
 from pathlib import Path
+
+import pytest
+
 from ifwi_mcp import config
 from ifwi_mcp.result import ErrorCode
 
@@ -298,3 +301,62 @@ def test_deliverables_archive_env_override(clean_env, write_config, monkeypatch)
     write_config({"deliverables": {"archive": True}})
     monkeypatch.setenv("IFWI_MCP_DELIVERABLES_ARCHIVE", "false")
     assert config.get_deliverables_config()["data"]["archive"] is False
+
+
+def test_job_settings_defaults_and_overrides(clean_env, write_config, monkeypatch):
+    data = config.get_execution_config()["data"]
+    assert data["image"].endswith("fiv-ubuntu24.04-python3.13:v1.1.1")
+    assert data["wrapper_path"] == "/app/stitch_wrapper.py"
+    assert (data["pending_timeout_seconds"], data["finalize_grace_seconds"],
+            data["refresh_min_interval_seconds"], data["refresh_workers"],
+            data["max_inline_spec_bytes"], data["max_active_jobs"],
+            data["job_retention_hours"]) == (900, 120, 5, 16, 4096, 64, 168)
+    assert data["report_base_url"] == ""
+    write_config({"execution": {"max_active_jobs": 3, "report_base_url": "https://mcp.example.com/"}})
+    monkeypatch.setenv("IFWI_MCP_EXEC_FINALIZE_GRACE", "200")
+    data = config.get_execution_config()["data"]
+    assert data["max_active_jobs"] == 3 and data["finalize_grace_seconds"] == 200
+    assert data["report_base_url"] == "https://mcp.example.com"
+    monkeypatch.setenv("IFWI_MCP_REPORT_BASE_URL", "mcp.example.com")
+    assert config.get_execution_config()["detail"]["param"] == "execution.report_base_url"
+
+
+def test_jobs_db_path(clean_env, monkeypatch, tmp_path):
+    assert config.get_jobs_db_path() == tmp_path / "cache" / "jobs.db"
+    monkeypatch.setenv("IFWI_MCP_JOBS_DB", str(tmp_path / "other" / "j.db"))
+    assert config.get_jobs_db_path() == tmp_path / "other" / "j.db"
+
+
+@pytest.mark.parametrize("overrides, param", [
+    ({"pending_timeout_seconds": 3600}, "execution.pending_timeout_seconds"),
+    ({"timeout_seconds": 465, "pending_timeout_seconds": 100}, "execution.timeout_seconds"),
+    ({"image": "registry.example.com/fiv-ubuntu24.04-python3.13:v1.0.0"}, "execution.image"),
+    ({"image": "registry.example.com/fiv-ubuntu24.04-python3.13:v1.1.0"}, "execution.image"),
+])
+def test_validate_startup_checks_remote_budgets_and_image(clean_env, write_config, monkeypatch,
+                                                          overrides, param):
+    monkeypatch.setenv("FIV_BASE_URL", "https://fiv.example.com")
+    write_config({"execution": {"mode": "remote", "endpoint": "https://jobs.example.com/job",
+                                **overrides}})
+    result = config.validate_startup()
+    assert result["error_code"] == ErrorCode.CONFIG_INVALID and result["detail"]["param"] == param
+
+
+def test_validate_startup_accepts_remote_defaults_and_dev_tags(clean_env, write_config, monkeypatch):
+    monkeypatch.setenv("FIV_BASE_URL", "https://fiv.example.com")
+    write_config({"execution": {"mode": "remote", "endpoint": "https://jobs.example.com/job"}})
+    assert config.validate_startup()["ok"] is True
+    monkeypatch.setenv("IFWI_MCP_EXEC_IMAGE", "registry.example.com/img:stitch-wrapper-dev")
+    assert config.validate_startup()["ok"] is True
+    assert config.image_tag_version("registry.example.com/img:stitch-wrapper-dev") is None
+    assert config.image_tag_version("r/img:v1.12.3") == (1, 12, 3)
+
+
+def test_validate_startup_creates_the_job_database_in_server_mode(clean_env, monkeypatch, tmp_path):
+    monkeypatch.setenv("FIV_BASE_URL", "https://fiv.example.com")
+    monkeypatch.setenv("IFWI_MCP_SERVER_MODE", "server")
+    monkeypatch.setenv("IFWI_MCP_SERVER_TOKEN", "t")
+    monkeypatch.setenv("IFWI_MCP_ARTIFACTORY_REPO", "https://af.example.com/repo")
+    monkeypatch.setenv("IFWI_MCP_JOBS_DB", str(tmp_path / "db" / "jobs.db"))
+    assert config.validate_startup()["ok"] is True
+    assert (tmp_path / "db" / "jobs.db").exists()
