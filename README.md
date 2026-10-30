@@ -534,10 +534,11 @@ protocol 1); the full design is `docs/superpowers/specs/2026-10-28-remote-execut
    pod has ended (or is gone, or the deadline passed) the job enters `finalizing` and reads
    `result.json`, inferring `REMOTE_RESULT_MISSING` / `REMOTE_TIMEOUT` only after
    `finalize_grace_seconds`. An inferred failure is replaced if the real result shows up later.
-5. In server mode the result is links only: `stitched_bin` (`url`, `sha256`, `bytes`), `log_url`,
-   `artifacts`, `artifactory_url`, `result_url`, `pod_job_id`, `pod_log_url`, plus the v1 aliases
-   `job_id` (= `pod_job_id`), `stitched_bin_url`, `command_line`, `exit_code`, `environment`. In stdio
-   mode the deliverables are also downloaded into the local deliverables dir.
+5. In server mode the result has the same shape as a local run: `plan_id`, `run_id`,
+   `artifactory_url`, `stitched_bin` (`url`, `sha256`, `bytes`), `log_url` and `warnings`. Pod
+   details (`pod_job_id`, `pod_log_url`, ...) are in the job's `remote` block; the full artifact list,
+   command line and source URLs are in `<artifactory_url>/result.json`. In stdio mode the result keeps
+   the full v1 shape and the deliverables are also downloaded into the local deliverables dir.
 6. The pod is deleted once the job is over: `pod_cleanup_delay_seconds` (30 s) after it ends on its own, at
    once on cancel or timeout. A failed delete is retried on later queries and at startup; the Job API's
    `ttlsecondsafterfinished` (12 h) is the last resort. Progress shows in `data.cleanup.pod_delete`.
@@ -603,7 +604,10 @@ Every failure carries a stable `error_code`, one of:
 `REMOTE_RESULT_UNREADABLE`, `WRAPPER_SPEC_INVALID`, `WRAPPER_INTERNAL_ERROR`, `JOB_NOT_FOUND`,
 `JOB_CANCELLED`, `JOB_INTERRUPTED`, `JOB_ALREADY_FINISHED`, `JOB_NOT_CANCELLABLE`, `JOB_QUEUE_FULL`,
 `IDEMPOTENCY_CONFLICT`. Job errors carry `detail.job_id`, `run_id`, `artifactory_url` (remote:
-`pod_job_id`, `pod_status`) and `detail.retryable`.
+`pod_job_id`, `pod_status`) and `detail.retryable`. In a job view (`GET /jobs/{id}`) `job_id`,
+`plan_id`, `run_id` and `artifactory_url` appear only at the top level, not again inside `result`;
+once a remote job ends, `remote` drops the polling fields (`pod_status`, `last_checked_at`,
+`degraded`, `last_error`).
 
 ### Tool call sequences
 

@@ -117,8 +117,7 @@ def main():
         job = call("POST", "/stitching", headers, base_url=base_url, payload=payload)
         result = wait_for_result(job["status_url"], headers, base_url=base_url,
                                  expected_instance=job.get("instance_id"))
-        # Remote (pod) execution still reports stitched_bin_url.
-        url = (result.get("stitched_bin") or {}).get("url") or result.get("stitched_bin_url")
+        url = (result.get("stitched_bin") or {}).get("url")
         print("Stitching succeeded; stitched binary: {}".format(url))
         return 0
     except (requests.RequestException, RuntimeError, KeyError) as exc:

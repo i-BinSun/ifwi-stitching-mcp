@@ -446,9 +446,9 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 4. 服务器收到回调即结束任务。没有回调时，查询会检查 pod；pod 已结束（或已不存在、或已过截止时间）后任务进入
    `finalizing` 并读取 `result.json`，超过 `finalize_grace_seconds` 仍没有结果才推断为 `REMOTE_RESULT_MISSING` /
    `REMOTE_TIMEOUT`。推断出的失败在真实结果之后出现时会被覆盖。
-5. server 模式下结果只有链接：`stitched_bin`（`url`、`sha256`、`bytes`）、`log_url`、`artifacts`、`artifactory_url`、
-   `result_url`、`pod_job_id`、`pod_log_url`，以及兼容旧版本的别名 `job_id`（即 `pod_job_id`）、`stitched_bin_url`、
-   `command_line`、`exit_code`、`environment`。stdio 模式下还会把产物下载到本地 deliverables 目录。
+5. server 模式下结果与本地执行同形：`plan_id`、`run_id`、`artifactory_url`、`stitched_bin`（`url`、`sha256`、
+   `bytes`）、`log_url` 和 `warnings`。pod 信息（`pod_job_id`、`pod_log_url` 等）见任务的 `remote` 字段；完整产物列表、
+   命令行和来源 URL 见 `<artifactory_url>/result.json`。stdio 模式下结果保留完整的 v1 字段，并把产物下载到本地 deliverables 目录。
 6. 任务结束后删除 pod：正常结束时过 `pod_cleanup_delay_seconds`（30 秒）删除，取消或超时时立即删除。删除失败会在之后的查询和启动时重试，Job API 的 `ttlsecondsafterfinished`（12 小时）是最后的兜底。进度见 `data.cleanup.pod_delete`。
 
 pod 镜像提供 `IFWI_ARTIFACTORY_TOKEN`（以及可选的 `IFWI_FIVPORTAL_TOKEN`，只有 plan 的来源没有固定为 URL 时才需要），
@@ -512,7 +512,9 @@ pod 镜像提供 `IFWI_ARTIFACTORY_TOKEN`（以及可选的 `IFWI_FIVPORTAL_TOKE
 `REMOTE_RESULT_UNREADABLE`、`WRAPPER_SPEC_INVALID`、`WRAPPER_INTERNAL_ERROR`、`JOB_NOT_FOUND`、
 `JOB_CANCELLED`、`JOB_INTERRUPTED`、`JOB_ALREADY_FINISHED`、`JOB_NOT_CANCELLABLE`、`JOB_QUEUE_FULL`、
 `IDEMPOTENCY_CONFLICT`。任务的错误都带 `detail.job_id`、`run_id`、`artifactory_url`（远程任务另带
-`pod_job_id`、`pod_status`）以及 `detail.retryable`。
+`pod_job_id`、`pod_status`）以及 `detail.retryable`。任务视图（`GET /jobs/{id}`）里 `job_id`、`plan_id`、`run_id`、
+`artifactory_url` 只在顶层出现，`result` 里不再重复；远程任务结束后 `remote` 不再包含轮询字段（`pod_status`、
+`last_checked_at`、`degraded`、`last_error`）。
 
 ### 工具调用顺序
 

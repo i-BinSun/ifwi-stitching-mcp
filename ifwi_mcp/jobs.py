@@ -53,6 +53,8 @@ LEGACY_TERMINATED_WINDOW = 120
 DEADLINE_EPOCH_WRAPPER = (1, 1, 0)
 MAX_BODY_CHARS = 2000
 MAX_LOG_TAIL = 4096
+SERVER_RESULT_KEYS = ("plan_id", "run_id", "artifactory_url", "stitched_bin", "log_url", "warnings")
+VIEW_JOB_FIELDS = ("job_id", "plan_id", "run_id", "artifactory_url")
 NOT_CANCELLABLE_LOCAL = "local execution cannot be interrupted once it is running"
 
 _RETRYABLE = {ErrorCode.REMOTE_SUBMIT_FAILED, ErrorCode.REMOTE_SCHEDULE_TIMEOUT,
@@ -465,7 +467,11 @@ class JobManager:
             if shaped["ok"]:
                 plan_warnings = row["remote"].get("plan_warnings") or []
                 shaped["data"]["warnings"] = list(plan_warnings) + shaped["data"]["warnings"]
-                if not self.server_mode:
+                if self.server_mode:
+                    # Same shape as a server-mode local run; pod details are in the job view
+                    # and the full worker output stays in result.json.
+                    shaped = ok({key: shaped["data"][key] for key in SERVER_RESULT_KEYS})
+                else:
                     shaped = executor.fetch_remote_deliverables(shaped["data"])
             return shaped
         code = envelope["error_code"]
@@ -1036,13 +1042,16 @@ class JobManager:
         remote = None
         if row["executor"] == "remote":
             stored = row["remote"]
-            remote = {"pod_job_id": row["pod_job_id"], "pod_status": row["pod_status"],
-                      "last_checked_at": iso(row["last_checked_at"]),
-                      "degraded": bool(stored.get("degraded")),
-                      "last_error": stored.get("last_error")}
+            remote = {"pod_job_id": row["pod_job_id"]}
             if terminal:
+                # Poll fields go stale once the job ends; a failure's detail keeps pod_status.
                 remote.update({key: stored.get(key) for key in
                                ("worker_commit", "durations", "pod_log_url", "exit_code", "signal")})
+            else:
+                remote.update({"pod_status": row["pod_status"],
+                               "last_checked_at": iso(row["last_checked_at"]),
+                               "degraded": bool(stored.get("degraded")),
+                               "last_error": stored.get("last_error")})
         cleanup = None
         if row["cleanup"] and (row["cleanup_pending"] or terminal):
             cleanup = {"pod_delete": row["cleanup"].get("pod_delete")}
@@ -1058,7 +1067,7 @@ class JobManager:
         if not terminal:
             view["cancel_url"] = f"/jobs/{row['job_id']}/cancel"
         if include_result:
-            view["result"] = row["result"] if terminal else None
+            view["result"] = _without_job_fields(row["result"], view) if terminal else None
         if include_events:
             view["events"] = [{**event, "at": iso(event["at"])}
                               for event in self.store.events(row["job_id"])]
@@ -1129,6 +1138,18 @@ class JobManager:
 
 _ORPHAN_WARNING = ("the pod could not be deleted; it may keep running until its "
                    "activedeadlineseconds expires")
+
+
+def _without_job_fields(result, view):
+    """The stored result minus the locating fields the view already shows at its top level."""
+    if not isinstance(result, dict):
+        return result
+    part = "data" if result.get("ok") else "detail"
+    body = result.get(part)
+    if not isinstance(body, dict):
+        return result
+    return {**result, part: {key: value for key, value in body.items()
+                             if not (key in VIEW_JOB_FIELDS and value == view[key])}}
 
 
 class _ConfigProblem(Exception):
