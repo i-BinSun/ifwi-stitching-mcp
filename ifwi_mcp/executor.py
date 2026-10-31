@@ -29,7 +29,8 @@ from urllib.parse import quote
 import requests
 import urllib3
 
-from . import archive, artifactory, config, deliverables, plan as plan_mod, prepare, stitch_runner
+from . import (archive, artifactory, bios_package, config, deliverables, plan as plan_mod, prepare,
+               stitch_runner)
 from .result import ok, err, ErrorCode
 
 REMOTE_RESULT_NAME = "result.json"
@@ -259,6 +260,17 @@ def _isolated_stitch_dir(env_data: dict, key: str) -> dict:
     return ok({"stitch_dir": str(workspace_root / rel), "workspace_dir": str(workspace_root)})
 
 
+def _resolve_bios(env_data: dict, config_ini: str, work_dir: Path) -> dict:
+    """Swap a BIOS build package for the file or BIOSID folder the stitch tool takes,
+    before the inputs are copied into the run (the package itself is several GB)."""
+    ingredients = env_data["ingredients"]
+    if not any(str(i.get("name", "")).strip().lower() == "bios" for i in ingredients):
+        return ok({"ingredients": ingredients, "warnings": []})
+    resolved = stitch_runner.resolve_config_ini(env_data["stitch_dir"], config_ini) if config_ini else None
+    config_path = resolved["data"]["config_ini_path"] if resolved and resolved["ok"] else None
+    return bios_package.resolve_bios_ingredients(ingredients, config_path, str(work_dir))
+
+
 def _isolated_inputs(env_data: dict, inputs_dir: Path) -> dict:
     """Private copies of the IFWI binary and ingredients, so no run reads or writes
     files another run can touch."""
@@ -274,11 +286,13 @@ def _isolated_inputs(env_data: dict, inputs_dir: Path) -> dict:
             label = re.sub(r"[^A-Za-z0-9_.-]", "_", item["name"])
             target = inputs_dir / "ingredients" / f"{index}_{label}"
             if src.is_dir():
+                # Keep the folder's own name: a BIOSID folder must be named after its version.
+                target = target / src.name
                 shutil.copytree(src, target, symlinks=True)
             else:
                 target.mkdir(parents=True, exist_ok=True)
                 target = Path(shutil.copy2(src, target / src.name))
-            ingredients.append({"name": item["name"], "path": str(target)})
+            ingredients.append({**item, "path": str(target)})
     except OSError as exc:
         return err(ErrorCode.WORKSPACE_SETUP_FAILED, "could not copy stitch inputs into the run directory",
                    {"inputs_dir": str(inputs_dir), "reason": str(exc)})
@@ -312,6 +326,11 @@ def _execute_local(plan: dict, exec_cfg: dict, run_id: str = "") -> dict:
     if not isolated["ok"]:
         return isolated
     run_root = stitch_runner.run_dir(run_id)
+    bios = _resolve_bios(env["data"], config_ini, run_root / "bios")
+    if not bios["ok"]:
+        return bios
+    env["data"]["ingredients"] = bios["data"]["ingredients"]
+    env["data"]["warnings"] = env["data"]["warnings"] + bios["data"]["warnings"]
     inputs = _isolated_inputs(env["data"], run_root / "inputs")
     if not inputs["ok"]:
         return inputs

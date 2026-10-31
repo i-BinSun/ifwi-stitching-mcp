@@ -255,6 +255,20 @@ exposes independent authenticated REST JSON interfaces:
   and Artifactory links to the deliverables. An `ingredients` value may also be a
   direct `http(s)://` download link instead of a version; it is used as-is and the
   FIV lookup is skipped (the file is not validated against FIV).
+- An ingredient named `BIOS` may point to a BIOS **build package** (e.g. a
+  `..._BuildPkg.7z` link). It is resolved during execution, once the target config is known:
+  if the package holds `IFWIStitch20.bin` (a zip; an already extracted `IFWIStitch20/BiosPkg`
+  folder works too), its `BiosPkg/BiosFile/MAIN.fd` and `SECPEI.fd` (plus
+  `ConfigInfo/BuildConfig.ini` for the VAB state and `SourceFile/BinaryFd.fdf`) are laid out as a
+  BIOSID version folder (named after the `$IBIOSI$` version, at the paths of the target config's
+  `[BIOSID]` `regex_mandatory_dict`) and stitched as `BIOSID`. Otherwise one 64 MB IFWI `.bin` is
+  stitched as `BIOS` and the tool slices MAIN+SECPEI out of it: `*_PO_SAFE*` images are never used,
+  images that are neither `Simics` nor `jc_2s_b` are preferred, then the first by name; the chosen
+  file is reported in `warnings`. A package with only PO_SAFE images, a config without `[BIOSID]`
+  or an unreadable `IFWIStitch20.bin` fails with `BIOS_PACKAGE_INVALID` (HTTP 400). A plain image
+  or folder that is not a build package is passed through unchanged. BIOS replacement needs a
+  stitch tool release that has `Source/StitchStep/BiosRegion` (older `stitch2.py` releases cannot
+  stitch BIOS).
 - Pass an optional `ifwi_url` (`http(s)://` link) on `/stitching` to stitch onto a
   customized IFWI instead of the release binary. `version` then becomes optional: the
   server reads only the 256-byte OEM region at `0xF00` (HTTP Range; without Range
