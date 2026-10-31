@@ -223,6 +223,10 @@ def resolve_stitching(payload: dict) -> dict:
     if not built["ok"]:
         return built
     if payload.get("dry_run"):
+        if any(name.strip().lower() == "bios" for name in ingredients):
+            warnings.append("BIOS: a BIOS build package is resolved during execution: "
+                            "IFWIStitch20.bin MAIN.fd/SECPEI.fd are stitched as BIOSID, otherwise a "
+                            "64MB IFWI .bin (not PO_SAFE, preferably not Simics/jc_2s_b) as BIOS")
         return ok({"dry_run": True, "plan_id": built["data"]["plan_id"],
                    "project": project_name, "fiv_project_id": project["data"]["project_id"],
                    "phase": phase, "version": version,

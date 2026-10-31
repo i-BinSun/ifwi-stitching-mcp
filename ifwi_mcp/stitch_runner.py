@@ -31,6 +31,8 @@ _LEGACY_ENTRY_DIR = "Source"
 _LEGACY_ENTRY_SCRIPT = "stitch2.py"
 _MUPPET_ENTRY_SCRIPTS = ("muppet.py", "fxtmuppet.py", "fxtmuppt.py")
 _ENTRY_SCRIPTS = (_ENTRY_SCRIPT, *_MUPPET_ENTRY_SCRIPTS, _LEGACY_ENTRY_SCRIPT)
+# BIOS region replacements take one image or BIOSID version folder, never a {key: file} dict.
+VERBATIM_INGREDIENTS = ("bios", "biosid", "rom")
 
 
 def _quote_argv(argv: list) -> str:
@@ -532,7 +534,10 @@ def build_stitch_command(stitch_dir: str, binary_file: Optional[str], ingredient
     names, args, warnings = [], [], list(base_warnings)
     for item in ingredients:
         name = item["name"].strip()
-        arg, item_warnings = _resolve_ingredient_arg(resolved_ini, name, item["path"].strip())
+        if item.get("verbatim") or name.lower() in VERBATIM_INGREDIENTS:
+            arg, item_warnings = item["path"].strip(), []
+        else:
+            arg, item_warnings = _resolve_ingredient_arg(resolved_ini, name, item["path"].strip())
         names.append(name)
         args.append(arg)
         warnings += item_warnings
