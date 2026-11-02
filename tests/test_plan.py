@@ -62,6 +62,10 @@ def test_build_plan_marks_custom_urls(clean_env):
     assert sources["ifwi"]["custom"] is True
     assert "custom" not in sources["ingredients"][0]
     assert "custom" not in sources["stitch_tool"]
+    sources = plan.build_plan(source_urls=urls, custom_urls={"https://art/tool.7z"},
+                              **ANSWERS)["data"]["plan"]["sources"]
+    assert sources["stitch_tool"]["custom"] is True
+    assert "custom" not in sources["ifwi"]
 
 
 def test_build_plan_records_build_target_fallback(clean_env):

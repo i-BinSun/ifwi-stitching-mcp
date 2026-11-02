@@ -379,12 +379,19 @@ def _extract_stitch_tool_locked(archive_path: str, tool_root: Path) -> dict:
                "tool_root": str(tool_root), "deps_source": deps_source})
 
 
-def extract_stitch_tool(archive_path: str) -> dict:
+def extract_stitch_tool(archive_path: str, dest_name: Optional[str] = None) -> dict:
+    """Extract a stitch tool archive into the stitch cache and set up its venv.
+
+    dest_name (optional) names the tool_root folder; defaults to the archive stem.
+    """
+    if dest_name and (("/" in dest_name) or ("\\" in dest_name) or (".." in dest_name)):
+        return err(ErrorCode.INVALID_ARGUMENT, "dest_name must be a bare filename",
+                   {"param": "dest_name", "expected": "no path separators or .."})
     src = Path(archive_path)
     if not src.is_file():
         return err(ErrorCode.EXTRACT_FAILED, "archive not found",
                    {"archive": archive_path, "reason": "not a file"})
-    tool_root = config.cache_subdir("stitch") / archive.cache_name(src.name)
+    tool_root = config.cache_subdir("stitch") / (dest_name or archive.cache_name(src.name))
     try:
         with lock.acquire(str(tool_root)):
             return _extract_stitch_tool_locked(archive_path, tool_root)

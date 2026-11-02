@@ -175,6 +175,35 @@ def test_custom_urls_get_their_own_cache_dirs(clean_env, monkeypatch, tmp_path):
     assert extract_names[0].startswith("mmc-custom-")
 
 
+def test_custom_stitch_tool_gets_its_own_cache_dirs(clean_env, monkeypatch, tmp_path):
+    p = _plan(tmp_path)
+    p["sources"]["ifwi"].update({"url": "https://art/ifwi.bin"})
+    p["sources"]["ingredients"][0].update({"url": "https://art/mmc.7z"})
+    p["sources"]["stitch_tool"].update({"url": "https://art/dev/tool.7z", "custom": True})
+    binary = tmp_path / "ifwi.bin"; binary.write_bytes(b"b")
+    ingredient = tmp_path / "mmc"; ingredient.mkdir()
+    categories, tool_names = [], []
+
+    def download(url, category):
+        categories.append(category)
+        return ok({"local_path": str(tmp_path / Path(url).name)})
+
+    def extract_tool(path, dest_name=None):
+        tool_names.append(dest_name)
+        return ok({"stitch_dir": str(tmp_path), "tool_root": str(tmp_path),
+                   "venv_python": "python", "config_targets": [], "warnings": []})
+
+    monkeypatch.setattr(executor.artifactory, "download", download)
+    monkeypatch.setattr(executor.archive, "extract_archive",
+                        lambda path: ok({"extract_dir": str(ingredient)}))
+    monkeypatch.setattr(executor.stitch_runner, "extract_stitch_tool", extract_tool)
+    assert executor.prepare_environment(p)["ok"] is True
+    # Release sources keep the shared cache; only the caller-supplied tool is keyed by URL.
+    assert categories[:2] == ["ifwi", "ingredients"]
+    assert categories[2].startswith("stitch/custom-")
+    assert tool_names[0].startswith("tool-custom-")
+
+
 def test_worker_auto_config_uses_extracted_targets(clean_env, env_fakes, run_fakes,
                                                    monkeypatch, tmp_path):
     p = _plan(tmp_path)

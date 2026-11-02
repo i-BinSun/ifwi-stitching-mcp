@@ -274,15 +274,24 @@ exposes independent authenticated REST JSON interfaces:
   server reads only the 256-byte OEM region at `0xF00` (HTTP Range; without Range
   support it stops after that window) and derives `version` and `swimlane` from its
   `ifwi_version` (e.g. `ap.post-silicon.2026.41.3.01`), plus `binary_name` = product +
-  flavor for official builds. The release still selects the stitch tool and config;
-  only the base binary download is replaced. An explicit `version`, `swimlane` or
+  flavor for official builds. The release still selects the config and (unless
+  `stitch_tool_url` is given) the stitch tool; only the base binary download is
+  replaced. An explicit `version`, `swimlane` or
   `binary_name` that contradicts the OEM region is HTTP 400; an OEM region without a
   release version and no `version` is HTTP 400 (no fallback to another release's stitch
   tool); a customized flavor with several candidate binaries is HTTP 409. The dry-run
   result includes the parsed `oem` fields.
-- Files from caller-supplied links (`ifwi_url` and link-valued `ingredients`) are
+- Files from caller-supplied links (`ifwi_url`, `stitch_tool_url` and link-valued `ingredients`) are
   downloaded and extracted into per-URL cache directories, so a same-named release
   file or a different link with the same file name is never reused.
+- Pass an optional `stitch_tool_url` (`http(s)://` link to a stitch tool archive) on
+  `/stitching` to validate a stitch tool fix that has not been released yet. It
+  replaces the release stitch tool and the FIV stitch tool lookup is skipped;
+  `version` is still required and still selects the IFWI binary and config. A value
+  that is not an `http(s)://` link is HTTP 400. The tool is downloaded and extracted
+  into a per-URL cache like `ifwi_url`, so it never reuses the release tool with the
+  same file name; a re-upload to the same URL reuses the cached copy, so publish each
+  fix under a new link. The dry-run result reports `custom_stitch_tool`.
 - Set `"dry_run": true` on `/stitching` to preview `source_urls`, the inferred
   `config_ini` and placeholder-based `command_template` without downloading or
   executing anything. The config hint cannot be verified until execution extracts

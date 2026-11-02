@@ -196,6 +196,43 @@ def test_stitching_rejects_non_http_ifwi_url():
     assert result["detail"]["param"] == "ifwi_url"
 
 
+def test_stitching_uses_custom_stitch_tool_url(monkeypatch):
+    monkeypatch.setattr(interfaces.fiv_portal, "resolve_project_by_id",
+                        lambda pid: ok({"project_id": pid, "project": "P"}))
+    monkeypatch.setattr(interfaces.fiv_portal, "list_release_binaries", lambda *a: ok({
+        "binaries": [{"binary_name": "only", "url": "https://art/ifwi.bin"}], "swimlane_branch": "lane"}))
+
+    def no_lookup(*args):
+        raise AssertionError("stitch_tool_url must skip the FIV stitch tool lookup")
+
+    monkeypatch.setattr(interfaces.fiv_portal, "find_stitch_tool", no_lookup)
+    monkeypatch.setattr(interfaces.fiv_portal, "find_ingredient", lambda *a: ok({"ingredient_url": "https://art/mmc.7z"}))
+    captured = {}
+
+    def build(*args, **kwargs):
+        captured.update(kwargs)
+        return ok({"plan_id": "p", "command_line": "cmd"})
+
+    monkeypatch.setattr(interfaces.plan, "build_plan", build)
+    result = interfaces.stitching({"fiv_project_id": "77", "phase": "Orange", "version": "v1",
+                                   "ingredients": {"MMC": "1"}, "dry_run": True,
+                                   "stitch_tool_url": " https://art/dev/tool_fix.7z "})
+    assert result["ok"] is True
+    assert result["data"]["custom_stitch_tool"] is True
+    assert result["data"]["custom_ifwi"] is False
+    assert result["data"]["source_urls"]["stitch_tool"] == "https://art/dev/tool_fix.7z"
+    assert captured["source_urls"]["ifwi"] == "https://art/ifwi.bin"
+    assert captured["custom_urls"] == {"https://art/dev/tool_fix.7z"}
+
+
+def test_stitching_rejects_invalid_stitch_tool_url():
+    for value in ("C:/tool.7z", "", 3):
+        result = interfaces.stitching({"fiv_project_id": "77", "phase": "Orange", "version": "v1",
+                                       "ingredients": {"MMC": "1"}, "stitch_tool_url": value})
+        assert result["error_code"] == ErrorCode.INVALID_ARGUMENT
+        assert result["detail"]["param"] == "stitch_tool_url"
+
+
 def test_invalid_payloads():
     assert interfaces.query({"fiv_project_id": "77", "phase": "Orange", "versions": []})["error_code"] == ErrorCode.INVALID_ARGUMENT
     assert interfaces.stitching({"fiv_project_id": "77", "phase": "Orange",
@@ -235,6 +272,7 @@ def test_stitching_dry_run_returns_preview_without_executing(monkeypatch):
     assert result["data"]["config_ini"] == "Config_Stitch_only"
     assert result["data"]["binary_name"] == "only"
     assert result["data"]["source_urls"]["stitch_tool"] == "https://art/tool.7z"
+    assert result["data"]["custom_stitch_tool"] is False
     assert "{binary_file}" in result["data"]["command_template"]
     assert interfaces.stitching({"fiv_project_id": "77", "phase": "Orange",
                                  "dry_run": "yes"})["detail"]["param"] == "dry_run"
