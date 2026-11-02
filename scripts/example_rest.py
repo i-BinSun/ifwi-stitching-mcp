@@ -43,6 +43,8 @@ STITCH_PAYLOAD = {
     # Optional: stitch onto a customized IFWI instead of the release binary; version,
     # swimlane and binary_name may then be omitted (read from its OEM region).
     # "ifwi_url": "https://af01p-or.devtools.intel.com/artifactory/.../custom_ifwi.bin",
+    # Optional: validate an unreleased stitch tool fix instead of the release's tool.
+    # "stitch_tool_url": "https://af01p-or.devtools.intel.com/artifactory/.../stitch_tool_fix.7z",
     "async": True,  # Real stitching returns a job to poll.
 }
 

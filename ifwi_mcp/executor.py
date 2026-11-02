@@ -173,10 +173,14 @@ def prepare_environment(plan: dict) -> dict:
                        {"source": "stitch_tool", "path": str(local)})
     else:
         if tool.get("url"):
-            dl = artifactory.download(tool["url"], category="stitch")
+            dl = artifactory.download(tool["url"], category=_cache_category("stitch", tool))
             if not dl["ok"]:
                 return dl
-            res = stitch_runner.extract_stitch_tool(dl["data"]["local_path"])
+            local_path = dl["data"]["local_path"]
+            key = _custom_key(tool)
+            res = (stitch_runner.extract_stitch_tool(
+                local_path, f"{archive.cache_name(Path(local_path).name)}-{key}")
+                   if key else stitch_runner.extract_stitch_tool(local_path))
             if res["ok"]:
                 res["data"]["prepared"] = True
         else:

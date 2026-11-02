@@ -54,6 +54,20 @@ def test_extract_success_lists_config_targets(clean_env, tmp_path):
         "Config_Stitch_TARGET_A", "Config_Stitch_TARGET_B"]
 
 
+def test_extract_dest_name_keeps_same_named_tools_apart(clean_env, tmp_path):
+    release = tmp_path / "release" / "stitch_tool.zip"; release.parent.mkdir()
+    custom = tmp_path / "custom" / "stitch_tool.zip"; custom.parent.mkdir()
+    _make_stitch_zip(release)
+    _make_stitch_zip(custom)
+    first = stitch_runner.extract_stitch_tool(str(release))
+    second = stitch_runner.extract_stitch_tool(str(custom), "stitch_tool-custom-abc")
+    assert first["ok"] is True and second["ok"] is True
+    assert Path(second["data"]["tool_root"]).name == "stitch_tool-custom-abc"
+    assert first["data"]["tool_root"] != second["data"]["tool_root"]
+    bad = stitch_runner.extract_stitch_tool(str(custom), "../escape")
+    assert bad["error_code"] == ErrorCode.INVALID_ARGUMENT
+
+
 def test_extract_success_7z(clean_env, tmp_path):
     import py7zr
     # build a .7z with the same layout by first laying files on disk

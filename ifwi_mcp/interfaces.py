@@ -101,6 +101,12 @@ def resolve_stitching(payload: dict) -> dict:
     if custom_ifwi and not custom_ifwi.lower().startswith(("https://", "http://")):
         return err(ErrorCode.INVALID_ARGUMENT, "ifwi_url must be an http(s) download link",
                    {"param": "ifwi_url"})
+    custom_tool = _text(payload, "stitch_tool_url", False)
+    if isinstance(custom_tool, dict):
+        return custom_tool
+    if custom_tool and not custom_tool.lower().startswith(("https://", "http://")):
+        return err(ErrorCode.INVALID_ARGUMENT, "stitch_tool_url must be an http(s) download link",
+                   {"param": "stitch_tool_url"})
     # With ifwi_url, version may come from the IFWI's OEM region instead.
     version = _text(payload, "version", not custom_ifwi)
     if isinstance(version, dict):
@@ -186,16 +192,21 @@ def resolve_stitching(payload: dict) -> dict:
     chosen = next(entry for entry in binaries["data"]["binaries"]
                   if entry["binary_name"] == binary)
     # A customized baseline replaces only the release binary download; the release
-    # still names the binary (for config selection) and supplies the stitch tool.
+    # still names the binary (for config selection) and, unless stitch_tool_url
+    # overrides it, supplies the stitch tool.
     ifwi_url = custom_ifwi or chosen.get("url")
     if not ifwi_url:
         return err(ErrorCode.IFWI_BINARY_NOT_FOUND, "release binary has no download URL",
                    {"binary_name": binary})
-    tool = fiv_portal.find_stitch_tool(project_name, phase, version, lane)
-    if not tool["ok"]:
-        return tool
+    if custom_tool:
+        stitch_url = custom_tool
+    else:
+        tool = fiv_portal.find_stitch_tool(project_name, phase, version, lane)
+        if not tool["ok"]:
+            return tool
+        stitch_url = tool["data"]["stitch_url"]
     ingredient_urls = []
-    custom_urls = {custom_ifwi} if custom_ifwi else set()
+    custom_urls = {url for url in (custom_ifwi, custom_tool) if url}
     for name, value in ingredients.items():
         if value.strip().lower().startswith(("https://", "http://")):
             # A direct download link bypasses the FIV lookup.
@@ -211,7 +222,7 @@ def resolve_stitching(payload: dict) -> dict:
     # conventional name is only a template hint; execution checks the actual
     # extracted targets before invoking the vendor tool.
     config_ini = f"Config_Stitch_{binary}"
-    urls = {"ifwi": ifwi_url, "stitch_tool": tool["data"]["stitch_url"],
+    urls = {"ifwi": ifwi_url, "stitch_tool": stitch_url,
             "ingredients": ingredient_urls}
 
     built = plan.build_plan(project_name, phase,
@@ -231,7 +242,8 @@ def resolve_stitching(payload: dict) -> dict:
                    "project": project_name, "fiv_project_id": project["data"]["project_id"],
                    "phase": phase, "version": version,
                    "swimlane": lane, "binary_name": binary,
-                   "custom_ifwi": bool(custom_ifwi), "oem": oem,
+                   "custom_ifwi": bool(custom_ifwi),
+                   "custom_stitch_tool": bool(custom_tool), "oem": oem,
                    "config_ini": config_ini, "ingredients": ingredients,
                    "config_status": "validated against the extracted stitch tool during execution",
                    "source_urls": urls,
