@@ -187,15 +187,17 @@ def _read_regex_mandatory(config_ini: Path, ingredient_name: str) -> Optional[di
 
 def _pick_file(regex: str, files: list, warnings: list, key: str) -> Optional[Path]:
     """Advisory match of one regex against candidate files. Never raises."""
-    strict = []
-    for f in files:
-        for cand in (str(f), str(f).replace("/", "\\")):
-            try:
-                if re.search(regex, cand):
-                    strict.append(f)
-                    break
-            except re.error:
-                break  # unparseable regex -> treat as no strict match
+    files = sorted(files, key=str)  # deterministic regardless of directory listing order
+    # Same normalization as the IFWI build and stitch tool: a pattern's backslashes are path
+    # separators (\binaries\mmc_pkg_..., CERT_DEBUG\.*Cert.pem), matched case-insensitively
+    # against a forward-slash path. Read as regex escapes, \b is a word boundary and \m an error.
+    pattern = regex.replace("\\", "/")
+    try:
+        compiled = re.compile(pattern, re.I)
+    except re.error as exc:
+        warnings.append(f"{key}: invalid regex {regex!r} ({exc})")
+        compiled = None
+    strict = [f for f in files if compiled and compiled.search(f.as_posix())]
     if len(strict) == 1:
         return strict[0]
     if len(strict) > 1:
@@ -207,14 +209,24 @@ def _pick_file(regex: str, files: list, warnings: list, key: str) -> Optional[Pa
     if not files:
         warnings.append(f"{key}: no files available to match")
         return None
-    best = max(files, key=lambda f: sum(1 for t in tokens if t.lower() in f.name.lower()))
-    best_score = sum(1 for t in tokens if t.lower() in best.name.lower())
+
+    def score(f):
+        return sum(1 for t in tokens if t.lower() in f.name.lower())
+
+    best_score = max(score(f) for f in files)
     if best_score == 0:
         warnings.append(f"{key}: no regex match and no token overlap; "
                         f"candidates={[f.name for f in files]}")
         return None
-    warnings.append(f"{key}: no exact regex match; best-effort picked {best.name}")
-    return best
+    best = [f for f in files if score(f) == best_score]
+    if len(best) > 1:
+        # A tie means the guess can't tell the files apart (e.g. imh1-a0 vs imh1-b0); picking
+        # one would silently stitch the wrong firmware, so leave it unresolved.
+        warnings.append(f"{key}: no regex match and {len(best)} files tie on best-effort "
+                        f"score; not guessing: {[f.name for f in best]}")
+        return None
+    warnings.append(f"{key}: no exact regex match; best-effort picked {best[0].name}")
+    return best[0]
 
 
 def resolve_config_ini(stitch_dir: str, config_ini: str) -> dict:

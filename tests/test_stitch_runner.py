@@ -320,7 +320,7 @@ def test_resolve_ingredient_arg_exact_regex_match(clean_env, tmp_path):
     ini = tmp_path / "cfg.ini"
     ini.write_text(
         "[Configuration]\n[MMC1]\n"
-        "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*imh1-a0\\\\.bin$\"}\n"
+        "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*imh1-a0.bin$\"}\n"
     )
     d = tmp_path / "ing"; d.mkdir()
     good = d / "mmc_pkg_0.915.0_00_10_sign-prod-debug_encrypt-prod_imh1-a0.bin"
@@ -336,7 +336,7 @@ def test_resolve_ingredient_arg_best_effort_when_no_regex_match(clean_env, tmp_p
     ini = tmp_path / "cfg.ini"
     ini.write_text(
         "[Configuration]\n[MMC1]\n"
-        "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*_sign-prod-debug_encrypt-prod_imh1-a0\\\\.bin$\"}\n"
+        "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*_sign-prod-debug_encrypt-prod_imh1-a0.bin$\"}\n"
     )
     d = tmp_path / "ing"; d.mkdir()
     close = d / "mmc_pkg_0.907.0_00_10_sign-prod-debug_encrypt-prod.bin"
@@ -345,6 +345,36 @@ def test_resolve_ingredient_arg_best_effort_when_no_regex_match(clean_env, tmp_p
     arg, warnings = stitch_runner._resolve_ingredient_arg(ini, "MMC1", str(d))
     assert ast.literal_eval(arg)["MMC1_file"] == str(close)  # most token overlap
     assert any("best-effort" in w for w in warnings)
+
+
+def test_resolve_ingredient_arg_backslash_separators_pick_a0_and_b0(clean_env, tmp_path):
+    # Real configs (Config_Stitch_OKSDCRB1_*) write `.*\\binaries\\mmc_pkg_...`, which parses
+    # to `\binaries\mmc_pkg_`: as regex escapes \b is a word boundary and \m is an error. The
+    # backslashes are path separators; each slot must get its own a0/b0 file.
+    tail = "_sign-prod-debug_encrypt-prod_dmr-ap-imh1-%s.bin"
+    ini = tmp_path / "cfg.ini"
+    ini.write_text(
+        "[Configuration]\n[MMC1]\n"
+        "regex_mandatory_dict = {\"MMC1_file\": \".*\\\\binaries\\\\mmc_pkg_.*" + tail % "a0" + "$\"}\n"
+        "[MMC2]\n"
+        "regex_mandatory_dict = {\"MMC2_file\": \".*\\\\binaries\\\\mmc_pkg_.*" + tail % "b0" + "$\"}\n"
+    )
+    d = tmp_path / "ing" / "binaries"; d.mkdir(parents=True)
+    a0 = d / ("mmc_pkg_0.1000.0_00_10" + tail % "a0")
+    b0 = d / ("mmc_pkg_0.1000.0_00_10" + tail % "b0")
+    for f in (a0, b0, d / "mmc_pkg_0.1000.0_pmr.bin"):
+        f.write_bytes(b"x")
+    for name, expected in (("MMC1", a0), ("MMC2", b0)):
+        arg, _ = stitch_runner._resolve_ingredient_arg(ini, name, str(d.parent))
+        assert list(ast.literal_eval(arg).values()) == [str(expected)]
+
+
+def test_pick_file_best_effort_tie_is_not_guessed(tmp_path):
+    # No strict match and a0/b0 tie on token score -> unresolved, never an arbitrary pick.
+    files = [tmp_path / "mmc_pkg_imh1-a0.bin", tmp_path / "mmc_pkg_imh1-b0.bin"]
+    warnings: list = []
+    assert stitch_runner._pick_file(".*mmc_pkg_.*imh1-c0.bin$", files, warnings, "K") is None
+    assert any("tie" in w for w in warnings)
 
 
 def test_resolve_ingredient_arg_passthrough_dict_string(clean_env, tmp_path):
@@ -380,7 +410,7 @@ def _make_stitch_zip_echo_ingredient(zip_path):
         z.writestr("Output/cli.py", cli_src)
         z.writestr("Output/config/Config_Stitch_MMC.ini",
                    "[Configuration]\n[MMC1]\n"
-                   "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*imh1-a0\\\\.bin$\"}\n")
+                   "regex_mandatory_dict = {\"MMC1_file\": \".*mmc_pkg_.*imh1-a0.bin$\"}\n")
 
 
 def test_run_stitch_auto_assembles_ingredient_dict(clean_env, tmp_path):
