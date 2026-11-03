@@ -23,9 +23,6 @@ htmlcov/
 .mcp.json
 .superpowers/
 
-# Local-only, not tracked in the repo
-/docs/
-
 # Local secrets / runtime config
 .env
 deploy.env
