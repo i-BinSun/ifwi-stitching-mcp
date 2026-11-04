@@ -68,6 +68,11 @@ def _custom_key(source: dict) -> str:
     return "custom-" + hashlib.sha256(source["url"].encode()).hexdigest()[:16]
 
 
+def _strip_custom_key(name: str) -> str:
+    """Undo _custom_key's cache suffix: a run's private copy must keep the package's own name."""
+    return re.sub(r"-custom-[0-9a-f]{16}$", "", name)
+
+
 def _cache_category(category: str, source: dict) -> str:
     key = _custom_key(source)
     return f"{category}/{key}" if key else category
@@ -291,7 +296,7 @@ def _isolated_inputs(env_data: dict, inputs_dir: Path) -> dict:
             target = inputs_dir / "ingredients" / f"{index}_{label}"
             if src.is_dir():
                 # Keep the folder's own name: a BIOSID folder must be named after its version.
-                target = target / src.name
+                target = target / _strip_custom_key(src.name)
                 shutil.copytree(src, target, symlinks=True)
             else:
                 target.mkdir(parents=True, exist_ok=True)

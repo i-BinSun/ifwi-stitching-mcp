@@ -204,6 +204,29 @@ def test_custom_stitch_tool_gets_its_own_cache_dirs(clean_env, monkeypatch, tmp_
     assert tool_names[0].startswith("tool-custom-")
 
 
+def test_isolated_inputs_drop_custom_cache_suffix_from_folder_name(tmp_path):
+    # A BIOSID folder must be named after its BIOS version; the cache key is not part of it.
+    cached = tmp_path / "cache" / "0040.D77-custom-7f72624fc739a066"
+    (cached / "Trunk").mkdir(parents=True)
+    (cached / "Trunk" / "MAIN.fd").write_bytes(b"x")
+    r = executor._isolated_inputs(
+        {"binary_file": "", "ingredients": [{"name": "BIOSID", "path": str(cached)}]},
+        tmp_path / "inputs")
+    assert r["ok"]
+    copied = Path(r["data"]["ingredients"][0]["path"])
+    assert copied.name == "0040.D77"
+    assert (copied / "Trunk" / "MAIN.fd").is_file()
+
+
+def test_isolated_inputs_keep_other_folder_names(tmp_path):
+    plain = tmp_path / "cache" / "0040.D77"
+    plain.mkdir(parents=True)
+    r = executor._isolated_inputs(
+        {"binary_file": "", "ingredients": [{"name": "BIOSID", "path": str(plain)}]},
+        tmp_path / "inputs")
+    assert Path(r["data"]["ingredients"][0]["path"]).name == "0040.D77"
+
+
 def test_worker_auto_config_uses_extracted_targets(clean_env, env_fakes, run_fakes,
                                                    monkeypatch, tmp_path):
     p = _plan(tmp_path)
