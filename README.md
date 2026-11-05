@@ -471,6 +471,8 @@ Artifactory is the fallback channel. See [Remote runner contract](#remote-runner
 | `execution.poll_interval_seconds` | `5` | Synchronous waits (`async: false`, `stitch_execute_plan`) re-check the job this often; there is no background polling. |
 | `execution.pending_timeout_seconds` | `900` | A pod the Job API still reports as pending after this long fails with `REMOTE_SCHEDULE_TIMEOUT` (must be below `timeout_seconds`). |
 | `execution.finalize_grace_seconds` | `120` | After a pod ends without a callback, how long to wait for a late callback or `result.json`. |
+| `execution.retry_result_missing` | `true` | When a pod ends without publishing a result, resubmit a new pod inside the same job (same `job_id`, new `run_id`) instead of failing with `REMOTE_RESULT_MISSING`. |
+| `execution.retry_result_missing_max` | `1` | Extra attempts allowed by the retry above; `0` disables it. |
 | `execution.refresh_min_interval_seconds` | `5` | Minimum gap between two Job API checks of one job. |
 | `execution.refresh_workers` | `16` | Threads for query-time refreshes, separate from the synchronous-request pool. |
 | `execution.max_inline_spec_bytes` | `4096` | Larger wrapper specs are uploaded to `<run>/spec.json` and passed with `--spec-url`. |
@@ -520,6 +522,8 @@ Every key above has an env-var equivalent, so the whole configuration can live i
 | `IFWI_MCP_WRAPPER_PATH` | `execution.wrapper_path` |
 | `IFWI_MCP_EXEC_PENDING_TIMEOUT` | `execution.pending_timeout_seconds` |
 | `IFWI_MCP_EXEC_FINALIZE_GRACE` | `execution.finalize_grace_seconds` |
+| `IFWI_MCP_EXEC_RETRY_RESULT_MISSING` | `execution.retry_result_missing` |
+| `IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX` | `execution.retry_result_missing_max` |
 | `IFWI_MCP_REFRESH_MIN_INTERVAL` | `execution.refresh_min_interval_seconds` |
 | `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
@@ -562,7 +566,9 @@ protocol 1); the full design is `docs/superpowers/specs/2026-10-28-remote-execut
 4. The server ends the job on the callback. Without one, a status query checks the pod; once the
    pod has ended (or is gone, or the deadline passed) the job enters `finalizing` and reads
    `result.json`, inferring `REMOTE_RESULT_MISSING` / `REMOTE_TIMEOUT` only after
-   `finalize_grace_seconds`. An inferred failure is replaced if the real result shows up later.
+   `finalize_grace_seconds`. Before failing with `REMOTE_RESULT_MISSING` the server resubmits a new pod
+   in the same job (up to `retry_result_missing_max` times; the `job_id` stays the same, `run_id` and
+   `artifactory_url` change). An inferred failure is replaced if the real result shows up later.
 5. In server mode the result has the same shape as a local run: `plan_id`, `run_id`,
    `artifactory_url`, `stitched_bin` (`url`, `sha256`, `bytes`), `log_url` and `warnings`. Pod
    details (`pod_job_id`, `pod_log_url`, ...) are in the job's `remote` block; the full artifact list,

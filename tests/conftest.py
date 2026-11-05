@@ -32,6 +32,7 @@ def clean_env(monkeypatch, tmp_path):
                 "IFWI_MCP_REFRESH_MIN_INTERVAL", "IFWI_MCP_REFRESH_WORKERS",
                 "IFWI_MCP_MAX_INLINE_SPEC", "IFWI_MCP_MAX_ACTIVE_JOBS", "IFWI_MCP_MAX_RUNNING_PODS",
                 "IFWI_MCP_JOB_RETENTION_HOURS", "IFWI_MCP_JOBS_DB",
+                "IFWI_MCP_EXEC_RETRY_RESULT_MISSING", "IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX",
                 "IFWI_STITCH_RESULT_FILE", "IFWI_STITCH_RUN_ID", "IFWI_STITCH_DEADLINE_EPOCH"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("IFWI_MCP_CACHE_DIR", str(tmp_path / "cache"))
