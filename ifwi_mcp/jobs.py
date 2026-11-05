@@ -64,6 +64,12 @@ SERVER_RESULT_KEYS = ("plan_id", "run_id", "artifactory_url", "stitched_bin", "l
 VIEW_JOB_FIELDS = ("job_id", "plan_id", "run_id", "artifactory_url")
 NOT_CANCELLABLE_LOCAL = "local execution cannot be interrupted once it is running"
 
+# Per-attempt facts under row["remote"] that a retry must not inherit.
+_ATTEMPT_REMOTE_KEYS = ("pods_seen", "gone_seen_at", "queued_noted", "last_error", "attempt_id",
+                        "degraded", "consecutive_errors", "callback_at", "wrapper_version",
+                        "worker_commit", "durations", "exit_code", "signal", "pod_log_url",
+                        "upgrade_probe_at")
+
 _RETRYABLE = {ErrorCode.REMOTE_SUBMIT_FAILED, ErrorCode.REMOTE_SCHEDULE_TIMEOUT,
               ErrorCode.REMOTE_TIMEOUT, ErrorCode.REMOTE_TERMINATED,
               ErrorCode.REMOTE_WORKER_CRASHED, ErrorCode.REMOTE_RESULT_MISSING,
@@ -306,6 +312,16 @@ class JobManager:
                 return False
             # The pending/deadline clocks start here, after any wait for a pod slot.
             times["submitted_at"] = _now()
+            if row["remote"].pop("retrying", False):
+                # A new attempt: keep the old one in the history, start from a clean slate.
+                row["remote"].setdefault("attempts", []).append(
+                    {"run_id": row["run_id"], "run_url": row["run_url"],
+                     "pod_job_id": row["pod_job_id"], "finished_reason": row["finalize_reason"]})
+                for key in _ATTEMPT_REMOTE_KEYS:
+                    row["remote"].pop(key, None)
+                row.update(pod_job_id=None, pod_status=None, finalize_reason=None,
+                           finalize_deadline_at=None, deadline_extended=0, last_checked_at=None,
+                           cleanup=None, cleanup_pending=0)
             row.update(state="running", stage="submitting", plan_id=plan_id, run_id=run_id,
                        run_url=run_url,
                        report_token_hash=_sha256(report_token) if report_token else None,
@@ -483,6 +499,9 @@ class JobManager:
             row.update(state="succeeded" if final["ok"] else "failed", stage="done",
                        result=final, result_source=source, updated_at=now,
                        finished_at=row["finished_at"] if override else now)
+            if final["ok"] and row["remote"].get("attempts"):
+                row["warnings"].append(f"succeeded on attempt {len(row['remote']['attempts']) + 1} "
+                                       "after the pod ended without a result")
             if cleanup_pending is not None:
                 row["cleanup_pending"] = 1 if cleanup_pending else 0
                 if cleanup_pending:
@@ -511,6 +530,10 @@ class JobManager:
             detail.setdefault("pod_status", row["pod_status"])
         if "log_tail" in detail:
             detail["log_tail"] = _truncate(detail["log_tail"], MAX_LOG_TAIL)
+        attempts = row["remote"].get("attempts")
+        if attempts:
+            detail.setdefault("attempts", len(attempts) + 1)
+            detail.setdefault("previous_runs", [a["run_id"] for a in attempts])
         if "retryable" not in detail:
             detail["retryable"] = result["error_code"] in _RETRYABLE
         if result["error_code"] == ErrorCode.REMOTE_SUBMIT_UNKNOWN:
@@ -836,6 +859,8 @@ class JobManager:
                          "the create request had an uncertain outcome and no result ever appeared",
                          detail)
         else:
+            if self._start_retry(row, cfg):
+                return self.store.get(row["job_id"])
             result = err(ErrorCode.REMOTE_RESULT_MISSING,
                          "the stitch pod ended without publishing a result", detail)
         delete = reason == "deadline" and read["kind"] == "missing"
@@ -844,6 +869,45 @@ class JobManager:
             self._delete_pod(updated, cfg)
             return self.store.get(row["job_id"])
         return updated
+
+    def _start_retry(self, row, cfg) -> bool:
+        """Resubmit a pod for a job whose pod ended without a result. True if a retry began."""
+        if not cfg["retry_result_missing"] or row["finalize_reason"] not in ("pod_ended", "pod_gone"):
+            return False
+        done = len(row["remote"].get("attempts") or [])
+        if done >= cfg["retry_result_missing_max"] or not row["plan_id"]:
+            return False
+        loaded = plan_mod.load_plan(row["plan_id"])
+        if not loaded["ok"]:
+            _LOG.warning("job %s: cannot retry, plan %s did not load", row["job_id"], row["plan_id"])
+            return False
+        plan = loaded["data"]["plan"]
+        warnings = list(row["remote"].get("plan_warnings") or [])
+        old_pod = row["pod_job_id"]
+
+        def mark(current):
+            if current["state"] not in ACTIVE_STATES or current["stage"] != "finalizing":
+                return False
+            current["remote"]["retrying"] = True
+            current.update(stage="submitting", updated_at=_now())
+            note(current, f"pod ended without a result; retrying (attempt {done + 2} of "
+                          f"{cfg['retry_result_missing_max'] + 1})")
+            return True
+        if self.store.mutate(row["job_id"], mark) is None:
+            return False                             # another path settled the job first
+
+        def work(job_id):
+            if old_pod:
+                with contextlib.suppress(Exception):
+                    executor.job_api_delete(cfg["endpoint"], old_pod)
+            self._submit_remote(job_id, plan, warnings, cfg)
+        try:
+            threading.Thread(target=self._run, args=(row["job_id"], work),
+                             name=f"ifwi-retry-{row['job_id'][:8]}", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish(row["job_id"], err(ErrorCode.INTERNAL_ERROR, "could not start the retry",
+                                            {"reason": str(exc), "retryable": True}), "server")
+        return True
 
     def _pending_timeout(self, row, cfg):
         concluded = self._from_result_json(row, executor.read_result_json(row["run_url"]))

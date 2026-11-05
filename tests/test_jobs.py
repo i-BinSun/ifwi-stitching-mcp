@@ -388,6 +388,58 @@ def test_missing_result_is_inferred_after_the_grace_period(setup, clock):
     assert done["result"]["detail"]["finalize_reason"] == "pod_ended"
 
 
+def _end_without_result(manager, remote, clock, job_id):
+    """Pod ended, no callback, no result.json: let the finalize grace period run out."""
+    remote.pod = {"kind": "ended", "status": "failed", "auth": False}
+    assert manager.refresh(job_id)["stage"] == "finalizing"
+    clock["now"] += 121
+    return manager.refresh(job_id)
+
+
+@pytest.fixture
+def saved_plan(clean_env):
+    assert plan_mod.save_plan(_plan())["ok"]
+
+
+def test_missing_result_retries_with_a_new_pod_under_the_same_job(setup, clock, saved_plan):
+    manager, remote = setup
+    row = _submit(manager)
+    first_run, old_token = row["run_id"], remote.token
+    retried = _end_without_result(manager, remote, clock, row["job_id"])
+    assert retried["state"] == "running" and retried["job_id"] == row["job_id"]
+    row = _settle(manager, row["job_id"])
+    assert row["stage"] == "pending" and row["run_id"] != first_run
+    assert len(remote.created) == 2 and remote.deleted == ["fivportal-abc"]
+    assert row["remote"]["attempts"][0]["run_id"] == first_run
+    assert _callback(manager, row, old_token, _success(row["run_id"]))[0] == 401
+    status, _ = _callback(manager, row, remote.token, _success(row["run_id"]))
+    done = manager.store.get(row["job_id"])
+    assert status == 200 and done["state"] == "succeeded"
+    assert any("succeeded on attempt 2" in w for w in done["warnings"])
+
+
+def test_missing_result_twice_ends_failed_after_the_retry_budget(setup, clock, saved_plan):
+    manager, remote = setup
+    row = _submit(manager)
+    _end_without_result(manager, remote, clock, row["job_id"])
+    _settle(manager, row["job_id"])
+    done = _end_without_result(manager, remote, clock, row["job_id"])
+    assert done["state"] == "failed" and done["result"]["error_code"] == ErrorCode.REMOTE_RESULT_MISSING
+    assert done["result"]["detail"]["attempts"] == 2
+    assert len(done["result"]["detail"]["previous_runs"]) == 1 and len(remote.created) == 2
+
+
+@pytest.mark.parametrize("overrides", [{"retry_result_missing": False},
+                                       {"retry_result_missing_max": 0}])
+def test_missing_result_is_not_retried_when_disabled(setup, remote_cfg, clock, saved_plan, overrides):
+    remote_cfg(**overrides)
+    manager, remote = setup
+    row = _submit(manager)
+    done = _end_without_result(manager, remote, clock, row["job_id"])
+    assert done["state"] == "failed" and done["result"]["error_code"] == ErrorCode.REMOTE_RESULT_MISSING
+    assert len(remote.created) == 1
+
+
 def test_gone_needs_two_answers_and_reverts_when_the_pod_reappears(setup, clock):
     manager, remote = setup
     row = _submit(manager)

@@ -47,6 +47,8 @@ _JOB_SETTINGS = (
     ("max_running_pods", "IFWI_MCP_MAX_RUNNING_PODS", 5, 0),
     ("job_retention_hours", "IFWI_MCP_JOB_RETENTION_HOURS", 168, 1),
     ("pod_cleanup_delay_seconds", "IFWI_MCP_POD_CLEANUP_DELAY", 30, 0),
+    # Extra attempts after a pod ends without publishing a result; 0 disables the retry.
+    ("retry_result_missing_max", "IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX", 1, 0),
 )
 _IMAGE_TAG_RE = re.compile(r":v(\d+)\.(\d+)\.(\d+)$")
 # These values are spliced into the pod's shell command line.
@@ -256,6 +258,10 @@ def get_execution_config() -> dict:
         if isinstance(value, dict):
             return value
         jobs[key] = value
+
+    jobs["retry_result_missing"] = _as_bool(
+        os.environ.get("IFWI_MCP_EXEC_RETRY_RESULT_MISSING"),
+        _as_bool(section.get("retry_result_missing"), True))
 
     report_base_url = str(os.environ.get("IFWI_MCP_REPORT_BASE_URL")
                           or section.get("report_base_url") or "").strip().rstrip("/")

@@ -362,6 +362,8 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `execution.poll_interval_seconds` | `5` | 同步等待（`async: false`、`stitch_execute_plan`）时重新检查任务的间隔；没有后台轮询。 |
 | `execution.pending_timeout_seconds` | `900` | Job API 报告 pod 仍在 pending 超过这个时间，判 `REMOTE_SCHEDULE_TIMEOUT`（必须小于 `timeout_seconds`）。 |
 | `execution.finalize_grace_seconds` | `120` | pod 结束但没有回调时，等待迟到的回调或 `result.json` 的时长。 |
+| `execution.retry_result_missing` | `true` | pod 结束但没有产出结果时，在同一个任务内重新提交一个新 pod（`job_id` 不变，`run_id` 改变），而不是直接判 `REMOTE_RESULT_MISSING`。 |
+| `execution.retry_result_missing_max` | `1` | 上述重试允许的额外次数；`0` 表示关闭。 |
 | `execution.refresh_min_interval_seconds` | `5` | 同一任务两次查询 Job API 的最小间隔。 |
 | `execution.refresh_workers` | `16` | 查询时刷新专用的线程数，与同步请求的线程池分开。 |
 | `execution.max_inline_spec_bytes` | `4096` | wrapper spec 超过这个长度时上传到 `<run>/spec.json`，改用 `--spec-url` 传递。 |
@@ -410,6 +412,8 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
 | `IFWI_MCP_WRAPPER_PATH` | `execution.wrapper_path` |
 | `IFWI_MCP_EXEC_PENDING_TIMEOUT` | `execution.pending_timeout_seconds` |
 | `IFWI_MCP_EXEC_FINALIZE_GRACE` | `execution.finalize_grace_seconds` |
+| `IFWI_MCP_EXEC_RETRY_RESULT_MISSING` | `execution.retry_result_missing` |
+| `IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX` | `execution.retry_result_missing_max` |
 | `IFWI_MCP_REFRESH_MIN_INTERVAL` | `execution.refresh_min_interval_seconds` |
 | `IFWI_MCP_REFRESH_WORKERS` | `execution.refresh_workers` |
 | `IFWI_MCP_MAX_INLINE_SPEC` | `execution.max_inline_spec_bytes` |
@@ -448,7 +452,7 @@ ifwi-cli download https://artifactory.example.com/some/ifwi.7z --category ifwi
    `result.json`、`IFWI_STITCH_RESULT_FILE` 和 stdout——成功、失败、崩溃、收到 SIGTERM 都会写。
 4. 服务器收到回调即结束任务。没有回调时，查询会检查 pod；pod 已结束（或已不存在、或已过截止时间）后任务进入
    `finalizing` 并读取 `result.json`，超过 `finalize_grace_seconds` 仍没有结果才推断为 `REMOTE_RESULT_MISSING` /
-   `REMOTE_TIMEOUT`。推断出的失败在真实结果之后出现时会被覆盖。
+   `REMOTE_TIMEOUT`。判 `REMOTE_RESULT_MISSING` 之前，服务器会先在同一任务内重新提交新 pod（最多 `retry_result_missing_max` 次；`job_id` 不变，`run_id` 与 `artifactory_url` 会变）。推断出的失败在真实结果之后出现时会被覆盖。
 5. server 模式下结果与本地执行同形：`plan_id`、`run_id`、`artifactory_url`、`stitched_bin`（`url`、`sha256`、
    `bytes`）、`log_url` 和 `warnings`。pod 信息（`pod_job_id`、`pod_log_url` 等）见任务的 `remote` 字段；完整产物列表、
    命令行和来源 URL 见 `<artifactory_url>/result.json`。stdio 模式下结果保留完整的 v1 字段，并把产物下载到本地 deliverables 目录。

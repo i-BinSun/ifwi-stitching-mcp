@@ -326,6 +326,20 @@ def test_job_settings_defaults_and_overrides(clean_env, write_config, monkeypatc
     assert config.get_execution_config()["detail"]["param"] == "execution.report_base_url"
 
 
+def test_retry_result_missing_defaults_and_overrides(clean_env, write_config, monkeypatch):
+    data = config.get_execution_config()["data"]
+    assert data["retry_result_missing"] is True and data["retry_result_missing_max"] == 1
+    write_config({"execution": {"retry_result_missing": False, "retry_result_missing_max": 2}})
+    data = config.get_execution_config()["data"]
+    assert data["retry_result_missing"] is False and data["retry_result_missing_max"] == 2
+    monkeypatch.setenv("IFWI_MCP_EXEC_RETRY_RESULT_MISSING", "true")
+    monkeypatch.setenv("IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX", "0")
+    data = config.get_execution_config()["data"]
+    assert data["retry_result_missing"] is True and data["retry_result_missing_max"] == 0
+    monkeypatch.setenv("IFWI_MCP_EXEC_RETRY_RESULT_MISSING_MAX", "-1")
+    assert config.get_execution_config()["detail"]["param"] == "execution.retry_result_missing_max"
+
+
 def test_jobs_db_path(clean_env, monkeypatch, tmp_path):
     assert config.get_jobs_db_path() == tmp_path / "cache" / "jobs.db"
     monkeypatch.setenv("IFWI_MCP_JOBS_DB", str(tmp_path / "other" / "j.db"))
